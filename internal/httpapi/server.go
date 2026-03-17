@@ -60,6 +60,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/v1", s.withTrafficLog("openai", s.handleOpenAIV1Root))
 	mux.HandleFunc("/v1/chat/completions", s.withTrafficLog("openai", s.handleChatCompletions))
 	mux.HandleFunc("/v1/responses", s.withTrafficLog("openai", s.handleResponses))
+	mux.HandleFunc("/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.HandleFunc("/claude/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.Handle("/", webui.Handler())
 	srv := &http.Server{Addr: s.bindAddr, Handler: mux}
@@ -883,7 +884,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]any{
 		"api_key":              s.currentAPIKey(),
 		"openai_endpoint":      strings.TrimRight(base, "/") + "/v1/chat/completions",
-		"claude_endpoint":      strings.TrimRight(base, "/") + "/claude/v1/messages",
+		"claude_endpoint":      strings.TrimRight(base, "/") + "/v1/messages",
 		"openai_models_url":    strings.TrimRight(base, "/") + "/v1/models",
 		"openai_chat_url":      strings.TrimRight(base, "/") + "/v1/chat/completions",
 		"openai_responses_url": strings.TrimRight(base, "/") + "/v1/responses",
@@ -1062,7 +1063,7 @@ func detectTrafficModelAndStream(path string, body []byte) (string, bool) {
 		if err := json.Unmarshal(body, &req); err == nil {
 			return strings.TrimSpace(req.Model), req.Stream
 		}
-	case "/claude/v1/messages":
+	case "/v1/messages", "/claude/v1/messages":
 		var req ClaudeMessagesRequest
 		if err := json.Unmarshal(body, &req); err == nil {
 			return strings.TrimSpace(req.Model), req.Stream

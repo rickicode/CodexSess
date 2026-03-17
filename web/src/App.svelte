@@ -14,6 +14,7 @@
   let modelMappings = $state({});
   let mappingAlias = $state('');
   let mappingTargetModel = $state('gpt-5.2-codex');
+  let editingMappingAlias = $state('');
   const defaultCodexModels = [
     'gpt-5.1-codex-max',
     'gpt-5.2',
@@ -255,7 +256,7 @@
   }
 
   function claudeExample() {
-    return `curl ${claudeEndpoint || 'http://127.0.0.1:3061/claude/v1/messages'} \\
+    return `curl ${claudeEndpoint || 'http://127.0.0.1:3061/v1/messages'} \\
   -H "x-api-key: ${apiKey || 'sk-codexsess-...'}" \\
   -H "Content-Type: application/json" \\
   -d '{
@@ -388,7 +389,7 @@
   async function loadAPILogs() {
     const data = await req('/api/logs?limit=400');
     const lines = Array.isArray(data.lines) ? data.lines : [];
-    apiLogs = lines.map((line, idx) => parseAPILogLine(line, idx));
+    apiLogs = [...lines].reverse().map((line, idx) => parseAPILogLine(line, idx));
   }
 
   async function refreshAllData() {
@@ -503,8 +504,24 @@
   function startEditMapping(alias) {
     const key = String(alias || '').trim();
     if (!key) return;
+    editingMappingAlias = key;
     mappingAlias = key;
-    mappingTargetModel = modelMappings[key] || 'gpt-5.2-codex';
+    const current = String(modelMappings[key] || '').trim();
+    if (current && availableModels.includes(current)) {
+      mappingTargetModel = current;
+      return;
+    }
+    if (availableModels.length > 0) {
+      mappingTargetModel = availableModels[0];
+      return;
+    }
+    mappingTargetModel = 'gpt-5.2-codex';
+  }
+
+  function cancelEditMapping() {
+    editingMappingAlias = '';
+    mappingAlias = '';
+    mappingTargetModel = availableModels[0] || 'gpt-5.2-codex';
   }
 
   async function saveModelMapping() {
@@ -520,11 +537,17 @@
     }
     busy = true;
     try {
+      if (editingMappingAlias && editingMappingAlias !== alias) {
+        await req(`/api/model-mappings?alias=${encodeURIComponent(editingMappingAlias)}`, {
+          method: 'DELETE'
+        });
+      }
       const data = await req('/api/model-mappings', {
         method: 'POST',
         body: JSON.stringify({ alias, model })
       });
       modelMappings = (data.mappings && typeof data.mappings === 'object') ? data.mappings : modelMappings;
+      editingMappingAlias = '';
       mappingAlias = '';
       setStatus(`Model mapping saved: ${alias} -> ${model}`, 'success');
     } catch (error) {
@@ -545,6 +568,9 @@
       modelMappings = (data.mappings && typeof data.mappings === 'object') ? data.mappings : modelMappings;
       if (mappingAlias === key) {
         mappingAlias = '';
+      }
+      if (editingMappingAlias === key) {
+        editingMappingAlias = '';
       }
       setStatus(`Model mapping removed: ${key}`, 'success');
     } catch (error) {
@@ -1071,7 +1097,12 @@
                 <option value={model}>{model}</option>
               {/each}
             </select>
-            <button class="btn btn-primary" onclick={saveModelMapping} disabled={busy}>Save Mapping</button>
+            <button class="btn btn-primary" onclick={saveModelMapping} disabled={busy}>
+              {editingMappingAlias ? 'Update Mapping' : 'Save Mapping'}
+            </button>
+            {#if editingMappingAlias}
+              <button class="btn btn-secondary" onclick={cancelEditMapping} disabled={busy}>Cancel</button>
+            {/if}
           </div>
           <div class="mapping-list">
             {#if Object.keys(modelMappings).length === 0}
@@ -1500,7 +1531,7 @@
 
   .mapping-form {
     display: grid;
-    grid-template-columns: 1fr 1fr auto;
+    grid-template-columns: 1fr 1fr auto auto;
     gap: .55rem;
     align-items: center;
   }

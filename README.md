@@ -36,20 +36,43 @@ This runs:
 - Svelte dev server on `http://127.0.0.1:3051/`
 - Go backend with `air` on `http://127.0.0.1:3052`
 
+Windows build with default icon:
+
+```bash
+make build-windows
+```
+
 ## First run
 
 ```bash
 ./codexsess
 ```
 
-No parameters are supported. Running with arguments will return an error.
+Supported CLI:
+- `--changepassword` to change admin web-console credential.
 No `.env` file is used.
 
 This generates:
-- `~/.codexsess/config.yaml`
-- `~/.codexsess/master.key`
-- `~/.codexsess/data.db`
-- `~/.codexsess/auth-accounts/` (per-account auth data)
+- Linux/macOS:
+  - `~/.codexsess/config.yaml`
+  - `~/.codexsess/master.key`
+  - `~/.codexsess/data.db`
+  - `~/.codexsess/auth-accounts/` (per-account auth data)
+- Windows:
+  - `%APPDATA%/codexsess/config.yaml`
+  - `%APPDATA%/codexsess/master.key`
+  - `%APPDATA%/codexsess/data.db`
+  - `%APPDATA%/codexsess/auth-accounts/`
+
+Default web-console auth:
+- username: `admin`
+- password: `hijilabs`
+
+Change password:
+
+```bash
+./codexsess --changepassword
+```
 
 Default server/web port is `3061`.
 You can override it with environment variable:
@@ -66,6 +89,7 @@ Use `http://127.0.0.1:3061/`:
 - switch account (`use`)
 - refresh usage
 - remove account
+- auth session cookie remembers login for 30 days
 
 ## Run
 
@@ -81,7 +105,7 @@ Web console is available at `http://127.0.0.1:3061/` by default.
 
 ```bash
 curl http://127.0.0.1:3061/v1/chat/completions \
-  -H "Authorization: Bearer sk-codexsess-..." \
+  -H "Authorization: Bearer sk-..." \
   -H "X-Codex-Account: <id|email|alias>" \
   -H "Content-Type: application/json" \
   -d '{
@@ -95,14 +119,14 @@ curl http://127.0.0.1:3061/v1/chat/completions \
 
 ```bash
 curl http://127.0.0.1:3061/v1/models \
-  -H "Authorization: Bearer sk-codexsess-..."
+  -H "Authorization: Bearer sk-..."
 ```
 
 ### Responses example
 
 ```bash
 curl http://127.0.0.1:3061/v1/responses \
-  -H "Authorization: Bearer sk-codexsess-..." \
+  -H "Authorization: Bearer sk-..." \
   -H "X-Codex-Account: <id|email|alias>" \
   -H "Content-Type: application/json" \
   -d '{

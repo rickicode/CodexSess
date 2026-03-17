@@ -11,8 +11,16 @@ import (
 //go:embed assets/*
 var embedded embed.FS
 
+func Assets() fs.FS {
+	sub, err := fs.Sub(embedded, "assets")
+	if err != nil {
+		panic(err)
+	}
+	return sub
+}
+
 func Handler() http.Handler {
-	sub, _ := fs.Sub(embedded, "assets")
+	sub := Assets()
 	indexBytes, _ := fs.ReadFile(sub, "index.html")
 	fileServer := http.FileServer(http.FS(sub))
 	serveIndex := func(w http.ResponseWriter) {

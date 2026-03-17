@@ -4,9 +4,11 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "check": "vite build",
+    "dev": "VITE_APP_MODE=web vite",
+    "build": "npm run build:web",
+    "build:web": "VITE_APP_MODE=web vite build",
+    "build:desktop": "VITE_APP_MODE=web vite build",
+    "check": "npm run build:web",
     "preview": "vite preview"
   },
   "devDependencies": {

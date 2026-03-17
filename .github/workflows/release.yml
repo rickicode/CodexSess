@@ -1,0 +1,72 @@
+name: Build And Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  release:
+    types:
+      - created
+      - edited
+      - prereleased
+      - published
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install frontend deps
+        working-directory: web
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build:web
+
+      - name: Build Linux binary
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -o dist/codexsess-linux-amd64 .
+
+      - name: Build Windows binary with icon
+        run: |
+          mkdir -p build/windows
+          go run ./scripts/gen_default_icon.go build/windows/app.ico
+          go run github.com/akavel/rsrc@latest -ico build/windows/app.ico -o codexsess_windows_amd64.syso
+          GOOS=windows GOARCH=amd64 go build -o dist/codexsess-windows-amd64.exe .
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: codexsess-build-${{ github.run_number }}
+          path: dist/*
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/codexsess-linux-amd64
+            dist/codexsess-windows-amd64.exe
+            dist/SHA256SUMS.txt

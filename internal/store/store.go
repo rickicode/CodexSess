@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -72,6 +73,12 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE accounts DROP COLUMN login_option`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "no such column") && !strings.Contains(msg, "syntax error") {
 			return err
 		}
 	}

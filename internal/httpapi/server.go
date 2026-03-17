@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,21 +28,32 @@ import (
 )
 
 type Server struct {
-	svc      *service.Service
-	apiKey   string
-	bindAddr string
-	traffic  *trafficlog.Logger
-	mu       sync.RWMutex
+	svc               *service.Service
+	apiKey            string
+	bindAddr          string
+	adminUsername     string
+	adminPasswordHash string
+	traffic           *trafficlog.Logger
+	mu                sync.RWMutex
 }
 
-func New(svc *service.Service, bindAddr string, apiKey string, traffic *trafficlog.Logger) *Server {
-	return &Server{svc: svc, bindAddr: bindAddr, apiKey: apiKey, traffic: traffic}
+func New(svc *service.Service, bindAddr string, apiKey string, adminUsername string, adminPasswordHash string, traffic *trafficlog.Logger) *Server {
+	return &Server{
+		svc:               svc,
+		bindAddr:          bindAddr,
+		apiKey:            apiKey,
+		adminUsername:     strings.TrimSpace(adminUsername),
+		adminPasswordHash: strings.TrimSpace(adminPasswordHash),
+		traffic:           traffic,
+	}
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/accounts", s.handleWebAccounts)
 	mux.HandleFunc("/api/account/use", s.handleWebUseAccount)
+	mux.HandleFunc("/api/account/use-api", s.handleWebUseAPIAccount)
+	mux.HandleFunc("/api/account/use-cli", s.handleWebUseCLIAccount)
 	mux.HandleFunc("/api/account/remove", s.handleWebRemoveAccount)
 	mux.HandleFunc("/api/account/import", s.handleWebImportAccount)
 	mux.HandleFunc("/api/usage/refresh", s.handleWebRefreshUsage)
@@ -50,7 +64,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/auth/browser/start", s.handleWebBrowserStart)
 	mux.HandleFunc("/api/auth/browser/cancel", s.handleWebBrowserCancel)
 	mux.HandleFunc("/api/auth/browser/callback", s.handleWebBrowserCallback)
+	mux.HandleFunc("/api/auth/login", s.handleAPIAuthLogin)
 	mux.HandleFunc("/auth/callback", s.handleWebBrowserCallback)
+	mux.HandleFunc("/auth/login", s.handleWebAuthLogin)
+	mux.HandleFunc("/auth/logout", s.handleWebAuthLogout)
 	mux.HandleFunc("/api/auth/device/start", s.handleWebDeviceStart)
 	mux.HandleFunc("/api/auth/device/poll", s.handleWebDevicePoll)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -63,12 +80,425 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.HandleFunc("/claude/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.Handle("/", webui.Handler())
-	srv := &http.Server{Addr: s.bindAddr, Handler: mux}
+	handler := withCORS(s.withManagementAuth(mux))
+	srv := &http.Server{Addr: s.bindAddr, Handler: handler}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
 	}()
 	return srv.ListenAndServe()
+}
+
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) withManagementAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.isPublicPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.isAuthenticated(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		target := "/auth/login"
+		path := strings.TrimSpace(r.URL.Path)
+		if path != "" && path != "/" {
+			target += "?next=" + url.QueryEscape(path)
+		}
+		http.Redirect(w, r, target, http.StatusFound)
+	})
+}
+
+func (s *Server) isPublicPath(path string) bool {
+	p := strings.TrimSpace(path)
+	switch {
+	case p == "/healthz":
+		return true
+	case strings.HasPrefix(p, "/v1"):
+		return true
+	case strings.HasPrefix(p, "/claude/v1"):
+		return true
+	case p == "/auth/callback":
+		return true
+	case p == "/api/auth/browser/callback":
+		return true
+	case p == "/auth/login":
+		return true
+	case p == "/api/auth/login":
+		return true
+	}
+	return false
+}
+
+func (s *Server) isAuthenticated(r *http.Request) bool {
+	ck, err := r.Cookie("codexsess_auth")
+	if err != nil || strings.TrimSpace(ck.Value) == "" {
+		return false
+	}
+	return s.validateAuthCookie(ck.Value)
+}
+
+func (s *Server) validateAuthCookie(raw string) bool {
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(string(b), "|")
+	if len(parts) != 3 {
+		return false
+	}
+	username := strings.TrimSpace(parts[0])
+	expRaw := strings.TrimSpace(parts[1])
+	sig := strings.TrimSpace(parts[2])
+	if username == "" || expRaw == "" || sig == "" {
+		return false
+	}
+	expUnix, err := strconv.ParseInt(expRaw, 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix() > expUnix {
+		return false
+	}
+	if username != s.adminUsername {
+		return false
+	}
+	expect := s.cookieSignature(username, expRaw)
+	return sig == expect
+}
+
+func (s *Server) cookieSignature(username, expRaw string) string {
+	sum := sha256.Sum256([]byte(username + "|" + expRaw + "|" + s.adminPasswordHash))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Server) issueAuthCookieValue() string {
+	expRaw := strconv.FormatInt(time.Now().Add(30*24*time.Hour).Unix(), 10)
+	sig := s.cookieSignature(s.adminUsername, expRaw)
+	payload := s.adminUsername + "|" + expRaw + "|" + sig
+	return base64.RawURLEncoding.EncodeToString([]byte(payload))
+}
+
+func (s *Server) setAuthCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "codexsess_auth",
+		Value:    s.issueAuthCookieValue(),
+		Path:     "/",
+		MaxAge:   30 * 24 * 60 * 60,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func (s *Server) clearAuthCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     "codexsess_auth",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+func (s *Server) verifyAdminCredentials(username, password string) bool {
+	user := strings.TrimSpace(username)
+	pass := strings.TrimSpace(password)
+	if user == "" || pass == "" {
+		return false
+	}
+	if user != s.adminUsername {
+		return false
+	}
+	return config.VerifyPassword(pass, s.adminPasswordHash)
+}
+
+func (s *Server) handleAPIAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, http.StatusBadRequest, "bad_request", "invalid JSON")
+		return
+	}
+	if !s.verifyAdminCredentials(req.Username, req.Password) {
+		respondErr(w, http.StatusUnauthorized, "unauthorized", "invalid username or password")
+		return
+	}
+	s.setAuthCookie(w)
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleWebAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		nextPath := strings.TrimSpace(r.URL.Query().Get("next"))
+		if nextPath == "" {
+			nextPath = "/"
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CodexSess Login</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+:root{
+  --bg:#0f1115;
+  --panel:#171717;
+  --border:rgba(148,163,184,.23);
+  --text:#f8fafc;
+  --muted:#94a3b8;
+  --primary:#00d4aa;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  min-height:100vh;
+  display:grid;
+  place-items:center;
+  background:radial-gradient(1200px 500px at 10% -20%,rgba(0,212,170,.10),transparent),var(--bg);
+  color:var(--text);
+  font-family:"IBM Plex Sans",sans-serif;
+}
+.login-shell{
+  width:min(420px,92vw);
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:18px;
+  display:grid;
+  gap:14px;
+}
+.brand{
+  display:grid;
+  gap:2px;
+  justify-items:center;
+  text-align:center;
+}
+.brand strong{
+  font-family:"IBM Plex Mono",monospace;
+  letter-spacing:.02em;
+  font-size:20px;
+}
+.brand span{
+  color:var(--muted);
+  font-size:12px;
+}
+form{
+  display:grid;
+  gap:10px;
+}
+label{
+  color:var(--muted);
+  font-size:12px;
+}
+input{
+  width:100%;
+  border:1px solid var(--border);
+  border-radius:9px;
+  padding:10px 11px;
+  background:#131313;
+  color:var(--text);
+  outline:none;
+}
+input:focus{
+  border-color:rgba(0,212,170,.7);
+  box-shadow:0 0 0 2px rgba(0,212,170,.16);
+}
+button{
+  margin-top:4px;
+  border:none;
+  border-radius:10px;
+  padding:10px 12px;
+  background:var(--primary);
+  color:#02251f;
+  font-weight:700;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+}
+button[disabled]{
+  opacity:.8;
+  cursor:wait;
+}
+.spin{
+  width:14px;
+  height:14px;
+  border-radius:50%;
+  border:2px solid rgba(2,37,31,.25);
+  border-top-color:#02251f;
+  animation:spin .8s linear infinite;
+}
+@keyframes spin{
+  to{transform:rotate(360deg)}
+}
+.foot{
+  color:var(--muted);
+  font-size:12px;
+  text-align:center;
+}
+.err{
+  margin:0;
+  min-height:20px;
+  border:1px solid rgba(239,68,68,.35);
+  background:rgba(239,68,68,.12);
+  color:#fecaca;
+  border-radius:9px;
+  padding:8px 10px;
+  font-size:12px;
+}
+.err[hidden]{
+  display:none;
+}
+.foot a{
+  color:#7fead6;
+  text-decoration:none;
+}
+.foot a:hover{
+  text-decoration:underline;
+}
+</style>
+</head>
+<body>
+<section class="login-shell">
+  <div class="brand">
+    <strong>CodexSess</strong>
+    <span>Codex Account Management</span>
+  </div>
+  <form id="loginForm" method="post" action="/auth/login">
+    <input type="hidden" name="next" value="` + templateEscape(nextPath) + `" />
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username" placeholder="admin" />
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" placeholder="Enter password" />
+    <p id="loginError" class="err" role="alert" aria-live="polite" hidden></p>
+    <button id="loginButton" type="submit">Sign In</button>
+  </form>
+  <div class="foot">
+    Session will be remembered for 30 days.<br/>
+    <a href="https://hijinetwork.net" target="_blank" rel="noopener noreferrer">Powered by HIJINETWORK</a>
+  </div>
+</section>
+<script>
+(() => {
+  const form = document.getElementById("loginForm");
+  const btn = document.getElementById("loginButton");
+  const err = document.getElementById("loginError");
+  if (!form || !btn) return;
+  const defaultButtonHTML = 'Sign In';
+  const loadingButtonHTML = '<span class="spin" aria-hidden="true"></span><span>Signing in...</span>';
+  const setError = (message) => {
+    if (!err) return;
+    if (!message) {
+      err.hidden = true;
+      err.textContent = "";
+      return;
+    }
+    err.hidden = false;
+    err.textContent = message;
+  };
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (btn.disabled) return;
+    setError("");
+    btn.disabled = true;
+    btn.innerHTML = loadingButtonHTML;
+    const fd = new FormData(form);
+    const username = String(fd.get("username") || "");
+    const password = String(fd.get("password") || "");
+    const next = String(fd.get("next") || "/");
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({ username, password }),
+      });
+      if (res.ok) {
+        window.location.assign(next || "/");
+        return;
+      }
+      let msg = "Invalid username or password";
+      try {
+        const body = await res.json();
+        if (body && body.error && typeof body.error.message === "string" && body.error.message.trim()) {
+          msg = body.error.message;
+        }
+      } catch (_) {}
+      setError(msg);
+    } catch (_) {
+      setError("Unable to sign in. Please try again.");
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = defaultButtonHTML;
+    }
+  });
+})();
+</script>
+</body>
+</html>`))
+		return
+	}
+	if r.Method != http.MethodPost {
+		respondErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		respondErr(w, http.StatusBadRequest, "bad_request", "invalid form")
+		return
+	}
+	username := r.Form.Get("username")
+	password := r.Form.Get("password")
+	nextPath := strings.TrimSpace(r.Form.Get("next"))
+	if nextPath == "" {
+		nextPath = "/"
+	}
+	if !s.verifyAdminCredentials(username, password) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("invalid username or password"))
+		return
+	}
+	s.setAuthCookie(w)
+	http.Redirect(w, r, nextPath, http.StatusFound)
+}
+
+func (s *Server) handleWebAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
+		respondErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	s.clearAuthCookie(w)
+	http.Redirect(w, r, "/auth/login", http.StatusFound)
+}
+
+func templateEscape(v string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
+	return replacer.Replace(v)
 }
 
 func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
@@ -82,23 +512,34 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type webAccount struct {
-		ID       string               `json:"id"`
-		Email    string               `json:"email"`
-		Alias    string               `json:"alias"`
-		PlanType string               `json:"plan_type"`
-		Active   bool                 `json:"active"`
-		Usage    *store.UsageSnapshot `json:"usage,omitempty"`
+		ID        string               `json:"id"`
+		Email     string               `json:"email"`
+		Alias     string               `json:"alias"`
+		PlanType  string               `json:"plan_type"`
+		Active    bool                 `json:"active"`
+		ActiveAPI bool                 `json:"active_api"`
+		ActiveCLI bool                 `json:"active_cli"`
+		Usage     *store.UsageSnapshot `json:"usage,omitempty"`
 	}
 	resp := struct {
 		Accounts []webAccount `json:"accounts"`
 	}{}
+	cliActiveID, err := s.svc.ActiveCLIAccountID(r.Context())
+	if err != nil {
+		respondErr(w, 500, "internal_error", err.Error())
+		return
+	}
 	for _, a := range accounts {
+		isAPI := a.Active
+		isCLI := cliActiveID != "" && a.ID == cliActiveID
 		item := webAccount{
-			ID:       a.ID,
-			Email:    a.Email,
-			Alias:    a.Alias,
-			PlanType: a.PlanType,
-			Active:   a.Active,
+			ID:        a.ID,
+			Email:     a.Email,
+			Alias:     a.Alias,
+			PlanType:  a.PlanType,
+			Active:    isAPI && isCLI,
+			ActiveAPI: isAPI,
+			ActiveCLI: isCLI,
 		}
 		if u, err := s.svc.Store.GetUsage(r.Context(), a.ID); err == nil {
 			ux := u
@@ -122,6 +563,46 @@ func (s *Server) handleWebUseAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	acc, err := s.svc.UseAccount(r.Context(), req.Selector)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]any{"ok": true, "account": map[string]any{"id": acc.ID, "email": acc.Email}})
+}
+
+func (s *Server) handleWebUseAPIAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		Selector string `json:"selector"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	acc, err := s.svc.UseAccountAPI(r.Context(), req.Selector)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]any{"ok": true, "account": map[string]any{"id": acc.ID, "email": acc.Email}})
+}
+
+func (s *Server) handleWebUseCLIAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		Selector string `json:"selector"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	acc, err := s.svc.UseAccountCLI(r.Context(), req.Selector)
 	if err != nil {
 		respondErr(w, 400, "bad_request", err.Error())
 		return
@@ -875,22 +1356,73 @@ func isValidCodexModel(model string) bool {
 }
 
 func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+	switch r.Method {
+	case http.MethodGet:
+		base := externalBaseURLFromRequest(r, s.bindAddr)
+		modelMappings := s.currentModelMappings()
+		s.mu.RLock()
+		usageAlertThreshold := s.svc.Cfg.UsageAlertThreshold
+		usageAutoSwitchThreshold := s.svc.Cfg.UsageAutoSwitchThreshold
+		s.mu.RUnlock()
+		respondJSON(w, 200, map[string]any{
+			"api_key":                     s.currentAPIKey(),
+			"openai_endpoint":             strings.TrimRight(base, "/") + "/v1/chat/completions",
+			"claude_endpoint":             strings.TrimRight(base, "/") + "/v1/messages",
+			"openai_models_url":           strings.TrimRight(base, "/") + "/v1/models",
+			"openai_chat_url":             strings.TrimRight(base, "/") + "/v1/chat/completions",
+			"openai_responses_url":        strings.TrimRight(base, "/") + "/v1/responses",
+			"available_models":            codexAvailableModels(),
+			"model_mappings":              modelMappings,
+			"usage_alert_threshold":       usageAlertThreshold,
+			"usage_auto_switch_threshold": usageAutoSwitchThreshold,
+		})
+		return
+	case http.MethodPost:
+		var req struct {
+			UsageAlertThreshold      *int `json:"usage_alert_threshold"`
+			UsageAutoSwitchThreshold *int `json:"usage_auto_switch_threshold"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondErr(w, 400, "bad_request", "invalid JSON")
+			return
+		}
+		s.mu.Lock()
+		cfg := s.svc.Cfg
+		if req.UsageAlertThreshold != nil {
+			v := *req.UsageAlertThreshold
+			if v < 0 || v > 100 {
+				s.mu.Unlock()
+				respondErr(w, 400, "bad_request", "usage_alert_threshold must be in range 0..100")
+				return
+			}
+			cfg.UsageAlertThreshold = v
+		}
+		if req.UsageAutoSwitchThreshold != nil {
+			v := *req.UsageAutoSwitchThreshold
+			if v < 0 || v > 100 {
+				s.mu.Unlock()
+				respondErr(w, 400, "bad_request", "usage_auto_switch_threshold must be in range 0..100")
+				return
+			}
+			cfg.UsageAutoSwitchThreshold = v
+		}
+		if err := config.Save(cfg); err != nil {
+			s.mu.Unlock()
+			respondErr(w, 500, "internal_error", err.Error())
+			return
+		}
+		s.svc.Cfg = cfg
+		s.mu.Unlock()
+		respondJSON(w, 200, map[string]any{
+			"ok":                          true,
+			"usage_alert_threshold":       cfg.UsageAlertThreshold,
+			"usage_auto_switch_threshold": cfg.UsageAutoSwitchThreshold,
+		})
+		return
+	default:
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	base := externalBaseURLFromRequest(r, s.bindAddr)
-	modelMappings := s.currentModelMappings()
-	respondJSON(w, 200, map[string]any{
-		"api_key":              s.currentAPIKey(),
-		"openai_endpoint":      strings.TrimRight(base, "/") + "/v1/chat/completions",
-		"claude_endpoint":      strings.TrimRight(base, "/") + "/v1/messages",
-		"openai_models_url":    strings.TrimRight(base, "/") + "/v1/models",
-		"openai_chat_url":      strings.TrimRight(base, "/") + "/v1/chat/completions",
-		"openai_responses_url": strings.TrimRight(base, "/") + "/v1/responses",
-		"available_models":     codexAvailableModels(),
-		"model_mappings":       modelMappings,
-	})
 }
 
 func (s *Server) handleWebLogs(w http.ResponseWriter, r *http.Request) {
@@ -1223,7 +1755,7 @@ func randomProxyKey() (string, error) {
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
-	return "sk-codexsess-" + hex.EncodeToString(buf), nil
+	return "sk-" + hex.EncodeToString(buf), nil
 }
 
 func oauthBaseURLFromRequest(r *http.Request) string {

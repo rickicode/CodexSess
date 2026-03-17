@@ -1,4 +1,4 @@
-.PHONY: build build-frontend build-backend run dev kill clean test deps
+.PHONY: build build-frontend build-backend build-linux-assets build-windows run dev wails wails-dev kill clean test deps
 
 BINARY_NAME ?= codexsess
 BINARY_PATH ?= ./$(BINARY_NAME)
@@ -8,16 +8,41 @@ DEV_FRONTEND_PORT ?= 3051
 DEV_BACKEND_PORT ?= 3052
 RUN_PORT ?= 3061
 
-build: build-frontend build-backend
+build: build-frontend build-linux-assets build-backend
 
 build-frontend:
 	@echo "Building frontend from $(WEB_DIR)..."
-	cd $(WEB_DIR) && npm install && npm run build
+	cd $(WEB_DIR) && npm install && npm run build:web
 	@echo "Frontend build output is configured directly to $(EMBED_ASSETS_DIR) via Vite outDir."
+
+build-linux-assets:
+	@echo "Generating Linux app icon + desktop launcher..."
+	@mkdir -p build/linux
+	@go run ./scripts/gen_default_icon.go build/linux/codexsess.png
+	@printf '%s\n' \
+		'[Desktop Entry]' \
+		'Type=Application' \
+		'Name=CodexSess' \
+		'Comment=Codex Account Management' \
+		'Exec='\"$$(pwd)/$(BINARY_NAME)\" \
+		'Icon='\"$$(pwd)/build/linux/codexsess.png\" \
+		'Terminal=true' \
+		'Categories=Development;Utility;' \
+		> build/linux/codexsess.desktop
+	@echo "Linux assets: build/linux/codexsess.png and build/linux/codexsess.desktop"
 
 build-backend:
 	@echo "Building backend binary $(BINARY_PATH)..."
 	go build -o $(BINARY_PATH) .
+
+build-windows: build-frontend
+	@echo "Building Windows binary with default icon..."
+	@mkdir -p build/windows
+	@go run ./scripts/gen_default_icon.go build/windows/app.ico
+	@go run ./scripts/gen_default_icon.go build/windows/app.png
+	@go run github.com/akavel/rsrc@latest -ico build/windows/app.ico -o codexsess_windows_amd64.syso
+	GOOS=windows GOARCH=amd64 go build -o codexsess.exe .
+	@echo "Windows assets: codexsess.exe + build/windows/app.png"
 
 run: build
 	@echo "Starting $(BINARY_NAME) on port $(RUN_PORT)..."
@@ -33,6 +58,14 @@ dev:
 	trap 'kill 0' INT TERM EXIT; \
 	(cd $(WEB_DIR) && npm install && npm run dev -- --host 127.0.0.1 --port $(DEV_FRONTEND_PORT)) & \
 	PORT=$(DEV_BACKEND_PORT) CODEXSESS_NO_OPEN_BROWSER=1 "$$(go env GOPATH)/bin/air" -c .air.toml
+
+wails:
+	@echo "Wails mode removed. Building web-only binary..."
+	$(MAKE) build
+
+wails-dev:
+	@echo "Wails mode removed. Running web dev mode..."
+	$(MAKE) dev
 
 kill:
 	@echo "Stopping codexsess dev/run processes on ports $(DEV_FRONTEND_PORT), $(DEV_BACKEND_PORT), $(RUN_PORT)..."

@@ -1,5 +1,10 @@
 # AGENTS.md
 
+## Design Source Of Truth (Mandatory)
+
+- For any UI/UX/design request, always use `Uncodixfy.md` as the single design reference.
+- Do not introduce additional design guides; just mention and follow `Uncodixfy.md`.
+
 ## Session Change Tracking (Mandatory)
 
 - Before editing, run `rtk git status --short` to capture baseline.

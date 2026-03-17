@@ -2,11 +2,13 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -14,27 +16,35 @@ import (
 )
 
 type Config struct {
-	BindAddr      string `yaml:"-"`
-	DataDir       string `yaml:"data_dir"`
-	MasterKeyPath string `yaml:"master_key_path"`
-	AuthStoreDir  string `yaml:"auth_store_dir"`
-	CodexHome     string `yaml:"codex_home"`
-	ProxyAPIKey   string `yaml:"codexsess_api_key"`
-	ModelMappings map[string]string `yaml:"model_mappings"`
-	LogLevel      string `yaml:"log_level"`
+	BindAddr                 string            `yaml:"-"`
+	DataDir                  string            `yaml:"data_dir"`
+	MasterKeyPath            string            `yaml:"master_key_path"`
+	AuthStoreDir             string            `yaml:"auth_store_dir"`
+	CodexHome                string            `yaml:"codex_home"`
+	ProxyAPIKey              string            `yaml:"codexsess_api_key"`
+	ModelMappings            map[string]string `yaml:"model_mappings"`
+	UsageAlertThreshold      int               `yaml:"usage_alert_threshold"`
+	UsageAutoSwitchThreshold int               `yaml:"usage_auto_switch_threshold"`
+	AdminUsername            string            `yaml:"admin_username"`
+	AdminPasswordHash        string            `yaml:"admin_password_hash"`
+	LogLevel                 string            `yaml:"log_level"`
 }
 
 func Default() Config {
 	home, _ := os.UserHomeDir()
-	base := filepath.Join(home, ".codexsess")
+	base := defaultDataDir(home)
 	return Config{
-		BindAddr:      resolveBindAddr(),
-		DataDir:       base,
-		MasterKeyPath: filepath.Join(base, "master.key"),
-		AuthStoreDir:  filepath.Join(base, "auth-accounts"),
-		CodexHome:     filepath.Join(home, ".codex"),
-		ModelMappings: map[string]string{},
-		LogLevel:      "info",
+		BindAddr:                 resolveBindAddr(),
+		DataDir:                  base,
+		MasterKeyPath:            filepath.Join(base, "master.key"),
+		AuthStoreDir:             filepath.Join(base, "auth-accounts"),
+		CodexHome:                filepath.Join(home, ".codex"),
+		ModelMappings:            map[string]string{},
+		UsageAlertThreshold:      5,
+		UsageAutoSwitchThreshold: 2,
+		AdminUsername:            "admin",
+		AdminPasswordHash:        HashPassword("hijilabs"),
+		LogLevel:                 "info",
 	}
 }
 
@@ -51,7 +61,7 @@ func LoadOrInit() (Config, error) {
 	p := configPath()
 	if _, err := os.Stat(p); errors.Is(err, os.ErrNotExist) {
 		if cfg.ProxyAPIKey == "" {
-			key, err := randomKey("sk-codexsess-")
+			key, err := randomKey("sk-")
 			if err != nil {
 				return cfg, err
 			}
@@ -80,8 +90,14 @@ func LoadOrInit() (Config, error) {
 	if cfg.ModelMappings == nil {
 		cfg.ModelMappings = map[string]string{}
 	}
+	if cfg.UsageAlertThreshold < 0 || cfg.UsageAlertThreshold > 100 {
+		cfg.UsageAlertThreshold = def.UsageAlertThreshold
+	}
+	if cfg.UsageAutoSwitchThreshold < 0 || cfg.UsageAutoSwitchThreshold > 100 {
+		cfg.UsageAutoSwitchThreshold = def.UsageAutoSwitchThreshold
+	}
 	if cfg.ProxyAPIKey == "" {
-		k, err := randomKey("sk-codexsess-")
+		k, err := randomKey("sk-")
 		if err != nil {
 			return cfg, err
 		}
@@ -89,6 +105,12 @@ func LoadOrInit() (Config, error) {
 		if err := Save(cfg); err != nil {
 			return cfg, err
 		}
+	}
+	if strings.TrimSpace(cfg.AdminUsername) == "" {
+		cfg.AdminUsername = def.AdminUsername
+	}
+	if strings.TrimSpace(cfg.AdminPasswordHash) == "" {
+		cfg.AdminPasswordHash = def.AdminPasswordHash
 	}
 	cfg.BindAddr = resolveBindAddr()
 	return cfg, nil
@@ -121,4 +143,22 @@ func resolveBindAddr() string {
 		}
 	}
 	return fmt.Sprintf("127.0.0.1:%d", port)
+}
+
+func defaultDataDir(home string) string {
+	if runtime.GOOS == "windows" {
+		if appData := strings.TrimSpace(os.Getenv("APPDATA")); appData != "" {
+			return filepath.Join(appData, "codexsess")
+		}
+	}
+	return filepath.Join(home, ".codexsess")
+}
+
+func HashPassword(password string) string {
+	sum := sha256.Sum256([]byte(password))
+	return hex.EncodeToString(sum[:])
+}
+
+func VerifyPassword(password, encoded string) bool {
+	return strings.EqualFold(HashPassword(password), strings.TrimSpace(encoded))
 }

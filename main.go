@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/ricki/codexsess/internal/config"
@@ -18,6 +20,7 @@ import (
 	"github.com/ricki/codexsess/internal/store"
 	"github.com/ricki/codexsess/internal/trafficlog"
 	"github.com/ricki/codexsess/internal/util"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -28,7 +31,12 @@ func main() {
 
 func run() error {
 	if len(os.Args) > 1 {
-		return fmt.Errorf("no command-line arguments are supported")
+		switch strings.TrimSpace(os.Args[1]) {
+		case "--changepassword":
+			return changePassword()
+		default:
+			return fmt.Errorf("unknown argument: %s", os.Args[1])
+		}
 	}
 
 	cfg, err := config.LoadOrInit()
@@ -67,7 +75,7 @@ func run() error {
 	}
 
 	svc := service.New(cfg, st, cry)
-	srv := httpapi.New(svc, cfg.BindAddr, cfg.ProxyAPIKey, traffic)
+	srv := httpapi.New(svc, cfg.BindAddr, cfg.ProxyAPIKey, cfg.AdminUsername, cfg.AdminPasswordHash, traffic)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -80,3 +88,47 @@ func run() error {
 	return nil
 }
 
+func changePassword() error {
+	cfg, err := config.LoadOrInit()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Printf("Username [%s]: ", cfg.AdminUsername)
+	userInput, _ := reader.ReadString('\n')
+	user := strings.TrimSpace(userInput)
+	if user == "" {
+		user = cfg.AdminUsername
+	}
+
+	fmt.Print("New password: ")
+	pass1Bytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return fmt.Errorf("read password: %w", err)
+	}
+	pass1 := strings.TrimSpace(string(pass1Bytes))
+	if pass1 == "" {
+		return fmt.Errorf("password cannot be empty")
+	}
+
+	fmt.Print("Confirm new password: ")
+	pass2Bytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Println()
+	if err != nil {
+		return fmt.Errorf("read password confirmation: %w", err)
+	}
+	pass2 := strings.TrimSpace(string(pass2Bytes))
+	if pass1 != pass2 {
+		return fmt.Errorf("password confirmation mismatch")
+	}
+
+	cfg.AdminUsername = user
+	cfg.AdminPasswordHash = config.HashPassword(pass1)
+	if err := config.Save(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	fmt.Println("Admin credential updated successfully.")
+	return nil
+}

@@ -9,7 +9,8 @@ export default defineConfig({
     port: 3051,
     strictPort: true,
     proxy: {
-      '/api': 'http://127.0.0.1:3052'
+      '/api': 'http://127.0.0.1:3052',
+      '/auth': 'http://127.0.0.1:3052'
     }
   },
   build: {

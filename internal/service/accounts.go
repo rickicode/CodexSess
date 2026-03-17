@@ -51,14 +51,8 @@ func (s *Service) SaveAccountFromTokens(ctx context.Context, t TokenSet, _ strin
 	if err := os.MkdirAll(s.Cfg.AuthStoreDir, 0o700); err != nil {
 		return store.Account{}, err
 	}
-	if err := os.MkdirAll(s.Cfg.CodexHome, 0o700); err != nil {
-		return store.Account{}, err
-	}
 	accountID := firstNonEmpty(t.AccountID, claims.AccountID)
 	if err := util.WriteAuthJSON(s.accountDir(id), t.IDToken, t.AccessToken, t.RefreshToken, accountID); err != nil {
-		return store.Account{}, err
-	}
-	if err := util.WriteAuthJSON(s.Cfg.CodexHome, t.IDToken, t.AccessToken, t.RefreshToken, accountID); err != nil {
 		return store.Account{}, err
 	}
 	encID, err := s.Crypto.Encrypt([]byte(t.IDToken))
@@ -91,9 +85,6 @@ func (s *Service) SaveAccountFromTokens(ctx context.Context, t TokenSet, _ strin
 	if err := s.Store.UpsertAccount(ctx, a); err != nil {
 		return store.Account{}, err
 	}
-	if err := s.Store.SetActiveAccount(ctx, a.ID); err != nil {
-		return store.Account{}, err
-	}
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
 
@@ -107,6 +98,17 @@ func (s *Service) ListAccounts(ctx context.Context) ([]store.Account, error) {
 }
 
 func (s *Service) UseAccount(ctx context.Context, selector string) (store.Account, error) {
+	a, err := s.UseAccountAPI(ctx, selector)
+	if err != nil {
+		return store.Account{}, err
+	}
+	if err := s.syncAccountAuthToCodexHome(a); err != nil {
+		return store.Account{}, err
+	}
+	return s.Store.FindAccountBySelector(ctx, a.ID)
+}
+
+func (s *Service) UseAccountAPI(ctx context.Context, selector string) (store.Account, error) {
 	a, err := s.Store.FindAccountBySelector(ctx, selector)
 	if err != nil {
 		return store.Account{}, err
@@ -114,14 +116,18 @@ func (s *Service) UseAccount(ctx context.Context, selector string) (store.Accoun
 	if err := s.Store.SetActiveAccount(ctx, a.ID); err != nil {
 		return store.Account{}, err
 	}
-	active, err := s.Store.FindAccountBySelector(ctx, a.ID)
+	return s.Store.FindAccountBySelector(ctx, a.ID)
+}
+
+func (s *Service) UseAccountCLI(ctx context.Context, selector string) (store.Account, error) {
+	a, err := s.Store.FindAccountBySelector(ctx, selector)
 	if err != nil {
 		return store.Account{}, err
 	}
-	if err := s.syncAccountAuthToCodexHome(active); err != nil {
+	if err := s.syncAccountAuthToCodexHome(a); err != nil {
 		return store.Account{}, err
 	}
-	return active, nil
+	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
 
 func (s *Service) RemoveAccount(ctx context.Context, selector string) error {
@@ -137,6 +143,10 @@ func (s *Service) RemoveAccount(ctx context.Context, selector string) error {
 }
 
 func (s *Service) ResolveForRequest(ctx context.Context, selector string) (store.Account, TokenSet, error) {
+	return s.resolveForRequest(ctx, selector, true)
+}
+
+func (s *Service) resolveForRequest(ctx context.Context, selector string, syncCLIAuth bool) (store.Account, TokenSet, error) {
 	var a store.Account
 	var err error
 	if strings.TrimSpace(selector) == "" {
@@ -169,14 +179,17 @@ func (s *Service) ResolveForRequest(ctx context.Context, selector string) (store
 	if err != nil {
 		return store.Account{}, TokenSet{}, err
 	}
-	if err := s.syncAccountAuthToCodexHome(refreshed.account); err != nil {
-		return store.Account{}, TokenSet{}, err
+	if syncCLIAuth {
+		if err := s.syncAccountAuthToCodexHome(refreshed.account); err != nil {
+			return store.Account{}, TokenSet{}, err
+		}
 	}
 	return refreshed.account, refreshed.tokens, nil
 }
 
 func (s *Service) RefreshUsage(ctx context.Context, selector string) (store.UsageSnapshot, error) {
-	a, tk, err := s.ResolveForRequest(ctx, selector)
+	// Refresh usage must not switch CLI active account in codex home.
+	a, tk, err := s.resolveForRequest(ctx, selector, false)
 	if err != nil {
 		return store.UsageSnapshot{}, err
 	}
@@ -312,4 +325,68 @@ func (s *Service) syncAccountAuthToCodexHome(a store.Account) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(s.Cfg.CodexHome, "auth.json"), b, 0o600)
+}
+
+func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
+	authPath := filepath.Join(s.Cfg.CodexHome, "auth.json")
+	b, err := os.ReadFile(authPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	var f struct {
+		IDToken     string `json:"id_token"`
+		AccessToken string `json:"access_token"`
+		AccountID   string `json:"account_id"`
+		Tokens      struct {
+			IDToken     string `json:"id_token"`
+			AccessToken string `json:"access_token"`
+			AccountID   string `json:"account_id"`
+		} `json:"tokens"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		return "", nil
+	}
+	idToken := firstNonEmpty(f.Tokens.IDToken, f.IDToken)
+	accessToken := firstNonEmpty(f.Tokens.AccessToken, f.AccessToken)
+	authAccountID := firstNonEmpty(f.Tokens.AccountID, f.AccountID)
+	if strings.TrimSpace(idToken) == "" || strings.TrimSpace(accessToken) == "" {
+		return "", nil
+	}
+	claims, err := util.ParseClaims(idToken, accessToken)
+	if err != nil {
+		return "", nil
+	}
+	claimAccountID := firstNonEmpty(authAccountID, claims.AccountID)
+	accounts, err := s.Store.ListAccounts(ctx)
+	if err != nil {
+		return "", err
+	}
+	// Match exact token pair first to avoid false-positive email/account-id matches.
+	for _, a := range accounts {
+		accIDTokenRaw, err := s.Crypto.Decrypt(a.TokenID)
+		if err != nil {
+			continue
+		}
+		accAccessTokenRaw, err := s.Crypto.Decrypt(a.TokenAccess)
+		if err != nil {
+			continue
+		}
+		if string(accIDTokenRaw) == idToken && string(accAccessTokenRaw) == accessToken {
+			return a.ID, nil
+		}
+	}
+	for _, a := range accounts {
+		if claimAccountID != "" && a.AccountID != "" && a.AccountID == claimAccountID {
+			return a.ID, nil
+		}
+	}
+	for _, a := range accounts {
+		if claims.Email != "" && strings.EqualFold(a.Email, claims.Email) {
+			return a.ID, nil
+		}
+	}
+	return "", nil
 }

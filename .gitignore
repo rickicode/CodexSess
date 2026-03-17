@@ -3,3 +3,5 @@ tmp/
 web/node_modules/
 web/dist/
 *.log
+.history
+build

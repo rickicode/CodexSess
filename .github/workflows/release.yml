@@ -4,12 +4,10 @@ on:
   push:
     tags:
       - "v*"
-  release:
-    types:
-      - created
-      - edited
-      - prereleased
-      - published
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -19,15 +17,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -57,14 +55,14 @@ jobs:
           sha256sum * > SHA256SUMS.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codexsess-build-${{ github.run_number }}
           path: dist/*
 
       - name: Upload to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2.6.1
         with:
           files: |
             dist/codexsess-linux-amd64

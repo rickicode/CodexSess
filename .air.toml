@@ -1,17 +1,46 @@
 root = "."
-testdata_dir = "testdata"
 tmp_dir = "tmp"
 
 [build]
-entrypoint = "./main.go"
-cmd = "go build -o ./tmp/codexsess ."
-full_bin = "PORT=3052 CODEXSESS_NO_OPEN_BROWSER=1 ./tmp/codexsess"
-include_ext = ["go"]
-exclude_dir = ["tmp", "web", "node_modules"]
-delay = 500
+cmd = "go build -o ./tmp/main ./main.go"
+bin = "./tmp/main"
+delay = 1000
+exclude_dir = [
+    "frontend",
+    "tmp",
+    "vendor",
+    "testdata",
+    "logs",
+    "data",
+    "uploads",
+    "screenshots",
+    "reports",
+]
+exclude_file = []
+exclude_regex = ["_test.go"]
+exclude_unchanged = false
+follow_symlink = false
+full_bin = ""
+include_dir = []
+include_ext = ["go", "tpl", "tmpl", "html", "env"]
+include_file = []
+kill_delay = "0s"
+log = "build-errors.log"
+send_interrupt = false
 stop_on_error = true
-send_interrupt = true
-kill_delay = "500ms"
+
+[color]
+app = ""
+build = "yellow"
+main = "magenta"
+runner = "green"
+watcher = "cyan"
 
 [log]
-time = true
+time = false
+
+[misc]
+clean_on_exit = true
+
+[screen]
+clear_on_rebuild = false

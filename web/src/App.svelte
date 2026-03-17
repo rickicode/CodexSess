@@ -363,7 +363,10 @@
       body = {};
     }
     if (!response.ok) {
-      throw new Error(body.error || body.message || bodyText || `HTTP ${response.status}`);
+      const msg = typeof body?.error === 'string'
+        ? body.error
+        : (body?.error?.message || body?.message || bodyText || `HTTP ${response.status}`);
+      throw new Error(msg);
     }
     return body;
   }
@@ -527,6 +530,8 @@
   async function saveModelMapping() {
     const alias = String(mappingAlias || '').trim();
     const model = String(mappingTargetModel || '').trim();
+    const previousAlias = String(editingMappingAlias || '').trim();
+    const isRename = previousAlias && previousAlias !== alias;
     if (!alias) {
       setStatus('Mapping alias is required.', 'error');
       return;
@@ -537,16 +542,23 @@
     }
     busy = true;
     try {
-      if (editingMappingAlias && editingMappingAlias !== alias) {
-        await req(`/api/model-mappings?alias=${encodeURIComponent(editingMappingAlias)}`, {
-          method: 'DELETE'
-        });
-      }
+      // Save target first to avoid losing existing mapping when rename fails midway.
       const data = await req('/api/model-mappings', {
         method: 'POST',
         body: JSON.stringify({ alias, model })
       });
       modelMappings = (data.mappings && typeof data.mappings === 'object') ? data.mappings : modelMappings;
+      if (isRename) {
+        try {
+          const deleted = await req(`/api/model-mappings?alias=${encodeURIComponent(previousAlias)}`, {
+            method: 'DELETE'
+          });
+          modelMappings = (deleted.mappings && typeof deleted.mappings === 'object') ? deleted.mappings : modelMappings;
+        } catch (error) {
+          setStatus(`Mapping saved as ${alias}, but old alias ${previousAlias} was not removed: ${error.message}`, 'error');
+          return;
+        }
+      }
       editingMappingAlias = '';
       mappingAlias = '';
       setStatus(`Model mapping saved: ${alias} -> ${model}`, 'success');

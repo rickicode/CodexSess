@@ -166,6 +166,13 @@ jobs:
           fi
           echo "has_diff=${has_diff}" >> "$GITHUB_OUTPUT"
 
+      - name: Temporarily disable local AGENTS instructions for CI codex run
+        run: |
+          set -euo pipefail
+          if [ -f AGENTS.md ]; then
+            mv AGENTS.md .codexsess-ci.AGENTS.md.bak
+          fi
+
       - name: Run review with Codex
         env:
           BASE_SHA: ${{ steps.ctx.outputs.base_sha }}
@@ -250,6 +257,14 @@ jobs:
             --skip-git-repo-check \
             -m gpt-5.2-codex \
             "$AUTOFIX_PROMPT" > autofix.txt || true
+
+      - name: Restore local AGENTS instructions
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f .codexsess-ci.AGENTS.md.bak ]; then
+            mv .codexsess-ci.AGENTS.md.bak AGENTS.md
+          fi
 
       - name: Commit and push autofix
         id: pushfix

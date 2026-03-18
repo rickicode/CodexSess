@@ -40,8 +40,19 @@ permissions:
 jobs:
   codereview:
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && secrets.CODEXSESS_URL != '' && secrets.CODEXSESS_API_KEY != '' }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
     steps:
+      - name: Validate required secrets
+        env:
+          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
+          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEXSESS_URL:-}" ] || [ -z "${CODEXSESS_API_KEY:-}" ]; then
+            echo "Missing CODEXSESS_URL or CODEXSESS_API_KEY secret"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
@@ -245,11 +256,20 @@ jobs:
         github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR'
-      ) &&
-      secrets.CODEXSESS_URL != '' &&
-      secrets.CODEXSESS_API_KEY != ''
+      )
     runs-on: ubuntu-latest
     steps:
+      - name: Validate required secrets
+        env:
+          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
+          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEXSESS_URL:-}" ] || [ -z "${CODEXSESS_API_KEY:-}" ]; then
+            echo "Missing CODEXSESS_URL or CODEXSESS_API_KEY secret"
+            exit 1
+          fi
+
       - name: Resolve PR metadata
         id: pr
         uses: actions/github-script@v8

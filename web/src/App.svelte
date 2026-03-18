@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import DashboardView from './views/DashboardView.svelte';
   import SettingsView from './views/SettingsView.svelte';
+  import ApiEndpointView from './views/ApiEndpointView.svelte';
   import ApiLogsView from './views/ApiLogsView.svelte';
   import AboutView from './views/AboutView.svelte';
 
@@ -235,6 +236,8 @@
     switch (key) {
       case 'settings':
         return `Settings - ${base}`;
+      case 'api-endpoints':
+        return `API Workspace - ${base}`;
       case 'logs':
         return `API Logs - ${base}`;
       case 'about':
@@ -1782,6 +1785,12 @@
         </span>
         <span>Settings</span>
       </button>
+      <button class={activeMenu === 'api-endpoints' ? 'is-active' : ''} onclick={() => switchMenu('api-endpoints')}>
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M3 5h18v4H3V5zm0 5.5h18v4H3v-4zM3 16h18v3H3v-3z"></path></svg>
+        </span>
+        <span>API Workspace</span>
+      </button>
       <button class={activeMenu === 'logs' ? 'is-active' : ''} onclick={() => switchMenu('logs')}>
         <span class="nav-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path d="M4 4h16v4H4V4zm0 6h16v10H4V10zm3 3v4h2v-4H7zm4 0v4h2v-4h-2zm4 0v4h2v-4h-2z"></path></svg>
@@ -1855,23 +1864,6 @@
     {#if activeMenu === 'settings'}
       <SettingsView
         busy={settingsBusy}
-        {apiKey}
-        {openAIEndpoint}
-        {claudeEndpoint}
-        {codeReviewEndpoint}
-        {availableModels}
-        {modelMappings}
-        {mappingAlias}
-        {mappingTargetModel}
-        {editingMappingAlias}
-        onSetMappingAlias={setMappingAlias}
-        onSetMappingTargetModel={setMappingTargetModel}
-        onSaveModelMapping={saveModelMapping}
-        onCancelEditMapping={cancelEditMapping}
-        onStartEditMapping={startEditMapping}
-        onDeleteModelMapping={deleteModelMapping}
-        onCopyText={copyText}
-        {isCopied}
         {showAccountEmail}
         onToggleShowAccountEmail={toggleShowAccountEmail}
         {autoRefreshEnabled}
@@ -1895,7 +1887,30 @@
         {autoRefreshBusy}
         {backgroundRefreshError}
         {backgroundRefreshLastAt}
+      />
+    {/if}
+
+    {#if activeMenu === 'api-endpoints'}
+      <ApiEndpointView
+        busy={settingsBusy}
+        {apiKey}
+        {openAIEndpoint}
+        {claudeEndpoint}
+        {codeReviewEndpoint}
+        {availableModels}
+        {modelMappings}
+        {mappingAlias}
+        {mappingTargetModel}
+        {editingMappingAlias}
+        onSetMappingAlias={setMappingAlias}
+        onSetMappingTargetModel={setMappingTargetModel}
+        onSaveModelMapping={saveModelMapping}
+        onCancelEditMapping={cancelEditMapping}
+        onStartEditMapping={startEditMapping}
+        onDeleteModelMapping={deleteModelMapping}
         onRegenerateAPIKey={regenerateAPIKey}
+        onCopyText={copyText}
+        {isCopied}
         {openAIExample}
         {claudeExample}
         {codeReviewExample}

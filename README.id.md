@@ -24,6 +24,7 @@
   <p>
     <a href="#ringkasan">Ringkasan</a> •
     <a href="#fitur-utama">Fitur Utama</a> •
+    <a href="#workflow-github-code-review">GitHub Code Review</a> •
     <a href="#pratinjau-ui">Pratinjau UI</a> •
     <a href="#autentikasi--sesi">Autentikasi</a> •
     <a href="#variabel-lingkungan">Environment</a> •
@@ -60,7 +61,6 @@ Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbed
   - `POST /v1/chat/completions` (termasuk SSE streaming)
   - `GET /v1/models`
   - `POST /v1/responses`
-  - `POST /v1/code-review` (endpoint khusus code review, `custom_prompt` opsional)
   - `POST /claude/v1/messages`
 - Pemisahan status akun aktif:
   - akun API aktif
@@ -101,11 +101,33 @@ Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbed
 Route kompatibilitas API di `/v1/*` dan `/claude/v1/*` tetap route bergaya API key dan tidak diblok alur login web UI.
 Artinya client OpenAI maupun client bergaya Claude sama-sama bisa diarahkan lewat CodexSess.
 
+## Workflow GitHub Code Review
+
+Untuk menggunakan review/autofix PR:
+
+- Gunakan file workflow: `.github/workflows/code-review.yml`
+- Tambahkan GitHub repository secret wajib:
+  - `CODEXSESS_URL`
+  - `CODEXSESS_API_KEY`
+- Trigger:
+  - otomatis saat event `pull_request`
+  - manual lewat `workflow_dispatch`
+- Input manual (`workflow_dispatch`):
+  - `target_ref` (opsional, branch/tag/sha; default `main`)
+  - `review_scope` (`diff` atau `full`)
+  - `review_focus` (opsional, area fokus review)
+
+Catatan:
+- `review_scope=full` membuat review mencakup keseluruhan repository (tidak tergantung diff commit saja).
+- `review_focus` dipakai untuk mengarahkan review manual ke area tertentu (contoh: `auth`, `api`, `performance`, `tests`).
+- Run manual akan membuat branch baru otomatis jika ada autofix yang aman untuk di-push.
+
 ## Variabel Lingkungan
 
 | Variabel | Default | Contoh | Deskripsi |
 |---|---|---|---|
-| `PORT` | `3061` | `PORT=8080` | Port HTTP server. Bind address: `127.0.0.1:<PORT>`. |
+| `PORT` | `3061` | `PORT=8080` | Port HTTP server saat `CODEXSESS_BIND_ADDR` tidak di-set. |
+| `CODEXSESS_BIND_ADDR` | `0.0.0.0:<PORT>` | `CODEXSESS_BIND_ADDR=0.0.0.0:3061` | Override bind address penuh (`host:port`) untuk HTTP server. |
 | `CODEXSESS_NO_OPEN_BROWSER` | `false` | `CODEXSESS_NO_OPEN_BROWSER=true` | Menonaktifkan auto-open browser saat startup. Nilai truthy: `1`, `true`, `yes`. |
 | `CODEXSESS_CODEX_SANDBOX` | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only` | Mode sandbox yang diteruskan ke `codex exec`. |
 | `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Jalankan eksekusi Codex dalam mode isolasi (`true`) atau environment normal (`false`). |

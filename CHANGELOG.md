@@ -9,8 +9,13 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 ### Added
 - Dedicated GitHub workflow for PR code review using `POST /v1/code-review` with chunked diff processing and synthesized final review output.
 - Optional PR autofix helper workflow that generates patch suggestions and uploads patch artifacts for manual application.
+- New API-key protected endpoint `GET /v1/auth.json` to export the active API account auth payload for external Codex CLI runners.
 
 ### Changed
+- Removed the dedicated `/v1/code-review` API surface from backend routing and request dispatch.
+- OpenAI `/v1` root payload validation now only dispatches to chat completions and responses APIs.
+- API settings payload now exposes `auth_json_endpoint` (replacing `code_review_endpoint`) for automation clients.
+- API Workspace UI now shows Auth JSON endpoint and download example instead of code-review endpoint examples.
 - Code-review automation flow is now review-first and can be configured to avoid direct push/merge behavior.
 - API/code-review integration and logging coverage were refined so review calls are visible and traceable in API logs.
 - Settings and documentation were expanded with code-review endpoint usage details and cURL examples.
@@ -39,6 +44,8 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - API account resolution no longer synchronizes CLI active context implicitly; only explicit `Use CLI` updates CLI auth state.
 - Codex exec error reporting now prefers structured JSON error events (`error` / `turn.failed`) before falling back to `stderr`/exit code, reducing generic `exit status 1` responses.
 - Installer update/download flow now forces release asset re-download with cache-bypass headers/query, so update keeps fetching binary/package even when version tag is unchanged.
+- GitHub code-review workflow now supports true manual runs without `pr_number` (via `target_ref`) and auto-creates a dedicated autofix branch on manual mode when safe changes exist.
+- GitHub code-review autofix push is now guarded for PR mode to skip direct push on fork-based PRs, preventing workflow failure from cross-repo push permission errors.
 
 ## [1.0.1] - 2026-03-18
 

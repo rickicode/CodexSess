@@ -3,11 +3,11 @@ package httpapi
 import "encoding/json"
 
 type ChatCompletionsRequest struct {
-	Model      string           `json:"model"`
-	Messages   []ChatMessage    `json:"messages"`
-	Stream     bool             `json:"stream"`
-	Tools      []ChatToolDef    `json:"tools,omitempty"`
-	ToolChoice json.RawMessage  `json:"tool_choice,omitempty"`
+	Model      string          `json:"model"`
+	Messages   []ChatMessage   `json:"messages"`
+	Stream     bool            `json:"stream"`
+	Tools      []ChatToolDef   `json:"tools,omitempty"`
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
 }
 
 type ChatMessage struct {
@@ -133,14 +133,14 @@ type ClaudeMessage struct {
 }
 
 type ClaudeMessagesResponse struct {
-	ID           string                `json:"id"`
-	Type         string                `json:"type"`
-	Role         string                `json:"role"`
-	Model        string                `json:"model"`
-	Content      []ClaudeContentBlock  `json:"content"`
-	StopReason   string                `json:"stop_reason"`
-	StopSequence *string               `json:"stop_sequence"`
-	Usage        ClaudeMessagesUsage   `json:"usage"`
+	ID           string               `json:"id"`
+	Type         string               `json:"type"`
+	Role         string               `json:"role"`
+	Model        string               `json:"model"`
+	Content      []ClaudeContentBlock `json:"content"`
+	StopReason   string               `json:"stop_reason"`
+	StopSequence *string              `json:"stop_sequence"`
+	Usage        ClaudeMessagesUsage  `json:"usage"`
 }
 
 type ClaudeContentBlock struct {
@@ -151,23 +151,4 @@ type ClaudeContentBlock struct {
 type ClaudeMessagesUsage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
-}
-
-type CodeReviewRequest struct {
-	Model        string   `json:"model"`
-	Diff         string   `json:"diff,omitempty"`
-	Content      string   `json:"content,omitempty"`
-	Language     string   `json:"language,omitempty"`
-	Focus        []string `json:"focus,omitempty"`
-	CustomPrompt string   `json:"custom_prompt,omitempty"`
-	Stream       bool     `json:"stream,omitempty"`
-}
-
-type CodeReviewResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	Model   string `json:"model"`
-	Review  string `json:"review"`
-	Usage   Usage  `json:"usage"`
 }

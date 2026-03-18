@@ -13,7 +13,7 @@
   let apiKey = $state('');
   let openAIEndpoint = $state('');
   let claudeEndpoint = $state('');
-  let codeReviewEndpoint = $state('');
+  let authJSONEndpoint = $state('');
   let activeMenu = $state('dashboard');
   let apiLogs = $state([]);
   let showLogDetailModal = $state(false);
@@ -618,15 +618,8 @@
   }'`;
   }
 
-  function codeReviewExample() {
-    return `curl ${codeReviewEndpoint || 'http://127.0.0.1:3061/v1/code-review'} \\\n  -H "Authorization: Bearer ${apiKey || 'sk-...'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{
-    "model": "gpt-5.2-codex",
-    "language": "go",
-    "focus": ["security", "regression"],
-    "diff": "diff --git a/main.go b/main.go\\nindex 111..222 100644\\n--- a/main.go\\n+++ b/main.go\\n@@ -1,3 +1,4 @@\\n+fmt.Println(\\"debug\\")",
-    "custom_prompt": "Prioritize auth and race-condition issues.",
-    "stream": false
-  }'`;
+  function authJSONExample() {
+    return `curl ${authJSONEndpoint || 'http://127.0.0.1:3061/v1/auth.json'} \\\n  -H "Authorization: Bearer ${apiKey || 'sk-...'}" \\\n  -o auth.json`;
   }
 
   function prettyJSONText(raw) {
@@ -768,7 +761,7 @@
     apiKey = data.api_key || '';
     openAIEndpoint = data.openai_endpoint || '';
     claudeEndpoint = data.claude_endpoint || '';
-    codeReviewEndpoint = data.code_review_endpoint || '';
+    authJSONEndpoint = data.auth_json_endpoint || '';
     const fromAPI = Array.isArray(data.available_models) ? data.available_models : [];
     availableModels = fromAPI.length > 0 ? fromAPI : defaultCodexModels;
     modelMappings = (data.model_mappings && typeof data.model_mappings === 'object') ? data.model_mappings : {};
@@ -1896,7 +1889,7 @@
         {apiKey}
         {openAIEndpoint}
         {claudeEndpoint}
-        {codeReviewEndpoint}
+        authJSONEndpoint={authJSONEndpoint}
         {availableModels}
         {modelMappings}
         {mappingAlias}
@@ -1913,7 +1906,7 @@
         {isCopied}
         {openAIExample}
         {claudeExample}
-        {codeReviewExample}
+        {authJSONExample}
       />
     {/if}
 

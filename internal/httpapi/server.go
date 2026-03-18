@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -52,7 +54,6 @@ type Server struct {
 const (
 	maxTrafficRequestCaptureBytes  = 8 * 1024 * 1024
 	maxTrafficResponseCaptureBytes = 8 * 1024 * 1024
-	maxCodeReviewInputChars        = 400_000
 )
 
 func New(svc *service.Service, bindAddr string, apiKey string, adminUsername string, adminPasswordHash string, traffic *trafficlog.Logger, appVersion string, codexVersion string) *Server {
@@ -100,7 +101,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/v1", s.withTrafficLog("openai", s.handleOpenAIV1Root))
 	mux.HandleFunc("/v1/chat/completions", s.withTrafficLog("openai", s.handleChatCompletions))
 	mux.HandleFunc("/v1/responses", s.withTrafficLog("openai", s.handleResponses))
-	mux.HandleFunc("/v1/code-review", s.withTrafficLog("openai", s.handleCodeReview))
+	mux.HandleFunc("/v1/auth.json", s.handleAPIAuthJSON)
 	mux.HandleFunc("/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.HandleFunc("/claude/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.Handle("/", webui.Handler())
@@ -952,6 +953,48 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, resp)
 }
 
+func (s *Server) handleAPIAuthJSON(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+		return
+	}
+	if !s.isValidAPIKey(r) {
+		respondErr(w, http.StatusUnauthorized, "unauthorized", "invalid API key")
+		return
+	}
+
+	account, err := s.resolveAPIAccount(r.Context(), "")
+	if err != nil {
+		msg := strings.ToLower(strings.TrimSpace(err.Error()))
+		switch {
+		case strings.Contains(msg, "not found"):
+			respondErr(w, http.StatusNotFound, "account_not_found", err.Error())
+		case strings.Contains(msg, "exhausted"):
+			respondErr(w, http.StatusTooManyRequests, "quota_exhausted", "target account quota exhausted")
+		default:
+			respondErr(w, http.StatusInternalServerError, "internal_error", err.Error())
+		}
+		return
+	}
+
+	authPath := filepath.Join(s.svc.APICodexHome(account.ID), "auth.json")
+	content, err := os.ReadFile(authPath)
+	if err != nil {
+		respondErr(w, http.StatusInternalServerError, "internal_error", "failed to load auth.json for active API account")
+		return
+	}
+	if !json.Valid(content) {
+		respondErr(w, http.StatusInternalServerError, "internal_error", "invalid auth.json content for active API account")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(content)
+}
+
 func (s *Server) handleOpenAIV1Root(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -979,144 +1022,12 @@ func (s *Server) handleOpenAIV1Root(w http.ResponseWriter, r *http.Request) {
 			s.handleResponses(w, r)
 			return
 		}
-		if _, ok := anyBody["diff"]; ok {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			s.handleCodeReview(w, r)
-			return
-		}
-		if _, ok := anyBody["content"]; ok {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			s.handleCodeReview(w, r)
-			return
-		}
-		respondErr(w, 400, "bad_request", "unsupported /v1 payload, use /v1/chat/completions, /v1/responses, or /v1/code-review")
+		respondErr(w, 400, "bad_request", "unsupported /v1 payload, use /v1/chat/completions or /v1/responses")
 		return
 	default:
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-}
-
-func (s *Server) handleCodeReview(w http.ResponseWriter, r *http.Request) {
-	start := time.Now()
-	reqID := "review_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if r.Method != http.MethodPost {
-		respondErr(w, 405, "method_not_allowed", "method not allowed")
-		return
-	}
-	if !s.isValidAPIKey(r) {
-		respondErr(w, 401, "unauthorized", "invalid API key")
-		return
-	}
-	var req CodeReviewRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondErr(w, 400, "bad_request", "invalid JSON body")
-		return
-	}
-	if strings.TrimSpace(req.Model) == "" {
-		req.Model = "gpt-5.2-codex"
-	}
-	req.Model = s.resolveMappedModel(req.Model)
-	prompt, err := buildCodeReviewPrompt(req)
-	if err != nil {
-		respondErr(w, 400, "bad_request", err.Error())
-		return
-	}
-
-	account, err := s.resolveAPIAccount(r.Context(), "")
-	if err != nil {
-		msg := strings.ToLower(strings.TrimSpace(err.Error()))
-		switch {
-		case strings.Contains(msg, "not found"):
-			respondErr(w, 404, "account_not_found", err.Error())
-		case strings.Contains(msg, "exhausted"):
-			respondErr(w, 429, "quota_exhausted", "target account quota exhausted")
-		default:
-			respondErr(w, 500, "internal_error", err.Error())
-		}
-		return
-	}
-	setResolvedAccountHeaders(w, account)
-
-	status := 200
-	defer func() {
-		_ = s.svc.Store.InsertAudit(r.Context(), store.AuditRecord{
-			RequestID: reqID,
-			AccountID: account.ID,
-			Model:     req.Model,
-			Stream:    req.Stream,
-			Status:    status,
-			LatencyMS: time.Since(start).Milliseconds(),
-			CreatedAt: time.Now().UTC(),
-		})
-	}()
-
-	if req.Stream {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			status = 500
-			respondErr(w, 500, "internal_error", "streaming not supported")
-			return
-		}
-		res, err := s.svc.Codex.StreamChat(r.Context(), s.svc.APICodexHome(account.ID), req.Model, prompt, func(evt provider.ChatEvent) error {
-			chunk := map[string]any{
-				"id":      reqID,
-				"object":  "code.review.chunk",
-				"created": time.Now().Unix(),
-				"model":   req.Model,
-				"delta":   evt.Text,
-			}
-			b, _ := json.Marshal(chunk)
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
-			return nil
-		})
-		if err != nil {
-			status = 500
-			_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"`+escape(err.Error())+`"}}`)
-			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-			flusher.Flush()
-			return
-		}
-		final := map[string]any{
-			"id":      reqID,
-			"object":  "code.review",
-			"created": time.Now().Unix(),
-			"model":   req.Model,
-			"usage": map[string]any{
-				"prompt_tokens":     res.InputTokens,
-				"completion_tokens": res.OutputTokens,
-				"total_tokens":      res.InputTokens + res.OutputTokens,
-			},
-			"done": true,
-		}
-		b, _ := json.Marshal(final)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
-		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
-
-	res, err := s.svc.Codex.Chat(r.Context(), s.svc.APICodexHome(account.ID), req.Model, prompt)
-	if err != nil {
-		status = 500
-		respondErr(w, 500, "upstream_error", err.Error())
-		return
-	}
-	respondJSON(w, 200, CodeReviewResponse{
-		ID:      reqID,
-		Object:  "code.review",
-		Created: time.Now().Unix(),
-		Model:   req.Model,
-		Review:  res.Text,
-		Usage: Usage{
-			PromptTokens:     res.InputTokens,
-			CompletionTokens: res.OutputTokens,
-			TotalTokens:      res.InputTokens + res.OutputTokens,
-		},
-	})
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -1593,62 +1504,6 @@ func promptFromClaudeMessages(msgs []ClaudeMessage) string {
 	return strings.TrimSpace(sb.String())
 }
 
-func buildCodeReviewPrompt(req CodeReviewRequest) (string, error) {
-	diff := strings.TrimSpace(req.Diff)
-	content := strings.TrimSpace(req.Content)
-	if diff == "" && content == "" {
-		return "", fmt.Errorf("diff or content is required")
-	}
-	if len(diff) > maxCodeReviewInputChars {
-		return "", fmt.Errorf("diff is too large (max %d chars)", maxCodeReviewInputChars)
-	}
-	if len(content) > maxCodeReviewInputChars {
-		return "", fmt.Errorf("content is too large (max %d chars)", maxCodeReviewInputChars)
-	}
-	if len(diff)+len(content) > maxCodeReviewInputChars {
-		return "", fmt.Errorf("combined review input is too large (max %d chars)", maxCodeReviewInputChars)
-	}
-	var sb strings.Builder
-	sb.WriteString("You are a strict senior code reviewer.\n")
-	sb.WriteString("Rules:\n")
-	sb.WriteString("- Prioritize bugs, regressions, security issues, and missing edge-case handling.\n")
-	sb.WriteString("- Findings first, ordered by severity.\n")
-	sb.WriteString("- For each finding include: severity, impact, and concrete fix suggestion.\n")
-	sb.WriteString("- If no issues found, say: no critical findings, then list residual risks.\n")
-	sb.WriteString("- Keep output concise and technical.\n")
-	if lang := strings.TrimSpace(req.Language); lang != "" {
-		sb.WriteString("\nLanguage: ")
-		sb.WriteString(lang)
-		sb.WriteString("\n")
-	}
-	if len(req.Focus) > 0 {
-		sb.WriteString("Focus Areas: ")
-		for i, f := range req.Focus {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString(strings.TrimSpace(f))
-		}
-		sb.WriteString("\n")
-	}
-	if diff != "" {
-		sb.WriteString("\nDIFF INPUT:\n")
-		sb.WriteString(diff)
-		sb.WriteString("\n")
-	}
-	if content != "" {
-		sb.WriteString("\nCONTENT INPUT:\n")
-		sb.WriteString(content)
-		sb.WriteString("\n")
-	}
-	if custom := strings.TrimSpace(req.CustomPrompt); custom != "" {
-		sb.WriteString("\nAdditional Reviewer Instruction:\n")
-		sb.WriteString(custom)
-		sb.WriteString("\n")
-	}
-	return strings.TrimSpace(sb.String()), nil
-}
-
 func extractClaudeContentText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -1956,7 +1811,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			"api_key":                     s.currentAPIKey(),
 			"openai_endpoint":             strings.TrimRight(base, "/") + "/v1/chat/completions",
 			"claude_endpoint":             strings.TrimRight(base, "/") + "/v1/messages",
-			"code_review_endpoint":        strings.TrimRight(base, "/") + "/v1/code-review",
+			"auth_json_endpoint":          strings.TrimRight(base, "/") + "/v1/auth.json",
 			"openai_models_url":           strings.TrimRight(base, "/") + "/v1/models",
 			"openai_chat_url":             strings.TrimRight(base, "/") + "/v1/chat/completions",
 			"openai_responses_url":        strings.TrimRight(base, "/") + "/v1/responses",
@@ -2449,11 +2304,6 @@ func detectTrafficModelAndStream(path string, body []byte) (string, bool) {
 		}
 	case "/v1/responses":
 		var req ResponsesRequest
-		if err := json.Unmarshal(body, &req); err == nil {
-			return strings.TrimSpace(req.Model), req.Stream
-		}
-	case "/v1/code-review":
-		var req CodeReviewRequest
 		if err := json.Unmarshal(body, &req); err == nil {
 			return strings.TrimSpace(req.Model), req.Stream
 		}

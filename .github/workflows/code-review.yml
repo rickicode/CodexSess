@@ -1,4 +1,4 @@
-name: CodexSess Code Review
+name: CodexSess Review And Autofix
 
 on:
   pull_request:
@@ -6,41 +6,39 @@ on:
       - opened
       - synchronize
       - reopened
+      - ready_for_review
   workflow_dispatch:
     inputs:
-      base_sha:
-        description: "Base commit SHA (optional)"
+      target_ref:
+        description: "Target branch/tag/sha for manual run (e.g. main)"
+        required: false
+        default: "main"
+        type: string
+      review_scope:
+        description: "Review scope: diff (changes) or full (entire repository)"
+        required: false
+        default: "full"
+        type: choice
+        options:
+          - full
+          - diff
+      review_focus:
+        description: "Optional focus area for manual run (e.g. auth, api, performance, tests)"
         required: false
         type: string
-      head_sha:
-        description: "Head commit SHA (optional)"
-        required: false
-        type: string
-      pr_number:
-        description: "PR number to post review comment (optional)"
-        required: false
-        type: string
-      pr_title:
-        description: "PR title override for review prompt (optional)"
-        required: false
-        type: string
-  issue_comment:
-    types:
-      - created
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
 jobs:
-  codereview:
+  review_autofix:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Validate required secrets
         env:
@@ -53,148 +51,235 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Resolve review context
+      - name: Resolve execution context
         id: ctx
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let mode = 'manual';
+            let reportToPR = 'false';
+            let prNumber = '';
+            let title = '';
+            let baseSha = '';
+            let headSha = '';
+            let checkoutRepo = `${owner}/${repo}`;
+            let checkoutRef = (context.payload.inputs && context.payload.inputs.target_ref) || '${{ github.event.inputs.target_ref }}' || 'main';
+            let headRef = checkoutRef;
+            let sameRepo = 'true';
+
+            if (context.eventName === 'pull_request') {
+              mode = 'pr';
+              reportToPR = 'true';
+              const pr = context.payload.pull_request;
+              prNumber = String(pr.number);
+              title = pr.title || `PR #${pr.number}`;
+              baseSha = pr.base.sha;
+              headSha = pr.head.sha;
+              checkoutRepo = pr.head.repo.full_name;
+              checkoutRef = pr.head.ref;
+              headRef = pr.head.ref;
+              sameRepo = pr.head.repo.full_name === `${owner}/${repo}` ? 'true' : 'false';
+            } else {
+              title = `Manual review on ${checkoutRef}`;
+            }
+
+            core.setOutput('mode', mode);
+            core.setOutput('report_to_pr', reportToPR);
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('title', title);
+            core.setOutput('base_sha', baseSha);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('checkout_repo', checkoutRepo);
+            core.setOutput('checkout_ref', checkoutRef);
+            core.setOutput('head_ref', headRef);
+            core.setOutput('same_repo', sameRepo);
+
+      - name: Resolve review mode
+        id: mode
+        env:
+          REVIEW_SCOPE_INPUT: ${{ github.event.inputs.review_scope || '' }}
+          REVIEW_FOCUS_INPUT: ${{ github.event.inputs.review_focus || '' }}
         run: |
           set -euo pipefail
-          EVENT="${{ github.event_name }}"
-
-          if [ "$EVENT" = "pull_request" ]; then
-            BASE_SHA="${{ github.event.pull_request.base.sha }}"
-            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-            PR_NUMBER="${{ github.event.pull_request.number }}"
-            PR_TITLE="${{ github.event.pull_request.title }}"
+          if [ "${{ steps.ctx.outputs.mode }}" = "pr" ]; then
+            scope="diff"
+            focus=""
           else
-            BASE_SHA="${{ github.event.inputs.base_sha }}"
-            HEAD_SHA="${{ github.event.inputs.head_sha }}"
-            PR_NUMBER="${{ github.event.inputs.pr_number }}"
-            PR_TITLE="${{ github.event.inputs.pr_title }}"
+            scope="full"
+            case "${REVIEW_SCOPE_INPUT:-full}" in
+              full|diff) scope="${REVIEW_SCOPE_INPUT:-full}" ;;
+              *) scope="full" ;;
+            esac
+            focus="$(printf '%s' "${REVIEW_FOCUS_INPUT:-}" | tr -d '\r' | xargs)"
           fi
+          echo "scope=${scope}" >> "$GITHUB_OUTPUT"
+          echo "focus=${focus}" >> "$GITHUB_OUTPUT"
 
-          if [ -z "$HEAD_SHA" ]; then
-            HEAD_SHA="$(git rev-parse HEAD)"
-          fi
-          if [ -z "$BASE_SHA" ]; then
-            BASE_SHA="$(git rev-parse "${HEAD_SHA}~1")"
-          fi
-          if [ -z "$PR_TITLE" ]; then
-            PR_TITLE="Manual code review ${BASE_SHA}...${HEAD_SHA}"
-          fi
+      - name: Checkout target
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.ctx.outputs.checkout_repo }}
+          ref: ${{ steps.ctx.outputs.checkout_ref }}
+          fetch-depth: 0
 
-          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
 
-      - name: Build PR diff
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@latest
+
+      - name: Download auth.json from CodexSess
+        env:
+          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
+          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.codex"
+          curl -fsSL \
+            "${CODEXSESS_URL%/}/v1/auth.json" \
+            -H "Authorization: Bearer ${CODEXSESS_API_KEY}" \
+            -o "$HOME/.codex/auth.json"
+          jq empty "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Build review diff
         id: diff
         run: |
           set -euo pipefail
-          BASE_SHA="${{ steps.ctx.outputs.base_sha }}"
-          HEAD_SHA="${{ steps.ctx.outputs.head_sha }}"
-          mkdir -p review_chunks review_out
-          git diff --name-status "${BASE_SHA}...${HEAD_SHA}" > review_out/files.txt || true
-          mapfile -t CHANGED_FILES < <(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
-          if [ "${#CHANGED_FILES[@]}" -eq 0 ]; then
-            echo "has_diff=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          idx=0
-          for file in "${CHANGED_FILES[@]}"; do
-            [ -n "$file" ] || continue
-            git diff --unified=3 "${BASE_SHA}...${HEAD_SHA}" -- "$file" > "review_chunks/${idx}.diff" || true
-            if [ -s "review_chunks/${idx}.diff" ]; then
-              echo "${idx}|${file}" >> review_out/chunks.index
-              idx=$((idx+1))
+          : > pr.diff
+          has_diff="false"
+          if [ "${{ steps.mode.outputs.scope }}" = "diff" ]; then
+            if [ "${{ steps.ctx.outputs.mode }}" = "pr" ]; then
+              git diff --unified=3 "${{ steps.ctx.outputs.base_sha }}...${{ steps.ctx.outputs.head_sha }}" > pr.diff
             else
-              rm -f "review_chunks/${idx}.diff"
+              if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+                git diff --unified=3 HEAD~1..HEAD > pr.diff
+              fi
             fi
-          done
-          if [ ! -f review_out/chunks.index ]; then
-            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            if [ -s pr.diff ]; then
+              has_diff="true"
+            fi
+          fi
+          echo "has_diff=${has_diff}" >> "$GITHUB_OUTPUT"
+
+      - name: Run review with Codex
+        env:
+          BASE_SHA: ${{ steps.ctx.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+          REVIEW_TITLE: ${{ steps.ctx.outputs.title }}
+          REVIEW_SCOPE: ${{ steps.mode.outputs.scope }}
+          REVIEW_FOCUS: ${{ steps.mode.outputs.focus }}
+          EXEC_MODE: ${{ steps.ctx.outputs.mode }}
+          HAS_DIFF: ${{ steps.diff.outputs.has_diff }}
+        run: |
+          set -euo pipefail
+          scope_instruction='Review the ENTIRE repository (not limited to current diff). Start from the current working tree and inspect relevant files directly.'
+          if [ "${REVIEW_SCOPE}" = "diff" ]; then
+            scope_instruction='Use git to inspect changes in `pr.diff`.'
+            if [ "${HAS_DIFF}" != "true" ]; then
+              scope_instruction='No diff snapshot available. Fall back to repository-level review and report this condition clearly.'
+            fi
+          fi
+          focus_instruction=''
+          if [ -n "${REVIEW_FOCUS}" ]; then
+            focus_instruction="Extra focus requested by maintainer: ${REVIEW_FOCUS}"
+          fi
+          cat > review_prompt.txt <<PROMPT
+          You are reviewing code changes.
+          Execution mode: ${EXEC_MODE}
+          Context title: "${REVIEW_TITLE}"
+          Focus on bugs, regressions, security issues, and missing tests.
+          Output concise markdown with:
+          1) Summary
+          2) Findings ordered by severity (Critical/High/Medium/Low)
+          3) Concrete fix suggestions
+          4) Residual testing gaps
+          ${scope_instruction}
+          ${focus_instruction}
+          PROMPT
+          REVIEW_PROMPT="$(cat review_prompt.txt)"
+          codex exec \
+            --sandbox read-only \
+            --skip-git-repo-check \
+            -m gpt-5.2-codex \
+            "$REVIEW_PROMPT" > review.txt
+          if [ ! -s review.txt ]; then
+            echo "No review output generated." > review.txt
+          fi
+
+      - name: Run autofix with Codex
+        env:
+          REVIEW_TITLE: ${{ steps.ctx.outputs.title }}
+          REVIEW_SCOPE: ${{ steps.mode.outputs.scope }}
+          REVIEW_FOCUS: ${{ steps.mode.outputs.focus }}
+        run: |
+          set -euo pipefail
+          REVIEW_SNIPPET="$(head -c 20000 review.txt | tr '\0' ' ')"
+          mode_hint='Primary target: full repository findings.'
+          if [ "${REVIEW_SCOPE}" = "diff" ]; then
+            mode_hint='Primary target: diff findings.'
+          fi
+          focus_hint=''
+          if [ -n "${REVIEW_FOCUS}" ]; then
+            focus_hint="Maintainer focus: ${REVIEW_FOCUS}"
+          fi
+          cat > autofix_prompt.txt <<PROMPT
+          You are applying safe autofixes based on the latest review report.
+          Context title: "${REVIEW_TITLE}"
+          ${mode_hint}
+          ${focus_hint}
+
+          Review findings to address:
+          $REVIEW_SNIPPET
+
+          Instructions:
+          - Apply minimal, safe fixes directly in repository files.
+          - Prioritize Critical/High findings first, then Medium.
+          - Do not modify unrelated files.
+          - Keep behavior backward-compatible unless fix requires change.
+          - If a finding cannot be safely fixed automatically, skip it.
+          - After edits, leave the repo in a consistent state.
+          PROMPT
+          AUTOFIX_PROMPT="$(cat autofix_prompt.txt)"
+          codex exec \
+            --sandbox workspace-write \
+            --skip-git-repo-check \
+            -m gpt-5.2-codex \
+            "$AUTOFIX_PROMPT" > autofix.txt || true
+
+      - name: Commit and push autofix
+        id: pushfix
+        if: steps.ctx.outputs.mode == 'manual' || steps.ctx.outputs.same_repo == 'true'
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "branch=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "chunk_count=${idx}" >> "$GITHUB_OUTPUT"
-          echo "has_diff=true" >> "$GITHUB_OUTPUT"
 
-      - name: Review chunks via CodexSess
-        if: steps.diff.outputs.has_diff == 'true'
-        env:
-          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
-          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
-        run: |
-          set -euo pipefail
-          : > review_out/chunk_reviews.md
-          while IFS='|' read -r idx file; do
-            [ -f "review_chunks/${idx}.diff" ] || continue
-            BODY=$(jq -n \
-              --rawfile diff "review_chunks/${idx}.diff" \
-              --arg title "${{ steps.ctx.outputs.pr_title }}" \
-              --arg file "$file" \
-              '{
-                model: "gpt-5.2-codex",
-                language: "mixed",
-                focus: ["bugs","security","regression","test_coverage"],
-                diff: $diff,
-                custom_prompt: ("You are reviewing one file chunk from a PR. PR title: " + $title + ". File: " + $file + ". Return concrete findings with severity and file/line references when possible. If no issues, state no critical findings for this file."),
-                stream: false
-              }')
-            curl -fsSL \
-              --retry 3 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              --connect-timeout 10 \
-              --max-time 240 \
-              "${CODEXSESS_URL%/}/v1/code-review" \
-              -H "Authorization: Bearer ${CODEXSESS_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d "$BODY" > "review_out/chunk_${idx}.json"
+          git config user.name "codexsess-bot"
+          git config user.email "codexsess-bot@users.noreply.github.com"
 
-            {
-              echo "### File: ${file}"
-              jq -r '.review // "No review output returned."' "review_out/chunk_${idx}.json"
-              echo
-            } >> review_out/chunk_reviews.md
-          done < review_out/chunks.index
+          target_ref="${{ steps.ctx.outputs.head_ref }}"
+          if [ "${{ steps.ctx.outputs.mode }}" = "manual" ]; then
+            target_ref="codexsess/manual-autofix-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            git checkout -b "${target_ref}"
+          fi
 
-      - name: Synthesize final review
-        if: steps.diff.outputs.has_diff == 'true'
-        env:
-          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
-          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
-        run: |
-          set -euo pipefail
-          BODY=$(jq -n \
-            --rawfile files review_out/files.txt \
-            --rawfile chunk_reviews review_out/chunk_reviews.md \
-            --arg title "${{ steps.ctx.outputs.pr_title }}" \
-            '{
-              model: "gpt-5.2-codex",
-              language: "mixed",
-              focus: ["bugs","security","regression","test_coverage"],
-              content: ("PR title: " + $title + "\n\nChanged files:\n" + $files + "\n\nPer-file reviewer outputs:\n" + $chunk_reviews),
-              custom_prompt: "Synthesize these chunk reviews into one final PR review. Deduplicate findings. Output ordered by severity (critical/high/medium/low). Include: summary, findings with impact + suggested fix, patch-ready snippet when confidence is high, and testing gaps.",
-              stream: false
-            }')
-          curl -fsSL \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            --connect-timeout 10 \
-            --max-time 240 \
-            "${CODEXSESS_URL%/}/v1/code-review" \
-            -H "Authorization: Bearer ${CODEXSESS_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "$BODY" > review_out/final.json
-          jq -r '.review // "No review output returned."' review_out/final.json > review.txt
+          git add -A
+          git commit -m "chore: codexsess autofix (${target_ref})"
+          git push origin "HEAD:${target_ref}"
 
-      - name: Upsert PR comment
-        if: steps.diff.outputs.has_diff == 'true' && steps.ctx.outputs.pr_number != ''
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=${target_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Report result to PR
+        if: steps.ctx.outputs.report_to_pr == 'true'
         uses: actions/github-script@v8
         with:
           script: |
@@ -202,19 +287,36 @@ jobs:
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const issue_number = Number('${{ steps.ctx.outputs.pr_number }}');
-            const marker = '<!-- codexsess-code-review -->';
-            let review = 'No review output returned.';
+            const marker = '<!-- codexsess-review-autofix -->';
+            let review = 'No review output generated.';
             try {
               review = fs.readFileSync('review.txt', 'utf8').trim() || review;
             } catch (_) {}
-            const maxLen = 60000;
-            if (review.length > maxLen) {
-              review = review.slice(0, maxLen) + '\n\n... (truncated by GitHub Action)';
-            }
-            const body = `${marker}
-            ## CodexSess Automated Code Review
+            if (review.length > 60000) review = review.slice(0, 60000) + '\n\n... (truncated)';
 
-            ${review}`;
+            const reviewScope = '${{ steps.mode.outputs.scope }}' || 'diff';
+            const reviewFocus = '${{ steps.mode.outputs.focus }}' || '-';
+            const pushed = '${{ steps.pushfix.outputs.pushed || 'false' }}' === 'true';
+            const sameRepo = '${{ steps.ctx.outputs.same_repo }}' === 'true';
+            let autofixStatus = '';
+            if (!sameRepo) {
+              autofixStatus = 'Autofix generated but push skipped (fork PR / external head repository).';
+            } else if (pushed) {
+              autofixStatus = 'Autofix commit has been pushed to this PR branch.';
+            } else {
+              autofixStatus = 'No safe autofix changes were applied.';
+            }
+
+            const body = `${marker}
+            ## CodexSess Automated Review
+
+            - Scope: \`${reviewScope}\`
+            - Focus: \`${reviewFocus}\`
+
+            ${review}
+
+            ### Autofix Status
+            ${autofixStatus}`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner,
@@ -243,161 +345,18 @@ jobs:
               });
             }
 
-      - name: Skip note (no diff)
-        if: steps.diff.outputs.has_diff != 'true'
-        run: echo "No diff found. Skipping CodexSess review."
-
-  autofix:
-    if: >
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request != null &&
-      startsWith(github.event.comment.body, '/codexsess-autofix') &&
-      (
-        github.event.comment.author_association == 'OWNER' ||
-        github.event.comment.author_association == 'MEMBER' ||
-        github.event.comment.author_association == 'COLLABORATOR'
-      )
-    runs-on: ubuntu-latest
-    steps:
-      - name: Validate required secrets
-        env:
-          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
-          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
+      - name: Manual run summary
+        if: steps.ctx.outputs.mode == 'manual'
         run: |
-          set -euo pipefail
-          if [ -z "${CODEXSESS_URL:-}" ] || [ -z "${CODEXSESS_API_KEY:-}" ]; then
-            echo "Missing CODEXSESS_URL or CODEXSESS_API_KEY secret"
-            exit 1
-          fi
-
-      - name: Resolve PR metadata
-        id: pr
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const pull_number = context.payload.issue.number;
-            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
-            core.setOutput('number', String(pr.number));
-            core.setOutput('head_ref', pr.head.ref);
-            core.setOutput('head_repo', pr.head.repo.full_name);
-            core.setOutput('base_sha', pr.base.sha);
-            core.setOutput('head_sha', pr.head.sha);
-            core.setOutput('is_same_repo', pr.head.repo.full_name === `${owner}/${repo}` ? 'true' : 'false');
-
-      - name: Checkout PR head
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ steps.pr.outputs.head_repo }}
-          ref: ${{ steps.pr.outputs.head_ref }}
-          fetch-depth: 0
-
-      - name: Build PR diff
-        id: diff
-        run: |
-          set -euo pipefail
-          BASE_SHA="${{ steps.pr.outputs.base_sha }}"
-          HEAD_SHA="${{ steps.pr.outputs.head_sha }}"
-          git diff --unified=3 "${BASE_SHA}...${HEAD_SHA}" > pr.diff
-          if [ ! -s pr.diff ]; then
-            echo "has_diff=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "has_diff=true" >> "$GITHUB_OUTPUT"
-
-      - name: Request autofix patch from CodexSess
-        if: steps.diff.outputs.has_diff == 'true'
-        env:
-          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
-          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
-        run: |
-          set -euo pipefail
-          BODY=$(jq -n \
-            --rawfile diff pr.diff \
-            --arg title "${{ github.event.issue.title }}" \
-            '{
-              model: "gpt-5.2-codex",
-              language: "mixed",
-              focus: ["bugs","regression","correctness"],
-              diff: $diff,
-              custom_prompt: ("Generate an autofix patch for this PR. Title: " + $title + ". Output MUST be a single valid unified diff only, starting with diff --git. No prose, no markdown fences, no explanations. Keep changes minimal and safe."),
-              stream: false
-            }')
-          curl -fsSL \
-            --retry 3 \
-            --retry-delay 2 \
-            --retry-all-errors \
-            --connect-timeout 10 \
-            --max-time 240 \
-            "${CODEXSESS_URL%/}/v1/code-review" \
-            -H "Authorization: Bearer ${CODEXSESS_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "$BODY" > review.json
-          jq -r '.review // ""' review.json > review_raw.txt
-          awk 'BEGIN{capture=0} /^diff --git /{capture=1} capture{print}' review_raw.txt > autofix.patch
-
-      - name: Validate patch
-        if: steps.diff.outputs.has_diff == 'true'
-        id: validate
-        run: |
-          set -euo pipefail
-          if [ ! -s autofix.patch ]; then
-            echo "valid=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git apply --check autofix.patch; then
-            echo "valid=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "valid=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Prepare patch preview
-        if: steps.diff.outputs.has_diff == 'true' && steps.validate.outputs.valid == 'true'
-        id: preview
-        run: |
-          set -euo pipefail
-          MAX=45000
-          SIZE=$(wc -c < autofix.patch || echo 0)
-          if [ "$SIZE" -gt "$MAX" ]; then
-            head -c "$MAX" autofix.patch > autofix.preview.patch
-            echo "\n# ... patch preview truncated ..." >> autofix.preview.patch
-          else
-            cp autofix.patch autofix.preview.patch
-          fi
-
-      - name: Upload patch artifact
-        if: steps.diff.outputs.has_diff == 'true' && steps.validate.outputs.valid == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: codexsess-autofix-patch-pr-${{ steps.pr.outputs.number }}
-          path: autofix.patch
-
-      - name: Report result
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const fs = require('fs');
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const issue_number = context.payload.issue.number;
-            const hasDiff = '${{ steps.diff.outputs.has_diff || 'false' }}' === 'true';
-            const valid = '${{ steps.validate.outputs.valid || 'false' }}' === 'true';
-            let body = '';
-            if (!hasDiff) {
-              body = 'Autofix skipped: no diff detected for this PR.';
-            } else if (!valid) {
-              body = 'Autofix suggestion failed: generated patch was empty or invalid. Review manually is required.';
-            } else {
-              let patchPreview = '';
-              try {
-                patchPreview = fs.readFileSync('autofix.preview.patch', 'utf8').trim();
-              } catch (_) {}
-              const header = 'Autofix suggestion generated. No code was pushed or merged automatically.\nReview and apply manually if accepted.';
-              if (patchPreview) {
-                body = `${header}\n\n\`\`\`diff\n${patchPreview}\n\`\`\``;
-              } else {
-                body = header + '\n\nPatch file is attached as workflow artifact.';
-              }
-            }
-            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+          {
+            echo "## CodexSess Manual Review Result"
+            echo ""
+            echo "- Scope: \`${{ steps.mode.outputs.scope }}\`"
+            echo "- Focus: \`${{ steps.mode.outputs.focus || '-' }}\`"
+            echo "- Target ref: \`${{ steps.ctx.outputs.checkout_ref }}\`"
+            if [ "${{ steps.pushfix.outputs.pushed }}" = "true" ]; then
+              echo "- Autofix branch: \`${{ steps.pushfix.outputs.branch }}\`"
+            else
+              echo "- Autofix branch: \`none (no safe changes)\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

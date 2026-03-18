@@ -4,7 +4,7 @@
     apiKey,
     openAIEndpoint,
     claudeEndpoint,
-    codeReviewEndpoint,
+    authJSONEndpoint,
     availableModels,
     modelMappings,
     mappingAlias,
@@ -21,7 +21,7 @@
     isCopied,
     openAIExample,
     claudeExample,
-    codeReviewExample
+    authJSONExample
   } = $props();
 </script>
 
@@ -123,11 +123,11 @@
       </div>
 
       <div class="setting-row">
-        <label for="codeReviewEndpoint">Code Review Endpoint</label>
+        <label for="authJsonEndpoint">Auth JSON Endpoint</label>
         <div class="setting-actions-grid">
-          <input id="codeReviewEndpoint" value={codeReviewEndpoint} readonly disabled />
-          <button class="btn btn-secondary" onclick={() => onCopyText(codeReviewEndpoint, 'Code review endpoint', 'code_review_endpoint')} disabled={busy}>
-            {#if isCopied('code_review_endpoint')}Copied{:else}Copy{/if}
+          <input id="authJsonEndpoint" value={authJSONEndpoint} readonly disabled />
+          <button class="btn btn-secondary" onclick={() => onCopyText(authJSONEndpoint, 'Auth JSON endpoint', 'auth_json_endpoint')} disabled={busy}>
+            {#if isCopied('auth_json_endpoint')}Copied{:else}Copy{/if}
           </button>
         </div>
       </div>
@@ -156,11 +156,11 @@
       </div>
 
       <div class="setting-row">
-        <p class="setting-title">Code Review Request Example</p>
+        <p class="setting-title">Auth JSON Download Example</p>
         <div class="code-box">
-          <pre>{codeReviewExample()}</pre>
-          <button class="btn btn-secondary" onclick={() => onCopyText(codeReviewExample(), 'Code review example', 'code_review_example')}>
-            {#if isCopied('code_review_example')}Copied{:else}Copy Example{/if}
+          <pre>{authJSONExample()}</pre>
+          <button class="btn btn-secondary" onclick={() => onCopyText(authJSONExample(), 'Auth JSON example', 'auth_json_example')}>
+            {#if isCopied('auth_json_example')}Copied{:else}Copy Example{/if}
           </button>
         </div>
       </div>

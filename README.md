@@ -24,7 +24,7 @@
   <p>
     <a href="#overview">Overview</a> •
     <a href="#core-capabilities">Core Capabilities</a> •
-    <a href="#code-review-usage">Code Review Usage</a> •
+    <a href="#github-code-review-workflow">GitHub Code Review Workflow</a> •
     <a href="#ui-preview">UI Preview</a> •
     <a href="#authentication--session">Authentication</a> •
     <a href="#environment-variables">Environment</a> •
@@ -61,7 +61,6 @@ Instead of juggling scripts, manual token edits, and separate dashboards, CodexS
   - `POST /v1/chat/completions` (including SSE streaming)
   - `GET /v1/models`
   - `POST /v1/responses`
-  - `POST /v1/code-review` (dedicated code review endpoint, optional `custom_prompt`)
   - `POST /claude/v1/messages`
 - Separate active account state:
   - API active account
@@ -102,61 +101,25 @@ Instead of juggling scripts, manual token edits, and separate dashboards, CodexS
 API compatibility routes under `/v1/*` and `/claude/v1/*` remain API-key style routes and are not blocked by web login UI flow.
 This means OpenAI clients and Claude-style clients can both be routed through CodexSess.
 
-## Code Review Usage
+## GitHub Code Review Workflow
 
-`POST /v1/code-review` is a dedicated review endpoint.
+To use CodexSess automated PR review/autofix in GitHub:
 
-Required context:
-- Send at least one of: `diff` or `content`
+- Use workflow file: `.github/workflows/code-review.yml`
+- Add required repository secrets:
+  - `CODEXSESS_URL`
+  - `CODEXSESS_API_KEY`
+- Trigger modes:
+  - automatic on `pull_request` events
+  - manual via `workflow_dispatch`
+- Manual inputs (`workflow_dispatch`):
+  - `target_ref` (optional, branch/tag/sha; default `main`)
+  - `review_scope` (`diff` or `full`)
+  - `review_focus` (optional focus area)
 
-Optional controls:
-- `language`
-- `focus` (array of review priorities)
-- `custom_prompt` (optional additional reviewer instruction)
-- `stream`
-
-Local CLI example:
-
-```bash
-DIFF="$(git diff HEAD~1..HEAD)"
-BODY=$(jq -n --arg diff "$DIFF" '{
-  model: "gpt-5.2-codex",
-  language: "go",
-  focus: ["security","regression"],
-  diff: $diff,
-  custom_prompt: "Prioritize auth and race-condition issues.",
-  stream: false
-}')
-curl -sS http://127.0.0.1:3061/v1/code-review \
-  -H "Authorization: Bearer sk-xxxx" \
-  -H "Content-Type: application/json" \
-  -d "$BODY"
-```
-
-GitHub Actions example (PR diff):
-
-```yaml
-- name: Build PR diff
-  run: |
-    git fetch origin ${{ github.base_ref }} --depth=1
-    git diff --unified=3 origin/${{ github.base_ref }}...HEAD > pr.diff
-
-- name: Review via CodexSess
-  env:
-    CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
-    CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
-  run: |
-    BODY=$(jq -n --arg diff "$(cat pr.diff)" '{
-      model: "gpt-5.2-codex",
-      focus: ["security","regression"],
-      diff: $diff,
-      stream: false
-    }')
-    curl -sS "$CODEXSESS_URL/v1/code-review" \
-      -H "Authorization: Bearer $CODEXSESS_API_KEY" \
-      -H "Content-Type: application/json" \
-      -d "$BODY" > review.json
-```
+Behavior:
+- Automatic PR run: posts review to PR and pushes autofix to PR branch when allowed.
+- Manual run: reviews selected `target_ref`; if autofix exists, workflow creates and pushes a new branch automatically.
 
 ## Environment Variables
 

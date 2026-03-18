@@ -70,7 +70,23 @@ Use the latest published binaries from GitHub Releases:
 Each release includes an `install.sh` script for automatic installation.
 
 ```bash
-curl -fsSL https://github.com/rickicode/CodexSess/releases/latest/download/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash
+```
+
+Mode-specific one-liners:
+
+```bash
+# auto (default)
+curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode auto
+
+# gui (linux desktop package)
+curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode gui
+
+# server / cli
+curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode server
+
+# update existing install (auto-detects gui/server)
+curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode update
 ```
 
 Installer modes:

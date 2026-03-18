@@ -13,7 +13,7 @@
     onCheckForUpdates
   } = $props();
 
-  const updateScriptCommand = 'curl -fsSL https://github.com/rickicode/CodexSess/releases/latest/download/install.sh | bash -s -- --mode update';
+  const updateScriptCommand = 'curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode update';
 
   async function copyUpdateScript() {
     try {

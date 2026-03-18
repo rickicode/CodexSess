@@ -47,6 +47,9 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - GitHub code-review autofix push is now guarded for PR mode to skip direct push on fork-based PRs, preventing workflow failure from cross-repo push permission errors.
 - GitHub code-review workflow now runs Codex in CI with `--dangerously-bypass-approvals-and-sandbox` to avoid bubblewrap (`bwrap`) sandbox failures on hosted runners.
 - GitHub code-review workflow now provisions default MCP servers in CI (`filesystem`, `sequential_thinking`, `memory`) and enables `exa` when optional `EXA_API_KEY` secret is set.
+- GitHub code-review workflow now installs security tooling in CI (`semgrep`, `gitleaks`, `gosec`, `govulncheck`) so Codex can run direct security checks during review/autofix when needed.
+- GitHub code-review autofix commit step now strips CI scratch artifacts and excludes `.github/workflows/*` from automation commits to avoid push rejections when workflow-token lacks `workflows` permission.
+- GitHub code-review PR comments now prioritize analysis output (review findings + autofix summary) and strip raw code blocks from posted comment content.
 
 ## [1.0.1] - 2026-03-18
 

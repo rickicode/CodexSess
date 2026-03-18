@@ -129,8 +129,23 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Setup Go (for security tooling)
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+
       - name: Install Codex CLI
         run: npm install -g @openai/codex@latest
+
+      - name: Install security tools for Codex review
+        run: |
+          set -euo pipefail
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user semgrep
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          go install github.com/zricethezav/gitleaks/v8@latest
 
       - name: Download auth.json from CodexSess
         env:
@@ -234,10 +249,39 @@ jobs:
           You are reviewing code changes.
           Execution mode: ${EXEC_MODE}
           Context title: "${REVIEW_TITLE}"
-          Focus on bugs, regressions, security issues, and missing tests.
+          Primary objective: find correctness bugs, regressions, and security vulnerabilities that could lead to compromise.
+          Perform a defensive security audit, not only style review.
+          You are allowed to run local security tools to verify findings when useful.
+          Available tools in this workflow:
+          - semgrep
+          - gitleaks
+          - gosec
+          - govulncheck
+          Use tool output as evidence and map findings to concrete files.
+          Security focus (non-exhaustive):
+          - Authentication and authorization bypass
+          - Privilege escalation paths
+          - Secret/token leakage (logs, errors, config, client exposure)
+          - Injection risks (SQL/NoSQL/command/template/code)
+          - Path traversal, SSRF, open redirect, unsafe file access
+          - CSRF/CORS/session/cookie misconfiguration
+          - Insecure deserialization / unsafe parsing
+          - Race conditions and TOCTOU in auth/state-changing flows
+          - Weak input validation / missing bounds checks
+          - Unsafe defaults, insecure debug behavior, missing rate limiting
+          - Dependency/supply-chain risk introduced by code changes
+          For each finding, explain realistic exploit impact and attack path.
+          If evidence is insufficient, say "needs verification" instead of guessing.
           Output concise markdown with:
           1) Summary
           2) Findings ordered by severity (Critical/High/Medium/Low)
+             - For each finding include:
+               - Title
+               - Affected file/path
+               - Why exploitable (or why likely)
+               - Impact
+               - Minimal concrete fix
+               - Verification step/test
           3) Concrete fix suggestions
           4) Residual testing gaps
           ${scope_instruction}
@@ -279,12 +323,20 @@ jobs:
           $REVIEW_SNIPPET
 
           Instructions:
+          - Prioritize security vulnerabilities first (Critical/High), then correctness bugs.
           - Apply minimal, safe fixes directly in repository files.
-          - Prioritize Critical/High findings first, then Medium.
+          - Run available security tools when needed to verify fixes and reduce false positives.
           - Do not modify unrelated files.
           - Keep behavior backward-compatible unless fix requires change.
+          - Prefer hardening that reduces exploitability (validation, auth checks, safer defaults, secret handling).
+          - Avoid introducing new config/runtime requirements unless strictly necessary.
           - If a finding cannot be safely fixed automatically, skip it.
           - After edits, leave the repo in a consistent state.
+          Final response format (no code snippets):
+          1) Applied Fix Summary
+          2) Files Touched (path + reason)
+          3) Findings Skipped (with reason)
+          4) Verification Notes
           PROMPT
           AUTOFIX_PROMPT="$(cat autofix_prompt.txt)"
           codex exec \
@@ -306,12 +358,6 @@ jobs:
         if: steps.ctx.outputs.mode == 'manual' || steps.ctx.outputs.same_repo == 'true'
         run: |
           set -euo pipefail
-          if git diff --quiet; then
-            echo "pushed=false" >> "$GITHUB_OUTPUT"
-            echo "branch=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           git config user.name "codexsess-bot"
           git config user.email "codexsess-bot@users.noreply.github.com"
 
@@ -321,35 +367,112 @@ jobs:
             git checkout -b "${target_ref}"
           fi
 
+          # Never include CI scratch artifacts in autofix commits.
+          rm -f review.txt autofix.txt review_prompt.txt autofix_prompt.txt pr.diff || true
+
           git add -A
+          # Never allow workflow-file edits from this automation branch, because
+          # default GitHub App tokens often lack workflows:write permission.
+          git restore --staged .github/workflows/*.yml 2>/dev/null || true
+          git checkout -- .github/workflows/*.yml 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           git commit -m "chore: codexsess autofix (${target_ref})"
           git push origin "HEAD:${target_ref}"
 
           echo "pushed=true" >> "$GITHUB_OUTPUT"
           echo "branch=${target_ref}" >> "$GITHUB_OUTPUT"
 
+      - name: Create PR for manual autofix branch
+        id: manualpr
+        if: steps.ctx.outputs.mode == 'manual' && steps.pushfix.outputs.pushed == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = '${{ steps.pushfix.outputs.branch }}';
+            const base = '${{ steps.ctx.outputs.checkout_ref }}';
+            const title = `chore: codexsess manual autofix (${head})`;
+            const body = [
+              'Automated manual review/autofix branch generated by CodexSess workflow.',
+              '',
+              `- Base: \`${base}\``,
+              `- Head: \`${head}\``,
+              `- Scope: \`${{ steps.mode.outputs.scope }}\``,
+              `- Focus: \`${{ steps.mode.outputs.focus || '-' }}\``
+            ].join('\n');
+
+            let prNumber = '';
+            try {
+              const { data: created } = await github.rest.pulls.create({
+                owner,
+                repo,
+                title,
+                head,
+                base,
+                body
+              });
+              prNumber = String(created.number);
+            } catch (err) {
+              if (err.status === 422) {
+                const { data: pulls } = await github.rest.pulls.list({
+                  owner,
+                  repo,
+                  state: 'open',
+                  head: `${owner}:${head}`,
+                  base
+                });
+                if (pulls.length > 0) {
+                  prNumber = String(pulls[0].number);
+                } else {
+                  throw err;
+                }
+              } else {
+                throw err;
+              }
+            }
+
+            core.setOutput('number', prNumber);
+
       - name: Report result to PR
-        if: steps.ctx.outputs.report_to_pr == 'true'
+        if: steps.ctx.outputs.report_to_pr == 'true' || steps.manualpr.outputs.number != ''
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const issue_number = Number('${{ steps.ctx.outputs.pr_number }}');
+            const issue_number = Number('${{ steps.ctx.outputs.pr_number || steps.manualpr.outputs.number }}');
             const marker = '<!-- codexsess-review-autofix -->';
             let review = 'No review output generated.';
             try {
               review = fs.readFileSync('review.txt', 'utf8').trim() || review;
             } catch (_) {}
-            if (review.length > 60000) review = review.slice(0, 60000) + '\n\n... (truncated)';
+            if (review.length > 30000) review = review.slice(0, 30000) + '\n\n... (truncated)';
+            let autofix = 'No autofix output generated.';
+            try {
+              autofix = fs.readFileSync('autofix.txt', 'utf8').trim() || autofix;
+            } catch (_) {}
+            if (autofix.length > 15000) autofix = autofix.slice(0, 15000) + '\n\n... (truncated)';
+            // Keep PR comments focused on analysis/results (no raw code blocks).
+            review = review.replace(/```[\s\S]*?```/g, '[code omitted]');
+            autofix = autofix.replace(/```[\s\S]*?```/g, '[code omitted]');
 
             const reviewScope = '${{ steps.mode.outputs.scope }}' || 'diff';
             const reviewFocus = '${{ steps.mode.outputs.focus }}' || '-';
             const pushed = '${{ steps.pushfix.outputs.pushed || 'false' }}' === 'true';
             const sameRepo = '${{ steps.ctx.outputs.same_repo }}' === 'true';
+            const execMode = '${{ steps.ctx.outputs.mode }}';
             let autofixStatus = '';
-            if (!sameRepo) {
+            if (execMode === 'manual' && pushed) {
+              autofixStatus = `Autofix branch pushed: \`${'${{ steps.pushfix.outputs.branch }}'}\``;
+            } else if (!sameRepo) {
               autofixStatus = 'Autofix generated but push skipped (fork PR / external head repository).';
             } else if (pushed) {
               autofixStatus = 'Autofix commit has been pushed to this PR branch.';
@@ -366,7 +489,10 @@ jobs:
             ${review}
 
             ### Autofix Status
-            ${autofixStatus}`;
+            ${autofixStatus}
+
+            ### Autofix Analysis
+            ${autofix}`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner,

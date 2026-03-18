@@ -7,6 +7,37 @@ VERSION="latest"     # latest or vX.Y.Z
 BIN_DIR="/usr/local/bin"
 NO_SUDO="0"
 DETECTED_SERVER_BIN=""
+TMP_PATHS=()
+
+if [[ -t 1 ]]; then
+  COLOR_INFO=$'\033[1;36m'
+  COLOR_OK=$'\033[1;32m'
+  COLOR_ERR=$'\033[1;31m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_INFO=""
+  COLOR_OK=""
+  COLOR_ERR=""
+  COLOR_RESET=""
+fi
+
+cleanup_tmp_paths() {
+  local p
+  for p in "${TMP_PATHS[@]:-}"; do
+    if [[ -n "${p}" ]]; then
+      rm -rf "${p}" || true
+    fi
+  done
+}
+
+new_tmp_dir() {
+  local d
+  d="$(mktemp -d)"
+  TMP_PATHS+=("${d}")
+  printf '%s' "${d}"
+}
+
+trap cleanup_tmp_paths EXIT
 
 usage() {
   cat <<'EOF'
@@ -34,8 +65,14 @@ Note:
 EOF
 }
 
-log() { printf '[codexsess-installer] %s\n' "$*"; }
-err() { printf '[codexsess-installer] ERROR: %s\n' "$*" >&2; }
+log() { printf '%s[codexsess-installer]%s %s\n' "${COLOR_INFO}" "${COLOR_RESET}" "$*"; }
+ok() { printf '%s[codexsess-installer]%s %s\n' "${COLOR_OK}" "${COLOR_RESET}" "$*"; }
+err() { printf '%s[codexsess-installer] ERROR:%s %s\n' "${COLOR_ERR}" "${COLOR_RESET}" "$*" >&2; }
+
+print_auth_help() {
+  ok "default login: username=admin password=hijilabs"
+  ok "change password: codexsess --changepassword"
+}
 
 run_root() {
   if [[ "${NO_SUDO}" == "1" || "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -181,15 +218,14 @@ install_gui_linux() {
   tag="$(resolve_tag)"
   pkg_version="${tag#v}"
   arch="$(detect_arch)"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  tmp="$(new_tmp_dir)"
 
   if has_cmd dpkg; then
     pkg="codexsess_GUI_${pkg_version}_${arch}.deb"
     log "downloading ${pkg}"
     curl -fL "https://github.com/${REPO}/releases/download/${tag}/${pkg}" -o "${tmp}/${pkg}"
     run_root dpkg -i "${tmp}/${pkg}"
-    log "installed GUI package via dpkg: ${pkg}"
+    ok "installed GUI package via dpkg: ${pkg}"
     return
   fi
 
@@ -210,7 +246,7 @@ install_gui_linux() {
     else
       run_root rpm -Uvh "${tmp}/${pkg}"
     fi
-    log "installed GUI package via rpm: ${pkg}"
+    ok "installed GUI package via rpm: ${pkg}"
     return
   fi
 
@@ -224,8 +260,7 @@ install_server_binary_release() {
   local tag tmp outbin arch asset
   tag="$(resolve_tag)"
   arch="$(detect_arch)"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  tmp="$(new_tmp_dir)"
 
   asset="codexsess-linux-${arch}"
   outbin="${BIN_DIR%/}/codexsess"
@@ -235,7 +270,7 @@ install_server_binary_release() {
 
   run_root mkdir -p "${BIN_DIR}"
   install_binary_file "${tmp}/${asset}" "${outbin}"
-  log "installed server binary: ${outbin}"
+  ok "installed server binary: ${outbin}"
 
   configure_server_systemd "${outbin}"
 }
@@ -264,6 +299,7 @@ Type=simple
 ExecStart=${outbin}
 Restart=always
 RestartSec=2
+Environment=CODEXSESS_BIND_ADDR=0.0.0.0:3061
 Environment=CODEXSESS_NO_OPEN_BROWSER=1
 
 [Install]
@@ -274,7 +310,14 @@ EOF
   run_root systemctl daemon-reload
   run_root systemctl enable --now codexsess.service
   run_root systemctl restart codexsess.service
-  log "systemd service active: codexsess.service"
+  if run_root systemctl is-active --quiet codexsess.service; then
+    ok "systemd service active: codexsess.service"
+    ok "check status with: systemctl status codexsess"
+  else
+    err "systemd service is not active: codexsess.service"
+    log "check status with: systemctl status codexsess"
+    return 1
+  fi
 }
 
 main() {
@@ -332,9 +375,11 @@ main() {
         exit 1
       fi
       install_gui_linux
+      print_auth_help
       ;;
     server)
       install_server_binary_release
+      print_auth_help
       ;;
     update)
       err "invalid mode transition for update"

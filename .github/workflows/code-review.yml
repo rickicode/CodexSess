@@ -6,6 +6,24 @@ on:
       - opened
       - synchronize
       - reopened
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "Base commit SHA (optional)"
+        required: false
+        type: string
+      head_sha:
+        description: "Head commit SHA (optional)"
+        required: false
+        type: string
+      pr_number:
+        description: "PR number to post review comment (optional)"
+        required: false
+        type: string
+      pr_title:
+        description: "PR title override for review prompt (optional)"
+        required: false
+        type: string
   issue_comment:
     types:
       - created
@@ -22,19 +40,52 @@ permissions:
 jobs:
   codereview:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' && secrets.CODEXSESS_URL != '' && secrets.CODEXSESS_API_KEY != '' }}
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && secrets.CODEXSESS_URL != '' && secrets.CODEXSESS_API_KEY != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
+      - name: Resolve review context
+        id: ctx
+        run: |
+          set -euo pipefail
+          EVENT="${{ github.event_name }}"
+
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+            PR_TITLE="${{ github.event.pull_request.title }}"
+          else
+            BASE_SHA="${{ github.event.inputs.base_sha }}"
+            HEAD_SHA="${{ github.event.inputs.head_sha }}"
+            PR_NUMBER="${{ github.event.inputs.pr_number }}"
+            PR_TITLE="${{ github.event.inputs.pr_title }}"
+          fi
+
+          if [ -z "$HEAD_SHA" ]; then
+            HEAD_SHA="$(git rev-parse HEAD)"
+          fi
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA="$(git rev-parse "${HEAD_SHA}~1")"
+          fi
+          if [ -z "$PR_TITLE" ]; then
+            PR_TITLE="Manual code review ${BASE_SHA}...${HEAD_SHA}"
+          fi
+
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+
       - name: Build PR diff
         id: diff
         run: |
           set -euo pipefail
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA="${{ steps.ctx.outputs.base_sha }}"
+          HEAD_SHA="${{ steps.ctx.outputs.head_sha }}"
           mkdir -p review_chunks review_out
           git diff --name-status "${BASE_SHA}...${HEAD_SHA}" > review_out/files.txt || true
           mapfile -t CHANGED_FILES < <(git diff --name-only "${BASE_SHA}...${HEAD_SHA}")
@@ -72,7 +123,7 @@ jobs:
             [ -f "review_chunks/${idx}.diff" ] || continue
             BODY=$(jq -n \
               --rawfile diff "review_chunks/${idx}.diff" \
-              --arg title "${{ github.event.pull_request.title }}" \
+              --arg title "${{ steps.ctx.outputs.pr_title }}" \
               --arg file "$file" \
               '{
                 model: "gpt-5.2-codex",
@@ -110,7 +161,7 @@ jobs:
           BODY=$(jq -n \
             --rawfile files review_out/files.txt \
             --rawfile chunk_reviews review_out/chunk_reviews.md \
-            --arg title "${{ github.event.pull_request.title }}" \
+            --arg title "${{ steps.ctx.outputs.pr_title }}" \
             '{
               model: "gpt-5.2-codex",
               language: "mixed",
@@ -132,14 +183,14 @@ jobs:
           jq -r '.review // "No review output returned."' review_out/final.json > review.txt
 
       - name: Upsert PR comment
-        if: steps.diff.outputs.has_diff == 'true'
+        if: steps.diff.outputs.has_diff == 'true' && steps.ctx.outputs.pr_number != ''
         uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const issue_number = context.payload.pull_request.number;
+            const issue_number = Number('${{ steps.ctx.outputs.pr_number }}');
             const marker = '<!-- codexsess-code-review -->';
             let review = 'No review output returned.';
             try {
@@ -297,7 +348,7 @@ jobs:
 
       - name: Upload patch artifact
         if: steps.diff.outputs.has_diff == 'true' && steps.validate.outputs.valid == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codexsess-autofix-patch-pr-${{ steps.pr.outputs.number }}
           path: autofix.patch

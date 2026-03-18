@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -142,7 +143,18 @@ func resolveBindAddr() string {
 			port = parsed
 		}
 	}
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	if raw := strings.TrimSpace(os.Getenv("CODEXSESS_BIND_ADDR")); raw != "" {
+		if strings.HasPrefix(raw, ":") {
+			return "0.0.0.0" + raw
+		}
+		if _, _, err := net.SplitHostPort(raw); err == nil {
+			return raw
+		}
+		if !strings.Contains(raw, ":") {
+			return fmt.Sprintf("%s:%d", raw, port)
+		}
+	}
+	return fmt.Sprintf("0.0.0.0:%d", port)
 }
 
 func defaultDataDir(home string) string {

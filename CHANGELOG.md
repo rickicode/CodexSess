@@ -15,6 +15,14 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - API/code-review integration and logging coverage were refined so review calls are visible and traceable in API logs.
 - Settings and documentation were expanded with code-review endpoint usage details and cURL examples.
 - GitHub Actions code-review and autofix automation are now consolidated into a single workflow file for simpler maintenance.
+- GitHub code-review workflow now supports manual run from Actions (`workflow_dispatch`) with optional base/head SHA and PR comment target.
+- Release and code-review workflows now use Node 24-ready artifact action (`actions/upload-artifact@v7`), and release publishing was migrated from `softprops/action-gh-release` to `gh release` CLI.
+- Fixed Linux installer cleanup trap to avoid `bash: line 1: tmp: unbound variable` after package install in strict shell mode (`set -u`).
+- Installer now prints default auth credentials (`admin / hijilabs`) and password change command (`codexsess --changepassword`) after install.
+- Server-mode installer now verifies `codexsess.service` active state and prints status check command (`systemctl status codexsess`).
+- Default bind address is now `0.0.0.0:<PORT>` (with `CODEXSESS_BIND_ADDR` override support), and server service unit sets `CODEXSESS_BIND_ADDR=0.0.0.0:3061`.
+- Installer terminal output now uses clearer colored status lines for info, success, and error messages.
+- README now documents `CODEXSESS_BIND_ADDR` and includes GUI-mode `~/.bashrc` bind override example for `0.0.0.0`.
 
 ## [1.0.1] - 2026-03-18
 

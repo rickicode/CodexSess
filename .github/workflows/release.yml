@@ -148,7 +148,7 @@ jobs:
           sha256sum packages/*.deb packages/*.rpm >> SHA256SUMS.txt
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codexsess-build-${{ github.run_number }}
           path: |
@@ -187,12 +187,14 @@ jobs:
             echo "has_changelog=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload to release (with changelog)
-        if: startsWith(github.ref, 'refs/tags/v') && steps.changelog.outputs.has_changelog == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: dist/release-notes.md
-          files: |
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ASSETS=(
             dist/codexsess-linux-amd64
             dist/codexsess-linux-arm64
             dist/codexsess-windows-amd64.exe
@@ -200,16 +202,18 @@ jobs:
             dist/SHA256SUMS.txt
             dist/packages/*.deb
             dist/packages/*.rpm
+          )
 
-      - name: Upload to release (default)
-        if: startsWith(github.ref, 'refs/tags/v') && steps.changelog.outputs.has_changelog != 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/codexsess-linux-amd64
-            dist/codexsess-linux-arm64
-            dist/codexsess-windows-amd64.exe
-            dist/codexsess-windows-arm64.exe
-            dist/SHA256SUMS.txt
-            dist/packages/*.deb
-            dist/packages/*.rpm
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+              gh release edit "$TAG" --notes-file dist/release-notes.md
+            fi
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            exit 0
+          fi
+
+          if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+            gh release create "$TAG" "${ASSETS[@]}" --notes-file dist/release-notes.md
+          else
+            gh release create "$TAG" "${ASSETS[@]}" --title "$TAG"
+          fi

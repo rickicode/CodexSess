@@ -162,7 +162,8 @@ GitHub Actions example (PR diff):
 
 | Variable | Default | Example | Description |
 |---|---|---|---|
-| `PORT` | `3061` | `PORT=8080` | HTTP server port. Bind address is `127.0.0.1:<PORT>`. |
+| `PORT` | `3061` | `PORT=8080` | HTTP server port used when `CODEXSESS_BIND_ADDR` is not explicitly set. |
+| `CODEXSESS_BIND_ADDR` | `0.0.0.0:<PORT>` | `CODEXSESS_BIND_ADDR=0.0.0.0:3061` | Full bind address override (`host:port`) for HTTP server. |
 | `CODEXSESS_NO_OPEN_BROWSER` | `false` | `CODEXSESS_NO_OPEN_BROWSER=true` | Disable automatic browser opening on startup. Truthy values: `1`, `true`, `yes`. |
 | `CODEXSESS_CODEX_SANDBOX` | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only` | Sandbox mode passed to `codex exec`. |
 | `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Run Codex execution in isolated mode (`true`) or normal environment (`false`). |
@@ -194,6 +195,15 @@ curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/in
 # update existing install type (auto-detect gui/server)
 curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode update
 ```
+
+GUI mode bind override (via `~/.bashrc`):
+
+```bash
+echo 'export CODEXSESS_BIND_ADDR=0.0.0.0:3061' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Then restart CodexSess GUI session.
 
 Windows installation:
 - Download `.exe` directly from:

@@ -26,6 +26,7 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Startup logging now prints actual bind address separately from local browser URL so public bind mode is explicit in runtime logs.
 - Startup logging now adds explicit `public bind enabled` line when bind host is `0.0.0.0` or `::`.
 - API request routing now applies backend auto-switch consistently across `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/code-review`: if active account quota is exhausted, it switches to the best available account; if all are exhausted, it returns quota exhaustion.
+- First-account bootstrap now auto-selects the very first added account as both API active and CLI (Codex) active when account storage is empty.
 
 ## [1.0.1] - 2026-03-18
 

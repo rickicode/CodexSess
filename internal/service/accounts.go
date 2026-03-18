@@ -52,6 +52,8 @@ func (s *Service) SaveAccountFromTokens(ctx context.Context, t TokenSet, _ strin
 	if err != nil {
 		return store.Account{}, err
 	}
+	existing, _ := s.Store.ListAccounts(ctx)
+	isFirstAccount := len(existing) == 0
 	id := accountStorageID(claims.Email, claims.AccountID, claims.OrgID)
 	if err := os.MkdirAll(s.Cfg.AuthStoreDir, 0o700); err != nil {
 		return store.Account{}, err
@@ -86,9 +88,18 @@ func (s *Service) SaveAccountFromTokens(ctx context.Context, t TokenSet, _ strin
 		CreatedAt:      time.Now().UTC(),
 		UpdatedAt:      time.Now().UTC(),
 		LastUsedAt:     time.Now().UTC(),
+		Active:         isFirstAccount,
 	}
 	if err := s.Store.UpsertAccount(ctx, a); err != nil {
 		return store.Account{}, err
+	}
+	if isFirstAccount {
+		// Bootstrap UX: first account becomes both API and CLI active.
+		if err := s.syncAccountAuthToCodexHome(a); err != nil {
+			return store.Account{}, err
+		}
+		s.setCLIActiveCache(a.ID)
+		_ = s.writeCLISelectedAccountID(a.ID)
 	}
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
@@ -133,6 +144,7 @@ func (s *Service) UseAccountCLI(ctx context.Context, selector string) (store.Acc
 		return store.Account{}, err
 	}
 	s.setCLIActiveCache(a.ID)
+	_ = s.writeCLISelectedAccountID(a.ID)
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
 
@@ -145,6 +157,9 @@ func (s *Service) RemoveAccount(ctx context.Context, selector string) error {
 		return err
 	}
 	_ = os.RemoveAll(s.accountDir(a.ID))
+	if strings.TrimSpace(s.readCLISelectedAccountID()) == a.ID {
+		_ = s.clearCLISelectedAccountID()
+	}
 	return nil
 }
 
@@ -342,13 +357,24 @@ func (s *Service) syncAccountAuthToCodexHome(a store.Account) error {
 }
 
 func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
+	selectedID := s.readCLISelectedAccountID()
+	if strings.TrimSpace(selectedID) == "" {
+		return "", nil
+	}
+
 	s.cliActiveMu.RLock()
-	if s.cliActiveCachedID != "" && time.Since(s.cliActiveCachedAt) < 5*time.Second {
+	if s.cliActiveCachedID != "" && s.cliActiveCachedID == selectedID && time.Since(s.cliActiveCachedAt) < 5*time.Second {
 		id := s.cliActiveCachedID
 		s.cliActiveMu.RUnlock()
 		return id, nil
 	}
 	s.cliActiveMu.RUnlock()
+
+	selected, err := s.Store.FindAccountBySelector(ctx, selectedID)
+	if err != nil {
+		_ = s.clearCLISelectedAccountID()
+		return "", nil
+	}
 
 	authPath := filepath.Join(s.Cfg.CodexHome, "auth.json")
 	b, err := os.ReadFile(authPath)
@@ -382,37 +408,24 @@ func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	claimAccountID := firstNonEmpty(authAccountID, claims.AccountID)
-	accounts, err := s.Store.ListAccounts(ctx)
-	if err != nil {
-		return "", err
-	}
-	// Match exact token pair first to avoid false-positive email/account-id matches.
-	for _, a := range accounts {
-		accIDTokenRaw, err := s.Crypto.Decrypt(a.TokenID)
-		if err != nil {
-			continue
-		}
-		accAccessTokenRaw, err := s.Crypto.Decrypt(a.TokenAccess)
-		if err != nil {
-			continue
-		}
-		if string(accIDTokenRaw) == idToken && string(accAccessTokenRaw) == accessToken {
-			s.setCLIActiveCache(a.ID)
-			return a.ID, nil
+
+	accIDTokenRaw, err := s.Crypto.Decrypt(selected.TokenID)
+	if err == nil {
+		accAccessTokenRaw, err2 := s.Crypto.Decrypt(selected.TokenAccess)
+		if err2 == nil && string(accIDTokenRaw) == idToken && string(accAccessTokenRaw) == accessToken {
+			s.setCLIActiveCache(selected.ID)
+			return selected.ID, nil
 		}
 	}
-	for _, a := range accounts {
-		if claimAccountID != "" && a.AccountID != "" && a.AccountID == claimAccountID {
-			s.setCLIActiveCache(a.ID)
-			return a.ID, nil
-		}
+	if claimAccountID != "" && selected.AccountID != "" && selected.AccountID == claimAccountID {
+		s.setCLIActiveCache(selected.ID)
+		return selected.ID, nil
 	}
-	for _, a := range accounts {
-		if claims.Email != "" && strings.EqualFold(a.Email, claims.Email) {
-			s.setCLIActiveCache(a.ID)
-			return a.ID, nil
-		}
+	if claims.Email != "" && strings.EqualFold(selected.Email, claims.Email) {
+		s.setCLIActiveCache(selected.ID)
+		return selected.ID, nil
 	}
+
 	return "", nil
 }
 
@@ -421,4 +434,31 @@ func (s *Service) setCLIActiveCache(id string) {
 	s.cliActiveCachedID = strings.TrimSpace(id)
 	s.cliActiveCachedAt = time.Now()
 	s.cliActiveMu.Unlock()
+}
+
+func (s *Service) cliSelectedAccountPath() string {
+	return filepath.Join(s.Cfg.DataDir, "active_cli_account")
+}
+
+func (s *Service) writeCLISelectedAccountID(id string) error {
+	path := s.cliSelectedAccountPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(strings.TrimSpace(id)), 0o600)
+}
+
+func (s *Service) readCLISelectedAccountID() string {
+	b, err := os.ReadFile(s.cliSelectedAccountPath())
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func (s *Service) clearCLISelectedAccountID() error {
+	if err := os.Remove(s.cliSelectedAccountPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }

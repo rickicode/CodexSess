@@ -1,0 +1,988 @@
+<script>
+  import { onMount, onDestroy, tick } from 'svelte';
+
+  let sessions = $state([]);
+  let activeSessionID = $state('');
+  let messages = $state([]);
+  let draftMessage = $state('');
+  let selectedModel = $state('gpt-5.2-codex');
+  let selectedWorkDir = $state('~/');
+  let selectedSandboxMode = $state('full-access');
+  let loadingSessions = $state(false);
+  let loadingMessages = $state(false);
+  let sending = $state(false);
+  let deleting = $state(false);
+  let viewStatus = $state('Ready.');
+  let composerError = $state('');
+  let streamingPending = $state(false);
+  let messagesViewport = $state(null);
+  let showNewSessionModal = $state(false);
+  let newSessionPath = $state('~/');
+  let pathSuggestions = $state(['~/']);
+  let loadingPathSuggestions = $state(false);
+  let pathSuggestTimer = null;
+  let sessionPrefsTimer = null;
+  let persistingSessionPrefs = $state(false);
+  let showSkillModal = $state(false);
+  let availableSkills = $state([]);
+  let skillSearchQuery = $state('');
+  let loadingSkills = $state(false);
+  let showSessionDrawer = $state(false);
+  let codexCLIEmail = $state('');
+  let codexIdentityTimer = null;
+  let expandedMessageMap = $state({});
+
+  const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
+  const draftStoragePrefix = 'codexsess.coding.draft.v1:';
+  const jsonHeaders = { 'Content-Type': 'application/json' };
+  const models = ['gpt-5.2-codex', 'gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.4'];
+  const slashCommands = ['/status', '/review [optional focus]'];
+
+  function toAPIURL(url) {
+    const raw = String(url || '').trim();
+    if (!apiBase || /^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith('/')) return `${apiBase}${raw}`;
+    return `${apiBase}/${raw}`;
+  }
+
+  async function req(url, options = {}) {
+    const response = await fetch(toAPIURL(url), {
+      headers: jsonHeaders,
+      credentials: 'same-origin',
+      ...options
+    });
+    if (response.redirected && String(response.url || '').includes('/auth/login')) {
+      if (typeof window !== 'undefined') window.location.href = '/auth/login';
+      throw new Error('Authentication required');
+    }
+    const text = await response.text();
+    let body = {};
+    try {
+      body = JSON.parse(text || '{}');
+    } catch {
+      body = {};
+    }
+    if (!response.ok) {
+      const message = body?.error?.message || body?.message || text || `HTTP ${response.status}`;
+      throw new Error(message);
+    }
+    return body;
+  }
+
+  function formatWhen(value) {
+    const d = new Date(String(value || ''));
+    if (Number.isNaN(d.getTime())) return '-';
+    return d.toLocaleString();
+  }
+
+  function activeSession() {
+    return sessions.find((item) => item?.id === activeSessionID) || null;
+  }
+
+  function sessionDisplayID(session) {
+    return String(session?.display_id || session?.codex_thread_id || session?.id || '-').trim() || '-';
+  }
+
+  function readSessionIDFromURL() {
+    if (typeof window === 'undefined') return '';
+    try {
+      const url = new URL(window.location.href);
+      return String(url.searchParams.get('id') || '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  function syncSessionIDToURL(sessionID) {
+    if (typeof window === 'undefined') return;
+    const sid = String(sessionID || '').trim();
+    try {
+      const url = new URL(window.location.href);
+      if (sid) {
+        url.searchParams.set('id', sid);
+      } else {
+        url.searchParams.delete('id');
+      }
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+    } catch {
+    }
+  }
+
+  function assistantDisplayName() {
+    const email = String(codexCLIEmail || '').trim();
+    if (!email) return 'Codex';
+    return `Codex - ${email}`;
+  }
+
+  function messageRoleClass(message) {
+    const role = String(message?.role || '').trim().toLowerCase();
+    if (role === 'assistant') return 'assistant';
+    if (role === 'activity') return 'activity';
+    return 'user';
+  }
+
+  function shouldCollapseContent(content) {
+    const text = String(content || '');
+    if (!text) return false;
+    if (text.length > 1600) return true;
+    return text.split('\n').length > 20;
+  }
+
+  function messagePreviewContent(content) {
+    const text = String(content || '');
+    if (!shouldCollapseContent(text)) return text;
+    const lines = text.split('\n');
+    if (lines.length > 20) {
+      return `${lines.slice(0, 20).join('\n')}\n...`;
+    }
+    return `${text.slice(0, 1600)}\n...`;
+  }
+
+  function isMessageExpanded(id) {
+    return Boolean(expandedMessageMap?.[String(id || '')]);
+  }
+
+  function toggleMessageExpanded(id) {
+    const key = String(id || '').trim();
+    if (!key) return;
+    expandedMessageMap = {
+      ...expandedMessageMap,
+      [key]: !expandedMessageMap?.[key]
+    };
+  }
+
+  async function refreshCodexIdentity() {
+    try {
+      const data = await req('/api/accounts');
+      const items = Array.isArray(data?.accounts) ? data.accounts : [];
+      const activeCLI = items.find((item) => Boolean(item?.active_cli));
+      codexCLIEmail = String(activeCLI?.email || '').trim();
+    } catch {
+      codexCLIEmail = '';
+    }
+  }
+
+  function draftStorageKey(sessionID) {
+    const sid = String(sessionID || '').trim();
+    if (!sid) return '';
+    return `${draftStoragePrefix}${sid}`;
+  }
+
+  function saveDraftForSession(sessionID, text) {
+    if (typeof window === 'undefined') return;
+    const key = draftStorageKey(sessionID);
+    if (!key) return;
+    const value = String(text || '');
+    try {
+      if (!value.trim()) {
+        localStorage.removeItem(key);
+        return;
+      }
+      localStorage.setItem(key, value);
+    } catch {
+    }
+  }
+
+  function loadDraftForSession(sessionID) {
+    if (typeof window === 'undefined') return '';
+    const key = draftStorageKey(sessionID);
+    if (!key) return '';
+    try {
+      return String(localStorage.getItem(key) || '');
+    } catch {
+      return '';
+    }
+  }
+
+  function clearDraftForSession(sessionID) {
+    if (typeof window === 'undefined') return;
+    const key = draftStorageKey(sessionID);
+    if (!key) return;
+    try {
+      localStorage.removeItem(key);
+    } catch {
+    }
+  }
+
+  async function loadSessions({ autoSelect = true } = {}) {
+    loadingSessions = true;
+    try {
+      const data = await req('/api/coding/sessions');
+      sessions = Array.isArray(data.sessions) ? data.sessions : [];
+      if (autoSelect && sessions.length > 0 && !sessions.find((item) => item.id === activeSessionID)) {
+        activeSessionID = sessions[0].id;
+      }
+      const active = activeSession();
+      if (active) {
+        selectedModel = String(active.model || selectedModel).trim() || selectedModel;
+        selectedWorkDir = String(active.work_dir || '~/').trim() || '~/';
+        selectedSandboxMode = String(active.sandbox_mode || 'full-access').trim() || 'full-access';
+      }
+    } finally {
+      loadingSessions = false;
+    }
+  }
+
+  async function persistSessionPreferences() {
+    const session = activeSession();
+    if (!session?.id) return;
+    persistingSessionPrefs = true;
+    try {
+      const data = await req('/api/coding/sessions', {
+        method: 'PUT',
+        body: JSON.stringify({
+          session_id: session.id,
+          model: selectedModel,
+          work_dir: selectedWorkDir || '~/',
+          sandbox_mode: selectedSandboxMode || 'full-access'
+        })
+      });
+      const updated = data?.session;
+      if (updated?.id) {
+        sessions = sessions.map((item) => (item.id === updated.id ? updated : item));
+      }
+    } finally {
+      persistingSessionPrefs = false;
+    }
+  }
+
+  function queuePersistSessionPreferences() {
+    if (sessionPrefsTimer) clearTimeout(sessionPrefsTimer);
+    sessionPrefsTimer = setTimeout(() => {
+      sessionPrefsTimer = null;
+      persistSessionPreferences().catch(() => {});
+    }, 220);
+  }
+
+  async function loadMessages(sessionID) {
+    const sid = String(sessionID || '').trim();
+    if (!sid) {
+      messages = [];
+      return;
+    }
+    loadingMessages = true;
+    try {
+      const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}`);
+      messages = Array.isArray(data.messages) ? data.messages : [];
+      await tick();
+      scrollMessagesToBottom();
+    } finally {
+      loadingMessages = false;
+    }
+  }
+
+  function scrollMessagesToBottom() {
+    if (!messagesViewport) return;
+    messagesViewport.scrollTop = messagesViewport.scrollHeight;
+    if (typeof window !== 'undefined') {
+      window.requestAnimationFrame(() => {
+        if (!messagesViewport) return;
+        messagesViewport.scrollTop = messagesViewport.scrollHeight;
+      });
+      setTimeout(() => {
+        if (!messagesViewport) return;
+        messagesViewport.scrollTop = messagesViewport.scrollHeight;
+      }, 60);
+    }
+  }
+
+  async function loadPathSuggestions(prefix = '~/') {
+    loadingPathSuggestions = true;
+    try {
+      const data = await req(`/api/coding/path-suggestions?prefix=${encodeURIComponent(prefix)}`);
+      const values = Array.isArray(data.suggestions) ? data.suggestions : [];
+      pathSuggestions = values.length > 0 ? values : [prefix || '~/'];
+    } finally {
+      loadingPathSuggestions = false;
+    }
+  }
+
+  function schedulePathSuggestions(prefix) {
+    if (pathSuggestTimer) clearTimeout(pathSuggestTimer);
+    pathSuggestTimer = setTimeout(() => {
+      pathSuggestTimer = null;
+      loadPathSuggestions(prefix).catch(() => {});
+    }, 180);
+  }
+
+  async function loadSkills() {
+    loadingSkills = true;
+    try {
+      const data = await req('/api/coding/skills');
+      availableSkills = Array.isArray(data.skills) ? data.skills : [];
+    } finally {
+      loadingSkills = false;
+    }
+  }
+
+  function openSkillModal() {
+    showSkillModal = true;
+    skillSearchQuery = '';
+    loadSkills().catch(() => {});
+  }
+
+  function closeSkillModal() {
+    showSkillModal = false;
+  }
+
+  function filteredSkills() {
+    const q = String(skillSearchQuery || '').trim().toLowerCase();
+    if (!q) return availableSkills;
+    return availableSkills.filter((item) => String(item || '').toLowerCase().includes(q));
+  }
+
+  function insertSkillToken(skillName) {
+    const name = String(skillName || '').trim();
+    if (!name) return;
+    const token = `$${name}`;
+    const base = String(draftMessage || '').trim();
+    draftMessage = base ? `${base} ${token}` : token;
+    closeSkillModal();
+    viewStatus = `Skill inserted: ${token}`;
+  }
+
+  async function createSession({ autoOpen = true, workDir = '~/' } = {}) {
+    const data = await req('/api/coding/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: '',
+        model: selectedModel,
+        work_dir: String(workDir || '~/').trim() || '~/',
+        sandbox_mode: selectedSandboxMode || 'full-access'
+      })
+    });
+    const created = data?.session;
+    if (!created?.id) throw new Error('Failed to create session');
+    await loadSessions({ autoSelect: false });
+    if (autoOpen) {
+      activeSessionID = created.id;
+      syncSessionIDToURL(created.id);
+      selectedModel = String(created.model || selectedModel).trim() || selectedModel;
+      selectedWorkDir = String(created.work_dir || '~/').trim() || '~/';
+      selectedSandboxMode = String(created.sandbox_mode || 'full-access').trim() || 'full-access';
+      await loadMessages(created.id);
+      draftMessage = loadDraftForSession(created.id);
+    }
+    viewStatus = 'New session created.';
+  }
+
+  function openNewSessionModal() {
+    newSessionPath = selectedWorkDir || '~/';
+    showNewSessionModal = true;
+    loadPathSuggestions(newSessionPath).catch(() => {});
+  }
+
+  function closeNewSessionModal() {
+    if (sending) return;
+    showNewSessionModal = false;
+  }
+
+  async function createSessionFromModal() {
+    const path = String(newSessionPath || '').trim() || '~/';
+    await createSession({ autoOpen: true, workDir: path });
+    closeNewSessionModal();
+  }
+
+  async function ensureSessionOnFirstOpen() {
+    await loadSessions({ autoSelect: true });
+    if (sessions.length === 0) {
+      await createSession({ autoOpen: true, workDir: '~/' });
+      return;
+    }
+    const requestedID = readSessionIDFromURL();
+    if (requestedID && sessions.find((item) => item.id === requestedID)) {
+      activeSessionID = requestedID;
+    } else if (!activeSessionID) {
+      activeSessionID = sessions[0].id;
+    }
+    syncSessionIDToURL(activeSessionID);
+    const active = activeSession();
+    if (active) {
+      selectedModel = String(active.model || selectedModel).trim() || selectedModel;
+      selectedWorkDir = String(active.work_dir || '~/').trim() || '~/';
+      selectedSandboxMode = String(active.sandbox_mode || 'full-access').trim() || 'full-access';
+    }
+    await loadMessages(activeSessionID);
+    draftMessage = loadDraftForSession(activeSessionID);
+  }
+
+  async function selectSession(sessionID) {
+    const sid = String(sessionID || '').trim();
+    if (!sid || sid === activeSessionID) return;
+    activeSessionID = sid;
+    syncSessionIDToURL(sid);
+    const selected = sessions.find((item) => item.id === sid);
+    if (selected?.model) selectedModel = selected.model;
+    selectedWorkDir = String(selected?.work_dir || '~/').trim() || '~/';
+    selectedSandboxMode = String(selected?.sandbox_mode || 'full-access').trim() || 'full-access';
+    await loadMessages(sid);
+    draftMessage = loadDraftForSession(sid);
+    showSessionDrawer = false;
+  }
+
+  function backToDashboard() {
+    if (typeof window !== 'undefined') {
+      window.location.href = '/';
+    }
+  }
+
+  async function deleteActiveSession() {
+    const session = activeSession();
+    if (!session?.id || deleting) return;
+    if (typeof window !== 'undefined') {
+      const ok = window.confirm(`Delete session "${session.title || session.id}"?`);
+      if (!ok) return;
+    }
+    deleting = true;
+    try {
+      await req(`/api/coding/sessions?id=${encodeURIComponent(session.id)}`, { method: 'DELETE' });
+      viewStatus = 'Session deleted.';
+      await loadSessions({ autoSelect: true });
+      if (sessions.length === 0) {
+        await createSession({ autoOpen: true, workDir: '~/' });
+      } else {
+        syncSessionIDToURL(activeSessionID);
+        await loadMessages(activeSessionID);
+        draftMessage = loadDraftForSession(activeSessionID);
+      }
+    } finally {
+      deleting = false;
+    }
+  }
+
+  async function sendMessage() {
+    if (sending) return;
+    const content = String(draftMessage || '').trim();
+    if (!content) return;
+    const session = activeSession();
+    if (!session?.id) return;
+
+    const slashMeta = parseSupportedSlashCommand(content);
+    if (slashMeta.error) {
+      viewStatus = slashMeta.error;
+      return;
+    }
+
+    composerError = '';
+    const prepared = prepareMessageContent(content);
+    const pendingID = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const pendingMessage = {
+      id: pendingID,
+      role: 'user',
+      content,
+      created_at: new Date().toISOString(),
+      pending: true
+    };
+    messages = [...messages, pendingMessage];
+    await tick();
+    scrollMessagesToBottom();
+
+    sending = true;
+    const workingDraft = content;
+    let liveAssistantID = '';
+    let streamedAssistantIDs = [];
+    streamingPending = true;
+    draftMessage = '';
+    viewStatus = 'Streaming...';
+    try {
+      const response = await fetch(toAPIURL('/api/coding/chat/stream'), {
+        method: 'POST',
+        headers: jsonHeaders,
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          session_id: session.id,
+          content: slashMeta.contentOverride ?? prepared,
+          model: selectedModel,
+          work_dir: selectedWorkDir || '~/',
+          sandbox_mode: selectedSandboxMode || 'full-access',
+          command: slashMeta.commandMode || 'chat'
+        })
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        let errMsg = text || `HTTP ${response.status}`;
+        try {
+          const body = JSON.parse(text || '{}');
+          errMsg = body?.error?.message || body?.message || errMsg;
+        } catch {
+        }
+        throw new Error(errMsg);
+      }
+      if (!response.body) {
+        throw new Error('Streaming response body unavailable.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let sseBuffer = '';
+      let donePayload = null;
+      let streamError = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        sseBuffer += decoder.decode(value, { stream: true });
+        sseBuffer = parseSSEFrames(sseBuffer, (frameText) => {
+          let evt = {};
+          try {
+            evt = JSON.parse(frameText || '{}');
+          } catch {
+            return;
+          }
+          const eventType = String(evt?.event || '').trim().toLowerCase();
+          if (eventType === 'assistant_message') {
+            const text = String(evt?.text || '').trim();
+            if (!text) return;
+            streamingPending = false;
+            const liveID = `live-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            streamedAssistantIDs = [...streamedAssistantIDs, liveID];
+            messages = messages
+              .concat([{
+                id: liveID,
+                role: 'assistant',
+                content: text,
+                created_at: new Date().toISOString(),
+                pending: false
+              }]);
+            return;
+          }
+          if (eventType === 'activity') {
+            const text = String(evt?.text || '').trim();
+            if (!text) return;
+            messages = messages.concat([{
+              id: `activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              role: 'activity',
+              content: text,
+              created_at: new Date().toISOString(),
+              pending: false
+            }]);
+            return;
+          }
+          if (eventType === 'delta') {
+            const deltaText = String(evt?.text || '');
+            if (!deltaText) return;
+            streamingPending = false;
+            if (!liveAssistantID) {
+              liveAssistantID = `live-assistant-delta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+              streamedAssistantIDs = [...streamedAssistantIDs, liveAssistantID];
+              messages = messages.concat([{
+                id: liveAssistantID,
+                role: 'assistant',
+                content: '',
+                created_at: new Date().toISOString(),
+                pending: false
+              }]);
+            }
+            messages = messages.map((item) =>
+              item?.id === liveAssistantID
+                ? { ...item, content: `${item.content || ''}${deltaText}` }
+                : item
+            );
+            return;
+          }
+          if (eventType === 'error') {
+            streamError = String(evt?.message || 'Streaming failed.');
+            return;
+          }
+          if (eventType === 'done') {
+            donePayload = evt;
+          }
+        });
+        if (streamError) throw new Error(streamError);
+        await tick();
+        scrollMessagesToBottom();
+      }
+
+      if (!donePayload) {
+        throw new Error('Streaming ended before completion.');
+      }
+
+      const userMessage = donePayload?.user;
+      const assistantMessage = donePayload?.assistant;
+      const assistantMessages = Array.isArray(donePayload?.assistant_messages) ? donePayload.assistant_messages : [];
+      streamingPending = false;
+      messages = messages.filter(
+        (item) =>
+          item?.id !== pendingID &&
+          !streamedAssistantIDs.includes(item?.id)
+      );
+      if (userMessage) messages = [...messages, userMessage];
+      if (assistantMessages.length > 0) {
+        messages = [...messages, ...assistantMessages];
+      } else if (assistantMessage) {
+        messages = [...messages, assistantMessage];
+      }
+      clearDraftForSession(session.id);
+
+      if (donePayload?.session?.id) {
+        const updated = donePayload.session;
+        sessions = sessions.map((item) => (item.id === updated.id ? updated : item));
+        sessions = [...sessions].sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')));
+        selectedWorkDir = String(updated.work_dir || selectedWorkDir).trim() || '~/';
+        selectedSandboxMode = String(updated.sandbox_mode || selectedSandboxMode).trim() || 'full-access';
+      }
+      await tick();
+      scrollMessagesToBottom();
+      viewStatus = 'Response received.';
+      composerError = '';
+    } catch (error) {
+      messages = messages.filter(
+        (item) =>
+          item?.id !== pendingID &&
+          !streamedAssistantIDs.includes(item?.id)
+      );
+      draftMessage = workingDraft;
+      saveDraftForSession(session.id, workingDraft);
+      const failReason = String(error?.message || 'Failed to send message.');
+      composerError = failReason;
+      viewStatus = failReason;
+      streamingPending = false;
+    } finally {
+      sending = false;
+      if (streamingPending) streamingPending = false;
+    }
+  }
+
+  function onComposerKeydown(event) {
+    if (event.shiftKey && event.key === 'Enter') {
+      event.preventDefault();
+      sendMessage();
+      return;
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault();
+      sendMessage();
+    }
+  }
+
+  function normalizePathInput(raw) {
+    const clean = String(raw || '').trim();
+    if (!clean) return '~/';
+    return clean;
+  }
+
+  function setSandboxMode(mode) {
+    const normalized = String(mode || '').trim().toLowerCase();
+    const next = normalized === 'write' ? 'write' : 'full-access';
+    if (selectedSandboxMode === next) return;
+    selectedSandboxMode = next;
+    queuePersistSessionPreferences();
+    viewStatus = `Sandbox set to ${next}.`;
+  }
+
+  function toggleSandboxMode() {
+    setSandboxMode(selectedSandboxMode === 'full-access' ? 'write' : 'full-access');
+  }
+
+  function parseSupportedSlashCommand(input) {
+    const raw = String(input || '').trim();
+    if (!raw.startsWith('/')) return { commandMode: 'chat', contentOverride: null, error: '' };
+    const parts = raw.split(/\s+/);
+    const cmd = String(parts[0] || '').toLowerCase();
+    const arg = raw.slice(parts[0].length).trim();
+    if (cmd === '/status') {
+      return { commandMode: 'chat', contentOverride: '/status', error: '' };
+    }
+    if (cmd === '/review') {
+      const reviewPrompt = String(arg || '').trim();
+      return { commandMode: 'review', contentOverride: reviewPrompt ? `/review ${reviewPrompt}` : '/review', error: '' };
+    }
+    return { commandMode: 'chat', contentOverride: raw, error: '' };
+  }
+
+  function prepareMessageContent(raw) {
+    const original = String(raw || '').trim();
+    if (!original) return '';
+    const skillMatches = [...original.matchAll(/\$([a-zA-Z0-9._-]+)/g)];
+    if (skillMatches.length === 0) return original;
+    const skills = [...new Set(skillMatches.map((match) => String(match[1] || '').trim()).filter(Boolean))];
+    if (skills.length === 0) return original;
+    return `Skill hints requested: ${skills.join(', ')}.\n\nUser request (unaltered):\n${original}`;
+  }
+
+  function parseSSEFrames(buffer, onFrame) {
+    let rest = String(buffer || '');
+    let boundary = rest.indexOf('\n\n');
+    while (boundary !== -1) {
+      const rawFrame = rest.slice(0, boundary);
+      rest = rest.slice(boundary + 2);
+      const lines = rawFrame.split('\n');
+      const dataLines = lines
+        .map((line) => String(line || ''))
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart());
+      if (dataLines.length > 0) onFrame(dataLines.join('\n'));
+      boundary = rest.indexOf('\n\n');
+    }
+    return rest;
+  }
+
+  onMount(() => {
+    ensureSessionOnFirstOpen().catch((error) => {
+      viewStatus = String(error?.message || 'Failed to initialize coding sessions.');
+    });
+    refreshCodexIdentity().catch(() => {});
+    codexIdentityTimer = setInterval(() => {
+      refreshCodexIdentity().catch(() => {});
+    }, 15000);
+  });
+
+  $effect(() => {
+    const sid = String(activeSessionID || '').trim();
+    if (!sid) return;
+    saveDraftForSession(sid, draftMessage);
+  });
+
+  onDestroy(() => {
+    if (pathSuggestTimer) {
+      clearTimeout(pathSuggestTimer);
+      pathSuggestTimer = null;
+    }
+    if (sessionPrefsTimer) {
+      clearTimeout(sessionPrefsTimer);
+      sessionPrefsTimer = null;
+    }
+    if (codexIdentityTimer) {
+      clearInterval(codexIdentityTimer);
+      codexIdentityTimer = null;
+    }
+  });
+</script>
+
+<section class="panel coding-panel">
+  <header class="coding-topbar">
+    <div class="coding-topbar-left">
+      <button class="btn btn-secondary" type="button" onclick={backToDashboard}>Dashboard</button>
+      <button class="btn btn-secondary" type="button" onclick={() => (showSessionDrawer = true)}>Sessions</button>
+      <div class="coding-topbar-title">
+        <strong>CodexSess Chat</strong>
+        <span title={selectedWorkDir || '~/'}>
+          {selectedWorkDir || '~/'}
+        </span>
+      </div>
+    </div>
+    <div class="coding-topbar-right">
+      <select bind:value={selectedModel} onchange={queuePersistSessionPreferences} aria-label="Model for coding session">
+        {#each models as model}
+          <option value={model}>{model}</option>
+        {/each}
+      </select>
+      <button class="btn btn-secondary" onclick={openNewSessionModal} disabled={loadingSessions || sending}>
+        New Session
+      </button>
+      <button class="btn btn-danger" onclick={deleteActiveSession} disabled={!activeSessionID || deleting || sending}>
+        Delete
+      </button>
+    </div>
+  </header>
+
+  <div class="coding-layout">
+    <section class="coding-chat-area full" aria-label="Coding chat">
+      {#if !activeSessionID}
+        <div class="empty-state">Session not selected.</div>
+      {:else}
+        <div class="coding-messages" bind:this={messagesViewport}>
+          {#if loadingMessages}
+            <p class="empty-note">Loading messages...</p>
+          {:else if messages.length === 0}
+            <p class="empty-note">Start by sending a coding instruction.</p>
+          {:else}
+            {#each messages as message (message.id)}
+              <article class="coding-message {messageRoleClass(message)} {message.pending ? 'pending' : ''} {message.failed ? 'failed' : ''}">
+                <div class="coding-message-head">
+                  <strong>
+                    {#if message.role === 'assistant'}
+                      {assistantDisplayName()}
+                    {:else if message.role === 'activity'}
+                      Activity
+                    {:else}
+                      You
+                    {/if}
+                  </strong>
+                  <span>
+                    {#if message.failed}
+                      Failed to send
+                    {:else if !message.pending}
+                      {formatWhen(message.created_at)}
+                    {/if}
+                  </span>
+                </div>
+                <pre>{isMessageExpanded(message.id) ? (message.content || '-') : messagePreviewContent(message.content || '-')}</pre>
+                {#if shouldCollapseContent(message.content || '')}
+                  <button class="btn btn-secondary btn-small coding-show-more" type="button" onclick={() => toggleMessageExpanded(message.id)}>
+                    {isMessageExpanded(message.id) ? 'Show less' : 'Show more'}
+                  </button>
+                {/if}
+                {#if message.pending && message.role === 'assistant' && !String(message.content || '').trim()}
+                  <p class="coding-message-status">Coding...</p>
+                {/if}
+              </article>
+            {/each}
+          {/if}
+          {#if sending && streamingPending}
+            <div class="coding-streaming-note" role="status" aria-live="polite">
+              <span class="streaming-pulse" aria-hidden="true"></span>
+              <span class="streaming-label">Streaming</span>
+              <span class="streaming-dots" aria-hidden="true"></span>
+              <span class="streaming-bar" aria-hidden="true"><i></i></span>
+            </div>
+          {/if}
+        </div>
+
+        <div class="coding-composer">
+          <textarea
+            placeholder="Write coding task here... (Shift+Enter to send). Supports /status, /review, and $skill"
+            bind:value={draftMessage}
+            rows="4"
+            onkeydown={onComposerKeydown}
+            oninput={() => {
+              if (composerError) composerError = '';
+            }}
+            disabled={sending}
+          ></textarea>
+          {#if composerError}
+            <p class="coding-composer-error">Failed to send: {composerError}</p>
+          {/if}
+          <div class="inline-actions coding-composer-actions">
+            <button class="btn btn-secondary" onclick={openSkillModal} disabled={sending}>Insert Skill</button>
+            <button
+              class="btn btn-secondary sandbox-mode-btn {selectedSandboxMode === 'full-access' ? 'mode-full' : 'mode-write'}"
+              type="button"
+              onclick={toggleSandboxMode}
+              disabled={sending}
+            >
+              {selectedSandboxMode === 'full-access' ? 'Full Access' : 'Write'}
+            </button>
+            <button class="btn btn-primary btn-send" onclick={sendMessage} disabled={sending || !draftMessage.trim()}>
+              <span>{sending ? 'Sending...' : 'Send'}</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12l18-9-6 9 6 9-18-9z"></path></svg>
+            </button>
+          </div>
+        </div>
+      {/if}
+    </section>
+  </div>
+  <div class="coding-status-line" aria-live="polite">
+    {viewStatus}
+    {#if persistingSessionPrefs}
+      <span class="coding-status-saving">Saving session settings...</span>
+    {/if}
+  </div>
+</section>
+
+{#if showNewSessionModal}
+  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
+    <div class="modal-card modal-card-coding" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeNewSessionModal()}>
+      <div class="modal-head">
+        <div>
+          <h3>New Session</h3>
+          <p class="modal-subtitle">Choose workspace/folder before starting coding session.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" onclick={closeNewSessionModal} disabled={sending}>Close</button>
+      </div>
+      <div class="modal-body">
+        <label for="sessionWorkDir">Workspace Path</label>
+        <input
+          id="sessionWorkDir"
+          list="sessionWorkDirSuggestions"
+          bind:value={newSessionPath}
+          placeholder="~/"
+          oninput={(event) => schedulePathSuggestions(event.currentTarget.value)}
+          onfocus={() => schedulePathSuggestions(newSessionPath)}
+          disabled={sending}
+        />
+        <datalist id="sessionWorkDirSuggestions">
+          {#each pathSuggestions as option}
+            <option value={option}></option>
+          {/each}
+        </datalist>
+        <p class="setting-title">
+          {#if loadingPathSuggestions}
+            Loading path suggestions...
+          {:else}
+            Default path is `~/`. Suggestions are loaded from current folder listing.
+          {/if}
+        </p>
+        <div class="panel-actions">
+          <button class="btn btn-secondary" onclick={() => loadPathSuggestions(newSessionPath)} disabled={sending || loadingPathSuggestions}>
+            Refresh Suggestions
+          </button>
+          <button class="btn btn-primary" onclick={createSessionFromModal} disabled={sending || !newSessionPath.trim()}>
+            Create Session
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showSessionDrawer}
+  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
+    <div class="modal-card modal-card-coding drawer-card" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && (showSessionDrawer = false)}>
+      <div class="modal-head">
+        <div>
+          <h3>Sessions</h3>
+          <p class="modal-subtitle">Pick a session from the list.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" onclick={() => (showSessionDrawer = false)}>Close</button>
+      </div>
+      <div class="coding-sessions-list drawer-list" aria-label="Session list">
+        {#if loadingSessions}
+          <p class="empty-note">Loading sessions...</p>
+        {:else if sessions.length === 0}
+          <p class="empty-note">No session yet.</p>
+        {:else}
+          {#each sessions as session (session.id)}
+            <button
+              class="coding-session-item {activeSessionID === session.id ? 'is-active' : ''}"
+              onclick={() => selectSession(session.id)}
+            >
+              <strong>{session.title || 'New Session'}</strong>
+              <span class="mono">{sessionDisplayID(session)}</span>
+              <span>{formatWhen(session.last_message_at)}</span>
+              <span class="mono">{session.work_dir || '~/'}</span>
+            </button>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showSkillModal}
+  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
+    <div class="modal-card modal-card-coding" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeSkillModal()}>
+      <div class="modal-head">
+        <div>
+          <h3>Insert Skill</h3>
+          <p class="modal-subtitle">Select available skill and insert `$skill_name` into composer.</p>
+        </div>
+        <button class="btn btn-secondary btn-small" onclick={closeSkillModal}>Close</button>
+      </div>
+      <div class="modal-body">
+        <label for="skillSearchInput">Search Skill</label>
+        <input
+          id="skillSearchInput"
+          value={skillSearchQuery}
+          placeholder="Search skill name..."
+          oninput={(event) => (skillSearchQuery = event.currentTarget.value)}
+        />
+        {#if loadingSkills}
+          <p class="setting-title">Loading skills...</p>
+        {:else if filteredSkills().length === 0}
+          <p class="setting-title">No skills found.</p>
+        {:else}
+          <div class="skill-list">
+            {#each filteredSkills() as skill}
+              <button class="skill-item" onclick={() => insertSkillToken(skill)}>
+                <span>{skill}</span>
+                <code>${skill}</code>
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}

@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import DashboardView from './views/DashboardView.svelte';
+  import CodingView from './views/CodingView.svelte';
   import SettingsView from './views/SettingsView.svelte';
   import ApiEndpointView from './views/ApiEndpointView.svelte';
   import ApiLogsView from './views/ApiLogsView.svelte';
@@ -14,6 +15,7 @@
   let openAIEndpoint = $state('');
   let claudeEndpoint = $state('');
   let authJSONEndpoint = $state('');
+  let isChatRoute = $state(typeof window !== 'undefined' && (window.location.pathname === '/chat' || window.location.pathname.startsWith('/chat/')));
   let activeMenu = $state('dashboard');
   let apiLogs = $state([]);
   let showLogDetailModal = $state(false);
@@ -226,14 +228,35 @@
   }
 
   function switchMenu(menu) {
+    if (menu === 'coding' && typeof window !== 'undefined') {
+      window.location.href = '/chat';
+      return;
+    }
     activeMenu = menu;
     closeMobileSidebar();
   }
+
+  function detectChatRoute() {
+    if (typeof window === 'undefined') return false;
+    const path = String(window.location.pathname || '').trim().toLowerCase();
+    return path === '/chat' || path.startsWith('/chat/');
+  }
+
+  function syncRouteMode() {
+    isChatRoute = detectChatRoute();
+    if (isChatRoute) {
+      activeMenu = 'coding';
+      closeMobileSidebar();
+    }
+  }
+
 
   function documentTitleByMenu(menu) {
     const base = 'CodexSess Console';
     const key = String(menu || '').trim().toLowerCase();
     switch (key) {
+      case 'coding':
+        return `Chat - ${base}`;
       case 'settings':
         return `Settings - ${base}`;
       case 'api-endpoints':
@@ -1653,15 +1676,22 @@
   }
 
   onMount(() => {
+    syncRouteMode();
     const onBeforeUnload = () => {
       cancelBrowserLoginSession();
     };
+    const onPopstate = () => {
+      syncRouteMode();
+    };
     window.addEventListener('beforeunload', onBeforeUnload);
+    window.addEventListener('popstate', onPopstate);
     loadUIPreferences();
 
-    refreshAllData().catch((error) => {
-      setStatus(error.message, 'error');
-    });
+    if (!isChatRoute) {
+      refreshAllData().catch((error) => {
+        setStatus(error.message, 'error');
+      });
+    }
 
     const onResize = () => {
       if (window.innerWidth > 760) closeMobileSidebar();
@@ -1674,6 +1704,7 @@
 
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload);
+      window.removeEventListener('popstate', onPopstate);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onEsc);
       cancelBrowserLoginSession();
@@ -1747,7 +1778,7 @@
 </script>
 
 <svelte:head>
-  <title>{documentTitleByMenu(activeMenu)}</title>
+  <title>{isChatRoute ? `Chat - CodexSess Console` : documentTitleByMenu(activeMenu)}</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
@@ -1757,7 +1788,8 @@
   />
 </svelte:head>
 
-<div class="app-root {mobileSidebarOpen ? 'mobile-sidebar-open' : ''}" data-app-mode={appMode}>
+<div class="app-root {mobileSidebarOpen ? 'mobile-sidebar-open' : ''} {isChatRoute ? 'chat-route' : ''}" data-app-mode={appMode}>
+  {#if !isChatRoute}
   <aside class="sidebar {mobileSidebarOpen ? 'is-open' : ''}">
     <div class="brand">
       <strong>CodexSess</strong>
@@ -1771,6 +1803,12 @@
           <svg viewBox="0 0 24 24"><path d="M3 3h8v8H3V3zm10 0h8v5h-8V3zM3 13h5v8H3v-8zm7 0h11v8H10v-8z"></path></svg>
         </span>
         <span>Dashboard</span>
+      </button>
+      <button class={activeMenu === 'coding' ? 'is-active' : ''} onclick={() => switchMenu('coding')}>
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4V5zm2 2v10h12V7H6zm2 2h8v2H8V9zm0 4h6v2H8v-2z"></path></svg>
+        </span>
+        <span>Chat</span>
       </button>
       <button class={activeMenu === 'api-endpoints' ? 'is-active' : ''} onclick={() => switchMenu('api-endpoints')}>
         <span class="nav-icon" aria-hidden="true">
@@ -1804,32 +1842,39 @@
       </form>
     </div>
   </aside>
+  {/if}
 
   <main class="content {activeMenu === 'logs' ? 'content-logs' : ''}">
-    <div class="mobile-topbar">
-      <button class="mobile-burger" type="button" aria-label="Toggle menu" onclick={toggleMobileSidebar}>
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z"></path>
-        </svg>
-      </button>
-      <strong>{documentTitleByMenu(activeMenu)}</strong>
-    </div>
-    <section class="status-banner status-{statusClass(status.kind)}" aria-live="polite">
-      <span class="status-icon">{statusIcon(status.kind)}</span>
-      <p>{status.text}</p>
-    </section>
-    <section class="active-summary-strip" aria-label="Active account summary">
-      <div class="active-summary-item">
-        <span class="active-summary-label">API</span>
-        <strong>{accountDisplayLabel(activeAPIAccount())}</strong>
+    {#if !isChatRoute}
+      <div class="mobile-topbar">
+        <button class="mobile-burger" type="button" aria-label="Toggle menu" onclick={toggleMobileSidebar}>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 6h16v2H4V6zm0 5h16v2H4v-2zm0 5h16v2H4v-2z"></path>
+          </svg>
+        </button>
+        <strong>{documentTitleByMenu(activeMenu)}</strong>
       </div>
-      <div class="active-summary-item">
-        <span class="active-summary-label">CLI</span>
-        <strong>{accountDisplayLabel(activeCLIAccount())}</strong>
-      </div>
-    </section>
+      <section class="status-banner status-{statusClass(status.kind)}" aria-live="polite">
+        <span class="status-icon">{statusIcon(status.kind)}</span>
+        <p>{status.text}</p>
+      </section>
+      <section class="active-summary-strip" aria-label="Active account summary">
+        <div class="active-summary-item">
+          <span class="active-summary-label">API</span>
+          <strong>{accountDisplayLabel(activeAPIAccount())}</strong>
+        </div>
+        <div class="active-summary-item">
+          <span class="active-summary-label">CLI</span>
+          <strong>{accountDisplayLabel(activeCLIAccount())}</strong>
+        </div>
+      </section>
+    {/if}
 
-    {#if activeMenu === 'dashboard'}
+    {#if activeMenu === 'coding'}
+      <CodingView />
+    {/if}
+
+    {#if !isChatRoute && activeMenu === 'dashboard'}
       <DashboardView
         accounts={filteredAccounts()}
         totalAccounts={accounts.length}
@@ -1854,7 +1899,7 @@
       />
     {/if}
 
-    {#if activeMenu === 'settings'}
+    {#if !isChatRoute && activeMenu === 'settings'}
       <SettingsView
         busy={settingsBusy}
         {showAccountEmail}
@@ -1883,7 +1928,7 @@
       />
     {/if}
 
-    {#if activeMenu === 'api-endpoints'}
+    {#if !isChatRoute && activeMenu === 'api-endpoints'}
       <ApiEndpointView
         busy={settingsBusy}
         {apiKey}
@@ -1910,7 +1955,7 @@
       />
     {/if}
 
-    {#if activeMenu === 'logs'}
+    {#if !isChatRoute && activeMenu === 'logs'}
       <ApiLogsView
         {busy}
         {apiLogs}
@@ -1921,7 +1966,7 @@
       />
     {/if}
 
-    {#if activeMenu === 'about'}
+    {#if !isChatRoute && activeMenu === 'about'}
       <AboutView
         {busy}
         {appVersion}
@@ -1937,7 +1982,7 @@
     {/if}
   </main>
 
-  {#if mobileSidebarOpen}
+  {#if !isChatRoute && mobileSidebarOpen}
     <button class="sidebar-overlay" type="button" aria-label="Close menu" onclick={closeMobileSidebar}></button>
   {/if}
 

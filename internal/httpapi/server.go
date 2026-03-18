@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +84,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/version/check", s.handleWebVersionCheck)
 	mux.HandleFunc("/api/model-mappings", s.handleWebModelMappings)
 	mux.HandleFunc("/api/logs", s.handleWebLogs)
+	mux.HandleFunc("/api/coding/sessions", s.handleWebCodingSessions)
+	mux.HandleFunc("/api/coding/messages", s.handleWebCodingMessages)
+	mux.HandleFunc("/api/coding/chat", s.handleWebCodingChat)
+	mux.HandleFunc("/api/coding/chat/stream", s.handleWebCodingChatStream)
+	mux.HandleFunc("/api/coding/path-suggestions", s.handleWebCodingPathSuggestions)
+	mux.HandleFunc("/api/coding/skills", s.handleWebCodingSkills)
 	mux.HandleFunc("/api/auth/browser/start", s.handleWebBrowserStart)
 	mux.HandleFunc("/api/auth/browser/cancel", s.handleWebBrowserCancel)
 	mux.HandleFunc("/api/auth/browser/callback", s.handleWebBrowserCallback)
@@ -297,6 +304,12 @@ func (r *accessLogRecorder) Write(p []byte) (int, error) {
 		r.status = http.StatusOK
 	}
 	return r.ResponseWriter.Write(p)
+}
+
+func (r *accessLogRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -2058,6 +2071,381 @@ func (s *Server) handleWebLogs(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]any{"ok": true, "lines": lines})
 }
 
+func (s *Server) handleWebCodingSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		sessions, err := s.svc.ListCodingSessions(r.Context())
+		if err != nil {
+			respondErr(w, 500, "internal_error", err.Error())
+			return
+		}
+		respondJSON(w, 200, map[string]any{
+			"ok":       true,
+			"sessions": mapCodingSessions(sessions),
+		})
+		return
+	case http.MethodPost:
+		var req struct {
+			Title       string `json:"title"`
+			Model       string `json:"model"`
+			WorkDir     string `json:"work_dir"`
+			SandboxMode string `json:"sandbox_mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondErr(w, 400, "bad_request", "invalid JSON")
+			return
+		}
+		session, err := s.svc.CreateCodingSession(r.Context(), req.Title, req.Model, req.WorkDir, req.SandboxMode)
+		if err != nil {
+			respondErr(w, 400, "bad_request", err.Error())
+			return
+		}
+		respondJSON(w, 200, map[string]any{
+			"ok":      true,
+			"session": mapCodingSession(session),
+		})
+		return
+	case http.MethodPut:
+		var req struct {
+			SessionID   string `json:"session_id"`
+			Model       string `json:"model"`
+			WorkDir     string `json:"work_dir"`
+			SandboxMode string `json:"sandbox_mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondErr(w, 400, "bad_request", "invalid JSON")
+			return
+		}
+		session, err := s.svc.UpdateCodingSessionPreferences(r.Context(), req.SessionID, req.Model, req.WorkDir, req.SandboxMode)
+		if err != nil {
+			respondErr(w, 400, "bad_request", err.Error())
+			return
+		}
+		respondJSON(w, 200, map[string]any{
+			"ok":      true,
+			"session": mapCodingSession(session),
+		})
+		return
+	case http.MethodDelete:
+		sessionID := strings.TrimSpace(r.URL.Query().Get("id"))
+		if sessionID == "" {
+			respondErr(w, 400, "bad_request", "session id is required")
+			return
+		}
+		if err := s.svc.DeleteCodingSession(r.Context(), sessionID); err != nil {
+			respondErr(w, 400, "bad_request", err.Error())
+			return
+		}
+		respondJSON(w, 200, map[string]any{"ok": true})
+		return
+	default:
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+}
+
+func (s *Server) handleWebCodingMessages(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	if sessionID == "" {
+		respondErr(w, 400, "bad_request", "session_id is required")
+		return
+	}
+	messages, err := s.svc.GetCodingMessages(r.Context(), sessionID)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]any{
+		"ok":       true,
+		"messages": mapCodingMessages(messages),
+	})
+}
+
+func (s *Server) handleWebCodingChat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		SessionID   string `json:"session_id"`
+		Content     string `json:"content"`
+		Model       string `json:"model"`
+		WorkDir     string `json:"work_dir"`
+		SandboxMode string `json:"sandbox_mode"`
+		Command     string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	result, err := s.svc.SendCodingMessage(r.Context(), req.SessionID, req.Content, req.Model, req.WorkDir, req.SandboxMode, req.Command)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]any{
+		"ok":                 true,
+		"session":            mapCodingSession(result.Session),
+		"user":               mapCodingMessage(result.User),
+		"assistant":          mapCodingMessage(result.Assistant),
+		"assistant_messages": mapCodingMessages(result.Assistants),
+	})
+}
+
+func (s *Server) handleWebCodingChatStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		SessionID   string `json:"session_id"`
+		Content     string `json:"content"`
+		Model       string `json:"model"`
+		WorkDir     string `json:"work_dir"`
+		SandboxMode string `json:"sandbox_mode"`
+		Command     string `json:"command"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		respondErr(w, 500, "internal_error", "streaming unsupported by server")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	writeEvent := func(payload map[string]any) error {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return err
+		}
+		if _, err := w.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	_ = writeEvent(map[string]any{"event": "started"})
+	result, err := s.svc.SendCodingMessageStream(r.Context(), req.SessionID, req.Content, req.Model, req.WorkDir, req.SandboxMode, req.Command, func(evt provider.ChatEvent) error {
+		eventType := strings.TrimSpace(strings.ToLower(evt.Type))
+		switch eventType {
+		case "assistant_message":
+			return writeEvent(map[string]any{
+				"event": "assistant_message",
+				"text":  evt.Text,
+			})
+		case "activity":
+			return writeEvent(map[string]any{
+				"event": "activity",
+				"text":  evt.Text,
+			})
+		case "delta":
+			return writeEvent(map[string]any{
+				"event": "delta",
+				"text":  evt.Text,
+			})
+		default:
+			return nil
+		}
+	})
+	if err != nil {
+		_ = writeEvent(map[string]any{
+			"event":   "error",
+			"message": err.Error(),
+		})
+		return
+	}
+	_ = writeEvent(map[string]any{
+		"event":              "done",
+		"session":            mapCodingSession(result.Session),
+		"user":               mapCodingMessage(result.User),
+		"assistant":          mapCodingMessage(result.Assistant),
+		"assistant_messages": mapCodingMessages(result.Assistants),
+	})
+}
+
+func (s *Server) handleWebCodingPathSuggestions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	raw := strings.TrimSpace(r.URL.Query().Get("prefix"))
+	if raw == "" {
+		raw = "~/"
+	}
+	expanded := expandSuggestionPath(raw)
+	parent := expanded
+	if !strings.HasSuffix(raw, "/") {
+		parent = filepath.Dir(expanded)
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		respondJSON(w, 200, map[string]any{"ok": true, "suggestions": []string{raw}})
+		return
+	}
+	out := make([]string, 0, len(entries)+1)
+	needle := strings.ToLower(strings.TrimSpace(filepath.Base(expanded)))
+	prefixRoot := raw
+	if !strings.HasSuffix(prefixRoot, "/") {
+		prefixRoot = filepath.Dir(raw)
+	}
+	prefixRoot = strings.TrimSuffix(prefixRoot, "/")
+	if prefixRoot == "." {
+		prefixRoot = ""
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if needle != "" && !strings.HasPrefix(strings.ToLower(name), needle) {
+			continue
+		}
+		var suggestion string
+		switch {
+		case strings.HasPrefix(raw, "~/"):
+			base := strings.TrimPrefix(prefixRoot, "~")
+			suggestion = filepath.ToSlash(filepath.Join("~", base, name)) + "/"
+		case strings.HasPrefix(raw, "/"):
+			suggestion = filepath.ToSlash(filepath.Join(prefixRoot, name)) + "/"
+		default:
+			if prefixRoot == "" {
+				suggestion = name + "/"
+			} else {
+				suggestion = filepath.ToSlash(filepath.Join(prefixRoot, name)) + "/"
+			}
+		}
+		out = append(out, suggestion)
+	}
+	if len(out) == 0 {
+		out = append(out, raw)
+	}
+	sort.Strings(out)
+	respondJSON(w, 200, map[string]any{"ok": true, "suggestions": out})
+}
+
+func (s *Server) handleWebCodingSkills(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	home, _ := os.UserHomeDir()
+	searchRoots := []string{
+		filepath.Join(home, ".codex", "skills"),
+		filepath.Join(home, ".agents", "skills"),
+		filepath.Join(".", ".codex", "skills"),
+	}
+	searchRoots = append(searchRoots, additionalSkillRootsFromEnv()...)
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 64)
+	for _, root := range searchRoots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := strings.TrimSpace(entry.Name())
+			if name == "" {
+				continue
+			}
+			skillPath := filepath.Join(root, name, "SKILL.md")
+			if _, err := os.Stat(skillPath); err != nil {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	respondJSON(w, 200, map[string]any{
+		"ok":     true,
+		"skills": out,
+	})
+}
+
+func additionalSkillRootsFromEnv() []string {
+	raw := strings.TrimSpace(os.Getenv("CODEXSESS_SKILL_DIRS"))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, string(os.PathListSeparator))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		out = append(out, expandSuggestionPath(p))
+	}
+	return out
+}
+
+func mapCodingSessions(items []store.CodingSession) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, mapCodingSession(item))
+	}
+	return out
+}
+
+func mapCodingSession(item store.CodingSession) map[string]any {
+	return map[string]any{
+		"id":              item.ID,
+		"display_id":      firstNonEmpty(strings.TrimSpace(item.CodexThreadID), item.ID),
+		"codex_thread_id": item.CodexThreadID,
+		"title":           item.Title,
+		"model":           item.Model,
+		"work_dir":        item.WorkDir,
+		"sandbox_mode":    item.SandboxMode,
+		"created_at":      item.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":      item.UpdatedAt.UTC().Format(time.RFC3339),
+		"last_message_at": item.LastMessageAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func mapCodingMessages(items []store.CodingMessage) []map[string]any {
+	out := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		out = append(out, mapCodingMessage(item))
+	}
+	return out
+}
+
+func mapCodingMessage(item store.CodingMessage) map[string]any {
+	return map[string]any{
+		"id":            item.ID,
+		"session_id":    item.SessionID,
+		"role":          item.Role,
+		"content":       item.Content,
+		"input_tokens":  item.InputTokens,
+		"output_tokens": item.OutputTokens,
+		"created_at":    item.CreatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
 func (s *Server) handleWebClientEventLog(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
@@ -2542,4 +2930,26 @@ func externalBaseURLFromRequest(r *http.Request, bindAddr string) string {
 		return scheme + "://" + host
 	}
 	return scheme + "://" + bindAddr
+}
+
+func expandSuggestionPath(raw string) string {
+	clean := strings.TrimSpace(raw)
+	if clean == "" {
+		clean = "~/"
+	}
+	if strings.HasPrefix(clean, "~/") || clean == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			suffix := strings.TrimPrefix(clean, "~")
+			return filepath.Clean(filepath.Join(home, suffix))
+		}
+	}
+	if filepath.IsAbs(clean) {
+		return filepath.Clean(clean)
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return filepath.Clean(clean)
+	}
+	return filepath.Clean(filepath.Join(wd, clean))
 }

@@ -70,6 +70,28 @@ func (s *Store) migrate(ctx context.Context) error {
 			latency_ms INTEGER NOT NULL,
 			created_at TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS coding_sessions (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			work_dir TEXT NOT NULL DEFAULT '~/',
+			sandbox_mode TEXT NOT NULL DEFAULT 'full-access',
+			codex_thread_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_message_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS coding_messages (
+			id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_coding_messages_session_created
+			ON coding_messages(session_id, created_at);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -79,6 +101,24 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE accounts DROP COLUMN login_option`); err != nil {
 		msg := strings.ToLower(err.Error())
 		if !strings.Contains(msg, "no such column") && !strings.Contains(msg, "syntax error") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN work_dir TEXT NOT NULL DEFAULT '~/'`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN codex_thread_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'full-access'`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
 			return err
 		}
 	}
@@ -258,6 +298,181 @@ func (s *Store) ListUsageSnapshots(ctx context.Context) (map[string]UsageSnapsho
 func (s *Store) InsertAudit(ctx context.Context, r AuditRecord) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO request_audit(request_id,account_id,model,stream,status,latency_ms,created_at) VALUES(?,?,?,?,?,?,?)`, r.RequestID, r.AccountID, r.Model, boolToInt(r.Stream), r.Status, r.LatencyMS, r.CreatedAt.UTC().Format(time.RFC3339))
 	return err
+}
+
+func (s *Store) CreateCodingSession(ctx context.Context, session CodingSession) (CodingSession, error) {
+	now := time.Now().UTC()
+	if session.CreatedAt.IsZero() {
+		session.CreatedAt = now
+	}
+	if session.UpdatedAt.IsZero() {
+		session.UpdatedAt = now
+	}
+	if session.LastMessageAt.IsZero() {
+		session.LastMessageAt = now
+	}
+	if strings.TrimSpace(session.Title) == "" {
+		session.Title = "New Session"
+	}
+	if strings.TrimSpace(session.Model) == "" {
+		session.Model = "gpt-5.2-codex"
+	}
+	if strings.TrimSpace(session.WorkDir) == "" {
+		session.WorkDir = "~/"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO coding_sessions(id,title,model,work_dir,sandbox_mode,codex_thread_id,created_at,updated_at,last_message_at)
+		VALUES(?,?,?,?,?,?,?,?,?)
+	`, session.ID, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.CreatedAt.UTC().Format(time.RFC3339), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return CodingSession{}, err
+	}
+	return s.GetCodingSession(ctx, session.ID)
+}
+
+func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,created_at,updated_at,last_message_at
+		FROM coding_sessions
+		ORDER BY last_message_at DESC, updated_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CodingSession
+	for rows.Next() {
+		var session CodingSession
+		var createdAt, updatedAt, lastMessageAt string
+		if err := rows.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &createdAt, &updatedAt, &lastMessageAt); err != nil {
+			return nil, err
+		}
+		session.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		session.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+		session.LastMessageAt, _ = time.Parse(time.RFC3339, lastMessageAt)
+		out = append(out, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) GetCodingSession(ctx context.Context, id string) (CodingSession, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,created_at,updated_at,last_message_at
+		FROM coding_sessions
+		WHERE id=?
+		LIMIT 1
+	`, strings.TrimSpace(id))
+	var session CodingSession
+	var createdAt, updatedAt, lastMessageAt string
+	if err := row.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &createdAt, &updatedAt, &lastMessageAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return session, fmt.Errorf("coding session not found")
+		}
+		return session, err
+	}
+	session.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	session.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	session.LastMessageAt, _ = time.Parse(time.RFC3339, lastMessageAt)
+	return session, nil
+}
+
+func (s *Store) UpdateCodingSession(ctx context.Context, session CodingSession) error {
+	if strings.TrimSpace(session.ID) == "" {
+		return fmt.Errorf("coding session id is required")
+	}
+	if strings.TrimSpace(session.Title) == "" {
+		session.Title = "New Session"
+	}
+	if strings.TrimSpace(session.Model) == "" {
+		session.Model = "gpt-5.2-codex"
+	}
+	if strings.TrimSpace(session.WorkDir) == "" {
+		session.WorkDir = "~/"
+	}
+	if strings.TrimSpace(session.SandboxMode) == "" {
+		session.SandboxMode = "full-access"
+	}
+	if session.UpdatedAt.IsZero() {
+		session.UpdatedAt = time.Now().UTC()
+	}
+	if session.LastMessageAt.IsZero() {
+		session.LastMessageAt = session.UpdatedAt
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE coding_sessions
+		SET title=?, model=?, work_dir=?, sandbox_mode=?, codex_thread_id=?, updated_at=?, last_message_at=?
+		WHERE id=?
+	`, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339), session.ID)
+	return err
+}
+
+func (s *Store) DeleteCodingSession(ctx context.Context, id string) error {
+	sessionID := strings.TrimSpace(id)
+	if sessionID == "" {
+		return fmt.Errorf("coding session id is required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM coding_messages WHERE session_id=?`, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM coding_sessions WHERE id=?`, sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) AppendCodingMessage(ctx context.Context, msg CodingMessage) (CodingMessage, error) {
+	if strings.TrimSpace(msg.ID) == "" {
+		return CodingMessage{}, fmt.Errorf("coding message id is required")
+	}
+	if strings.TrimSpace(msg.SessionID) == "" {
+		return CodingMessage{}, fmt.Errorf("coding message session_id is required")
+	}
+	if msg.CreatedAt.IsZero() {
+		msg.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO coding_messages(id,session_id,role,content,input_tokens,output_tokens,created_at)
+		VALUES(?,?,?,?,?,?,?)
+	`, msg.ID, msg.SessionID, msg.Role, msg.Content, msg.InputTokens, msg.OutputTokens, msg.CreatedAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return CodingMessage{}, err
+	}
+	return msg, nil
+}
+
+func (s *Store) ListCodingMessages(ctx context.Context, sessionID string) ([]CodingMessage, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id,session_id,role,content,input_tokens,output_tokens,created_at
+		FROM coding_messages
+		WHERE session_id=?
+		ORDER BY created_at ASC
+	`, strings.TrimSpace(sessionID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CodingMessage
+	for rows.Next() {
+		var msg CodingMessage
+		var createdAt string
+		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.Role, &msg.Content, &msg.InputTokens, &msg.OutputTokens, &createdAt); err != nil {
+			return nil, err
+		}
+		msg.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		out = append(out, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func scanAccount(row *sql.Row) (Account, error) {

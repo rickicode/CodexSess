@@ -42,3 +42,25 @@ type AuditRecord struct {
 	LatencyMS int64
 	CreatedAt time.Time
 }
+
+type CodingSession struct {
+	ID            string
+	Title         string
+	Model         string
+	WorkDir       string
+	SandboxMode   string
+	CodexThreadID string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	LastMessageAt time.Time
+}
+
+type CodingMessage struct {
+	ID           string
+	SessionID    string
+	Role         string
+	Content      string
+	InputTokens  int
+	OutputTokens int
+	CreatedAt    time.Time
+}

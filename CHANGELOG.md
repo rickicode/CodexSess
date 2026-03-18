@@ -10,6 +10,8 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Dedicated GitHub workflow for PR code review with synthesized final review output.
 - Optional PR autofix helper workflow that generates patch suggestions and uploads patch artifacts for manual application.
 - New API-key protected endpoint `GET /v1/auth.json` to export the active API account auth payload for external Codex CLI runners.
+- Web coding runtime session APIs (`/api/coding/sessions`, `/api/coding/messages`, `/api/coding/chat`) for ChatGPT-style session list and message history.
+- Persistent storage tables for coding sessions and coding messages in the local SQLite store.
 
 ### Changed
 - OpenAI `/v1` root payload validation now only dispatches to chat completions and responses APIs.
@@ -50,6 +52,30 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - GitHub code-review workflow now installs security tooling in CI (`semgrep`, `gitleaks`, `gosec`, `govulncheck`) so Codex can run direct security checks during review/autofix when needed.
 - GitHub code-review autofix commit step now strips CI scratch artifacts and excludes `.github/workflows/*` from automation commits to avoid push rejections when workflow-token lacks `workflows` permission.
 - GitHub code-review PR comments now prioritize analysis output (review findings + autofix summary) and strip raw code blocks from posted comment content.
+- Sidebar navigation now includes a dedicated `Sessions` menu and opens to that page by default.
+- New `Sessions` web UI provides first-open auto session creation, left-side session list, and coding chat composer/messages in a desktop app layout.
+- Codex executor now supports explicit `workdir` options so web coding sessions can run in project context while keeping `CODEX_HOME` auth separation.
+- `Sessions` flow now opens a workspace/folder picker modal on `New Session` with default path `~/`.
+- Added path suggestion API (`/api/coding/path-suggestions`) and UI autocomplete that suggests directories from server-side listing (`ls`-style).
+- Coding session metadata now persists `work_dir`, and active path is shown directly in the chat panel.
+- Sessions/chat now uses dedicated route `/chat` for full coding layout.
+- `/chat` view now hides dashboard shell elements (sidebar, status banner, API/CLI summary) and focuses only on coding UI.
+- `Sessions` navigation button now redirects to `/chat`, and `/chat` provides an explicit `Back to Dashboard` action.
+- `/chat` layout height was rebalanced to avoid whole-page scrolling; only the coding message area is scrollable.
+- Workspace path visibility in chat was improved (`Workspace Path` bar), and `New Session` workspace picker modal visibility was hardened.
+- Chat composer now supports slash commands (`/help`, `/model`, `/path`, `/new`) for quick runtime control without leaving chat.
+- Chat composer now supports `$skill` markers, which are passed as skill hints into the request payload.
+- Send button in coding chat was redesigned for clearer action state and better visual affordance.
+- Added `/status` slash command to quickly show current session/model/path context in the chat status line.
+- Added dedicated Skill Picker modal (with search) to insert available `$skill_name` tokens into composer directly from UI.
+- Added backend skills listing endpoint (`/api/coding/skills`) that discovers installed skills from local Codex/agents skill directories.
+- Fixed coding session persistence flow so user messages are only stored after successful Codex response, preventing duplicate history on retry after upstream failures.
+- `$skill` handling now preserves original user prompt text (no token stripping) while still passing skill hints.
+- Added coding session preferences update API (`PUT /api/coding/sessions`) so model/path changes persist immediately on active session.
+- Model dropdown and `/model` + `/path` commands now auto-save session preferences (debounced), reducing state drift between UI and stored session.
+- Skills discovery now supports custom roots via `CODEXSESS_SKILL_DIRS` (path-list env) in addition to default local skill directories.
+- Chat header controls were reorganized: model dropdown + `New Session` + `Delete` now live in the topbar only for cleaner layout.
+- Session list is now accessible via a dedicated `Sessions` sidebar modal drawer, including full session selection flow.
 
 ## [1.0.1] - 2026-03-18
 

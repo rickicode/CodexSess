@@ -26,6 +26,7 @@
     <a href="#installation-linux">Installation</a> •
     <a href="#core-capabilities">Core Capabilities</a> •
     <a href="#github-code-review-workflow">GitHub Code Review Workflow</a> •
+    <a href="#todo">TODO</a> •
     <a href="#ui-preview">UI Preview</a> •
     <a href="#authentication--session">Authentication</a> •
     <a href="#environment-variables">Environment</a>
@@ -164,6 +165,19 @@ Behavior:
   - `sequential_thinking` (free)
   - `memory` (free)
   - `exa` (enabled when `EXA_API_KEY` is provided)
+
+## TODO
+
+- Add a web-based Codex runtime wrapper so coding sessions can be run from mobile/desktop browser with CLI-like behavior.
+- Target parity with Codex CLI core flow:
+  - start/resume/stop interactive sessions
+  - stream tool/terminal output in real time
+  - workspace-aware file editing and diffs
+  - approval/sandbox controls exposed in web UI
+- Implement session isolation and security guardrails before public multi-device usage:
+  - per-session workspace boundaries
+  - strict command policy and audit logs
+  - rate limits and timeout controls
 
 ## Environment Variables
 

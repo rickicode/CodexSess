@@ -45,6 +45,7 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Installer update/download flow now forces release asset re-download with cache-bypass headers/query, so update keeps fetching binary/package even when version tag is unchanged.
 - GitHub code-review workflow now supports true manual runs without `pr_number` (via `target_ref`) and auto-creates a dedicated autofix branch on manual mode when safe changes exist.
 - GitHub code-review autofix push is now guarded for PR mode to skip direct push on fork-based PRs, preventing workflow failure from cross-repo push permission errors.
+- GitHub code-review workflow now runs Codex in CI with `--dangerously-bypass-approvals-and-sandbox` to avoid bubblewrap (`bwrap`) sandbox failures on hosted runners.
 
 ## [1.0.1] - 2026-03-18
 

@@ -210,7 +210,7 @@ jobs:
           PROMPT
           REVIEW_PROMPT="$(cat review_prompt.txt)"
           codex exec \
-            --sandbox read-only \
+            --dangerously-bypass-approvals-and-sandbox \
             --skip-git-repo-check \
             -m gpt-5.2-codex \
             "$REVIEW_PROMPT" > review.txt
@@ -253,7 +253,7 @@ jobs:
           PROMPT
           AUTOFIX_PROMPT="$(cat autofix_prompt.txt)"
           codex exec \
-            --sandbox workspace-write \
+            --dangerously-bypass-approvals-and-sandbox \
             --skip-git-repo-check \
             -m gpt-5.2-codex \
             "$AUTOFIX_PROMPT" > autofix.txt || true

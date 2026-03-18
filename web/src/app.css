@@ -111,6 +111,14 @@ textarea {
   align-self: end;
 }
 
+.sidebar-version {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-align: center;
+}
+
 .sidebar-footer form {
   margin: 0;
 }
@@ -312,8 +320,13 @@ textarea {
   border-radius: 8px;
   background: #2a2a2a;
   color: var(--text);
+  text-decoration: none;
   height: 34px;
   padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -922,7 +935,7 @@ input[type='range'].threshold-slider:focus-visible {
   }
 
   .nav {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
   .content {

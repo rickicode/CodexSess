@@ -65,6 +65,30 @@ Use the latest published binaries from GitHub Releases:
 
 - Latest release: https://github.com/rickicode/CodexSess/releases/latest
 
+## CLI Installer
+
+Each release includes an `install.sh` script for automatic installation.
+
+```bash
+curl -fsSL https://github.com/rickicode/CodexSess/releases/latest/download/install.sh | bash
+```
+
+Installer modes:
+- `--mode auto` (default): detects desktop/server environment automatically
+- `--mode gui`: installs `.deb`/`.rpm` GUI package on Linux
+- `--mode server`: downloads and installs release binary directly (CLI/server mode)
+- `--mode update`: detects existing install type (`gui`/`server`) and updates it automatically
+
+Examples:
+- `bash install.sh --mode gui`
+- `bash install.sh --mode server --bin-dir /usr/local/bin`
+- `bash install.sh --mode update`
+- `bash install.sh --version v1.0.1`
+
+Server mode notes:
+- On Linux, server install/update automatically provisions and restarts `codexsess.service` via `systemd`.
+- Service runs with `CODEXSESS_NO_OPEN_BROWSER=1` to stay headless.
+
 ## Project Goal
 
 CodexSess focuses on operational reliability for account-based Codex usage:

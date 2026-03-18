@@ -8,11 +8,12 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os/exec"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"golang.org/x/term"
 )
 
+var appVersion = "v1.0.1"
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("codexsess: %v", err)
@@ -38,6 +41,9 @@ func run() error {
 		switch strings.TrimSpace(os.Args[1]) {
 		case "--changepassword":
 			return changePassword()
+		case "--version":
+			fmt.Println(effectiveAppVersion())
+			return nil
 		default:
 			return fmt.Errorf("unknown argument: %s", os.Args[1])
 		}
@@ -79,7 +85,7 @@ func run() error {
 	}
 
 	svc := service.New(cfg, st, cry)
-	srv := httpapi.New(svc, cfg.BindAddr, cfg.ProxyAPIKey, cfg.AdminUsername, cfg.AdminPasswordHash, traffic)
+	srv := httpapi.New(svc, cfg.BindAddr, cfg.ProxyAPIKey, cfg.AdminUsername, cfg.AdminPasswordHash, traffic, effectiveAppVersion())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -94,6 +100,20 @@ func run() error {
 		return err
 	}
 	return nil
+}
+
+func effectiveAppVersion() string {
+	v := strings.TrimSpace(appVersion)
+	if v != "" && !strings.EqualFold(v, "dev") {
+		return v
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		mv := strings.TrimSpace(bi.Main.Version)
+		if mv != "" && mv != "(devel)" {
+			return mv
+		}
+	}
+	return "dev"
 }
 
 func shouldAutoOpenBrowser() bool {

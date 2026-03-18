@@ -17,6 +17,11 @@
   - `rtk git diff`
   - `rtk git show --stat`
 
+## Changelog Update (Mandatory)
+
+- Every editing session must update `CHANGELOG.md`.
+- Before commit, ensure `CHANGELOG.md` includes the user-visible changes for that session.
+
 ### Backend + frontend dev
 
 - `make dev` — runs backend hot-reload via `air` on port 3078 and starts the main `frontend` dev server.

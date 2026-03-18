@@ -37,10 +37,13 @@ jobs:
         working-directory: web
         run: npm run build:web
 
-      - name: Build Linux binary
+      - name: Build Linux binaries
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist
-          GOOS=linux GOARCH=amd64 go build -o dist/codexsess-linux-amd64 .
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-linux-arm64 .
 
       - name: Prepare Linux desktop assets
         run: |
@@ -52,14 +55,14 @@ jobs:
       - name: Install nFPM
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
 
-      - name: Build DEB and RPM packages
+      - name: Build DEB and RPM packages (amd64 + arm64)
         env:
           VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p dist/packages
           PKG_VERSION="${VERSION#v}"
-          cat > dist/nfpm.yaml <<EOF
-          name: codexsess
+          cat > dist/nfpm-amd64.yaml <<EOF
+          name: codexsess_GUI
           arch: amd64
           platform: linux
           version: ${PKG_VERSION}
@@ -87,20 +90,64 @@ jobs:
             postinstall: ./packaging/linux/postinstall.sh
             postremove: ./packaging/linux/postremove.sh
           EOF
-          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm.yaml --packager deb --target dist/packages/codexsess_${PKG_VERSION}_amd64.deb
-          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm.yaml --packager rpm --target dist/packages/codexsess-${PKG_VERSION}-1.x86_64.rpm
 
-      - name: Build Windows binary with icon
+          cat > dist/nfpm-arm64.yaml <<EOF
+          name: codexsess_GUI
+          arch: arm64
+          platform: linux
+          version: ${PKG_VERSION}
+          section: default
+          priority: optional
+          maintainer: rickicode
+          description: CodexSess - Codex account management gateway
+          vendor: CodexSess
+          homepage: https://github.com/rickicode/CodexSess
+          license: MIT
+          contents:
+            - src: ./dist/codexsess-linux-arm64
+              dst: /usr/bin/codexsess
+              file_info:
+                mode: 0755
+            - src: ./dist/linux/codexsess.desktop
+              dst: /usr/share/applications/codexsess.desktop
+              file_info:
+                mode: 0644
+            - src: ./dist/linux/codexsess.png
+              dst: /usr/share/icons/hicolor/64x64/apps/codexsess.png
+              file_info:
+                mode: 0644
+          scripts:
+            postinstall: ./packaging/linux/postinstall.sh
+            postremove: ./packaging/linux/postremove.sh
+          EOF
+
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-amd64.yaml --packager deb --target dist/packages/codexsess_GUI_${PKG_VERSION}_amd64.deb
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-amd64.yaml --packager rpm --target dist/packages/codexsess_GUI-${PKG_VERSION}-1.x86_64.rpm
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-arm64.yaml --packager deb --target dist/packages/codexsess_GUI_${PKG_VERSION}_arm64.deb
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-arm64.yaml --packager rpm --target dist/packages/codexsess_GUI-${PKG_VERSION}-1.aarch64.rpm
+
+      - name: Build Windows binaries with icon
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
           mkdir -p build/windows
           go run ./scripts/gen_default_icon.go build/windows/app.ico
           go run github.com/akavel/rsrc@latest -ico build/windows/app.ico -o codexsess_windows_amd64.syso
-          GOOS=windows GOARCH=amd64 go build -o dist/codexsess-windows-amd64.exe .
+          go run github.com/akavel/rsrc@latest -ico build/windows/app.ico -o codexsess_windows_arm64.syso
+          GOOS=windows GOARCH=amd64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-windows-amd64.exe .
+          GOOS=windows GOARCH=arm64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-windows-arm64.exe .
 
       - name: Checksums
         run: |
           cd dist
-          sha256sum codexsess-linux-amd64 codexsess-windows-amd64.exe > SHA256SUMS.txt
+          cp ../scripts/install.sh install.sh
+          chmod +x install.sh
+          sha256sum \
+            codexsess-linux-amd64 \
+            codexsess-linux-arm64 \
+            codexsess-windows-amd64.exe \
+            codexsess-windows-arm64.exe \
+            install.sh > SHA256SUMS.txt
           sha256sum packages/*.deb packages/*.rpm >> SHA256SUMS.txt
 
       - name: Upload artifacts
@@ -109,7 +156,10 @@ jobs:
           name: codexsess-build-${{ github.run_number }}
           path: |
             dist/codexsess-linux-amd64
+            dist/codexsess-linux-arm64
             dist/codexsess-windows-amd64.exe
+            dist/codexsess-windows-arm64.exe
+            dist/install.sh
             dist/SHA256SUMS.txt
             dist/packages/*.deb
             dist/packages/*.rpm
@@ -120,7 +170,10 @@ jobs:
         with:
           files: |
             dist/codexsess-linux-amd64
+            dist/codexsess-linux-arm64
             dist/codexsess-windows-amd64.exe
+            dist/codexsess-windows-arm64.exe
+            dist/install.sh
             dist/SHA256SUMS.txt
             dist/packages/*.deb
             dist/packages/*.rpm

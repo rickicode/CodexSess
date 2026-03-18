@@ -3,6 +3,7 @@
   import DashboardView from './views/DashboardView.svelte';
   import SettingsView from './views/SettingsView.svelte';
   import ApiLogsView from './views/ApiLogsView.svelte';
+  import AboutView from './views/AboutView.svelte';
 
   let accounts = $state([]);
   let busy = $state(false);
@@ -31,6 +32,14 @@
   let usageAutoSwitchThreshold = $state(2);
   let usageAutoSwitchThresholdInput = $state('2');
   let usageSoundEnabled = $state(true);
+  let appVersion = $state('dev');
+  let latestVersion = $state('');
+  let releaseURL = $state('');
+  let latestChangelog = $state('');
+  let updateAvailable = $state(false);
+  let updateCheckedAt = $state('');
+  let updateCheckError = $state('');
+  let updateCheckBusy = $state(false);
   let autoRefreshBusy = $state(false);
   let usageRefreshBusy = $state(false);
   let usageAutomationBusy = $state(false);
@@ -730,6 +739,37 @@
     }
     if (!availableModels.includes(mappingTargetModel) && availableModels.length > 0) {
       mappingTargetModel = availableModels[0];
+    }
+    appVersion = String(data.app_version || 'dev').trim() || 'dev';
+    latestVersion = String(data.latest_version || '').trim();
+    releaseURL = String(data.release_url || '').trim();
+    latestChangelog = String(data.latest_changelog || '').trim();
+    updateAvailable = Boolean(data.update_available);
+    updateCheckedAt = String(data.update_checked_at || '').trim();
+    updateCheckError = String(data.update_check_error || '').trim();
+  }
+
+  async function checkForUpdates() {
+    updateCheckBusy = true;
+    try {
+      const data = await req('/api/version/check', { method: 'POST', body: JSON.stringify({}) });
+      appVersion = String(data.app_version || appVersion).trim() || appVersion;
+      latestVersion = String(data.latest_version || '').trim();
+      releaseURL = String(data.release_url || '').trim();
+      latestChangelog = String(data.latest_changelog || '').trim();
+      updateAvailable = Boolean(data.update_available);
+      updateCheckedAt = String(data.update_checked_at || '').trim();
+      updateCheckError = String(data.update_check_error || '').trim();
+      if (updateAvailable) {
+        setStatus(`Update available: v${latestVersion}`, 'info');
+      } else {
+        setStatus(`You are using the latest version (${appVersion}).`, 'success');
+      }
+    } catch (error) {
+      updateCheckError = String(error?.message || 'failed to check updates');
+      setStatus(updateCheckError, 'error');
+    } finally {
+      updateCheckBusy = false;
     }
   }
 
@@ -1624,8 +1664,15 @@
         </span>
         <span>API Logs</span>
       </button>
+      <button class={activeMenu === 'about' ? 'is-active' : ''} onclick={() => (activeMenu = 'about')}>
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 4a1.4 1.4 0 110 2.8A1.4 1.4 0 0112 6zm-1.5 5h3v7h-3v-7z"></path></svg>
+        </span>
+        <span>About</span>
+      </button>
     </nav>
     <div class="sidebar-footer">
+      <p class="sidebar-version">Version: v{appVersion || 'dev'}</p>
       <form method="post" action="/auth/logout">
         <button class="btn btn-secondary sidebar-logout" type="submit">Logout</button>
       </form>
@@ -1729,6 +1776,21 @@
         onOpenLogDetail={openLogDetail}
         {formatLogTimestamp}
         {logStatusClass}
+      />
+    {/if}
+
+    {#if activeMenu === 'about'}
+      <AboutView
+        {busy}
+        {appVersion}
+        {latestVersion}
+        {updateAvailable}
+        {updateCheckedAt}
+        {updateCheckError}
+        {updateCheckBusy}
+        {latestChangelog}
+        {releaseURL}
+        onCheckForUpdates={checkForUpdates}
       />
     {/if}
   </main>

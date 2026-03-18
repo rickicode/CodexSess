@@ -68,6 +68,8 @@ Use the latest published binaries from GitHub Releases:
 ## CLI Installer
 
 Installer script is maintained in this repository (`scripts/install.sh`) and can be executed directly via raw URL.
+This installer is Linux-only.
+For Windows, download the `.exe` binary directly from the latest release page.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash

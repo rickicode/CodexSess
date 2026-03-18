@@ -85,7 +85,8 @@
     <section class="setting-category">
       <h3 class="setting-category-title">Quick Update</h3>
       <div class="setting-row">
-        <p class="setting-title">Run this command to auto-detect existing GUI/CLI install and update in place.</p>
+        <p class="setting-title">Linux only: run this command to auto-detect existing GUI/CLI install and update in place.</p>
+        <p class="setting-title">Windows: download the latest `.exe` directly from Release.</p>
         <div class="code-box">
           <pre>{updateScriptCommand}</pre>
         </div>

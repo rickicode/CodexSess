@@ -21,6 +21,10 @@
 
 - Every editing session must update `CHANGELOG.md`.
 - Before commit, ensure `CHANGELOG.md` includes the user-visible changes for that session.
+- Changelog scope must only include product code changes in:
+  - Go backend/runtime code (for example `main.go`, `internal/**/*.go`)
+  - Frontend application source (for example `web/src/**`)
+- Do not add changelog items for docs/workflow/packaging/scripts/assets-only edits unless the user explicitly requests it.
 
 ### Backend + frontend dev
 

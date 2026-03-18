@@ -28,6 +28,9 @@ Examples:
   ./install.sh --mode gui --version v1.0.1
   ./install.sh --mode server --bin-dir "$HOME/.local/bin"
   ./install.sh --mode update
+
+Note:
+  This installer is Linux-only.
 EOF
 }
 
@@ -68,9 +71,8 @@ detect_os() {
   raw="$(uname -s | tr '[:upper:]' '[:lower:]')"
   case "$raw" in
     linux*) echo "linux" ;;
-    mingw*|msys*|cygwin*) echo "windows" ;;
     *)
-      err "unsupported operating system: ${raw}"
+      err "unsupported operating system: ${raw}. install.sh is Linux-only"
       exit 1
       ;;
   esac
@@ -111,32 +113,19 @@ service_exists_linux() {
 }
 
 detect_existing_install_mode() {
-  local os_name
-  os_name="$(detect_os)"
-
-  if [[ "${os_name}" == "linux" ]]; then
-    if is_gui_package_installed_linux; then
-      echo "gui"
-      return
-    fi
-    if service_exists_linux; then
-      DETECTED_SERVER_BIN="$(detect_existing_server_binary_path)"
-      echo "server"
-      return
-    fi
-    if [[ -x "/usr/local/bin/codexsess" || -x "/usr/bin/codexsess" ]]; then
-      DETECTED_SERVER_BIN="$(detect_existing_server_binary_path)"
-      echo "server"
-      return
-    fi
+  if is_gui_package_installed_linux; then
+    echo "gui"
+    return
   fi
-
-  if [[ "${os_name}" == "windows" ]]; then
-    if [[ -x "${BIN_DIR%/}/codexsess.exe" ]]; then
-      DETECTED_SERVER_BIN="${BIN_DIR%/}/codexsess.exe"
-      echo "server"
-      return
-    fi
+  if service_exists_linux; then
+    DETECTED_SERVER_BIN="$(detect_existing_server_binary_path)"
+    echo "server"
+    return
+  fi
+  if [[ -x "/usr/local/bin/codexsess" || -x "/usr/bin/codexsess" ]]; then
+    DETECTED_SERVER_BIN="$(detect_existing_server_binary_path)"
+    echo "server"
+    return
   fi
 
   echo "none"
@@ -232,20 +221,14 @@ install_gui_linux() {
 install_server_binary_release() {
   require_cmd curl
 
-  local tag tmp outbin os_name arch asset
+  local tag tmp outbin arch asset
   tag="$(resolve_tag)"
-  os_name="$(detect_os)"
   arch="$(detect_arch)"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 
-  if [[ "${os_name}" == "windows" ]]; then
-    asset="codexsess-windows-${arch}.exe"
-    outbin="${BIN_DIR%/}/codexsess.exe"
-  else
-    asset="codexsess-linux-${arch}"
-    outbin="${BIN_DIR%/}/codexsess"
-  fi
+  asset="codexsess-linux-${arch}"
+  outbin="${BIN_DIR%/}/codexsess"
 
   log "downloading ${asset} from release ${tag}"
   curl -fL "https://github.com/${REPO}/releases/download/${tag}/${asset}" -o "${tmp}/${asset}"
@@ -254,15 +237,13 @@ install_server_binary_release() {
   install_binary_file "${tmp}/${asset}" "${outbin}"
   log "installed server binary: ${outbin}"
 
-  if [[ "${os_name}" == "linux" ]]; then
-    configure_server_systemd "${outbin}"
-  fi
+  configure_server_systemd "${outbin}"
 }
 
 configure_server_systemd() {
   local outbin="$1"
   if ! has_cmd systemctl; then
-    log "systemctl not found; skipping systemd service setup"
+    err "systemctl is not available on this Linux host. server mode requires systemd service setup"
     return
   fi
   if [[ "${NO_SUDO}" == "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -297,7 +278,16 @@ EOF
 }
 
 main() {
+  detect_os >/dev/null
+
   while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--mode" || "$1" == "--version" || "$1" == "--repo" || "$1" == "--bin-dir" ]]; then
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        err "missing value for $1"
+        usage
+        exit 1
+      fi
+    fi
     case "$1" in
       --mode) MODE="${2:-}"; shift 2 ;;
       --version) VERSION="${2:-}"; shift 2 ;;

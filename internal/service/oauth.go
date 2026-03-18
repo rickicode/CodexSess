@@ -138,7 +138,9 @@ func (s *Service) StartBrowserLogin(ctx context.Context) (BrowserLogin, error) {
 	}
 
 	callbackCh := make(chan string, 1)
-	srv := &http.Server{}
+	srv := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/auth/callback", func(w http.ResponseWriter, r *http.Request) {
 		code := r.URL.Query().Get("code")

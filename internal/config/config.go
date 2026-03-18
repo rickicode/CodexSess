@@ -3,6 +3,7 @@ package config
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -46,7 +48,7 @@ func Default() Config {
 		UsageAlertThreshold:      5,
 		UsageAutoSwitchThreshold: 2,
 		AdminUsername:            "admin",
-		AdminPasswordHash:        HashPassword("hijilabs"),
+		AdminPasswordHash:        "",
 		LogLevel:                 "info",
 	}
 }
@@ -69,6 +71,9 @@ func LoadOrInit() (Config, error) {
 				return cfg, err
 			}
 			cfg.ProxyAPIKey = key
+		}
+		if err := ensureAdminPassword(&cfg); err != nil {
+			return cfg, err
 		}
 		if err := Save(cfg); err != nil {
 			return cfg, err
@@ -113,8 +118,14 @@ func LoadOrInit() (Config, error) {
 	if strings.TrimSpace(cfg.AdminUsername) == "" {
 		cfg.AdminUsername = def.AdminUsername
 	}
-	if strings.TrimSpace(cfg.AdminPasswordHash) == "" {
-		cfg.AdminPasswordHash = def.AdminPasswordHash
+	hadAdminHash := strings.TrimSpace(cfg.AdminPasswordHash) != ""
+	if err := ensureAdminPassword(&cfg); err != nil {
+		return cfg, err
+	}
+	if !hadAdminHash {
+		if err := Save(cfg); err != nil {
+			return cfg, err
+		}
 	}
 	cfg.BindAddr = resolveBindAddr()
 	return cfg, nil
@@ -139,6 +150,31 @@ func randomKey(prefix string) (string, error) {
 	return prefix + hex.EncodeToString(buf), nil
 }
 
+func randomPassword() (string, error) {
+	buf := make([]byte, 18)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate random password: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func ensureAdminPassword(cfg *Config) error {
+	if strings.TrimSpace(cfg.AdminPasswordHash) != "" {
+		return nil
+	}
+	pass, err := randomPassword()
+	if err != nil {
+		return err
+	}
+	encoded := HashPassword(pass)
+	if strings.TrimSpace(encoded) == "" {
+		return errors.New("failed to hash generated admin password")
+	}
+	cfg.AdminPasswordHash = encoded
+	fmt.Printf("Generated admin password (one-time): %s\n", pass)
+	return nil
+}
+
 func resolveBindAddr() string {
 	port := 3061
 	if raw := strings.TrimSpace(os.Getenv("PORT")); raw != "" {
@@ -148,7 +184,7 @@ func resolveBindAddr() string {
 	}
 	if raw := strings.TrimSpace(os.Getenv("CODEXSESS_BIND_ADDR")); raw != "" {
 		if strings.HasPrefix(raw, ":") {
-			return "0.0.0.0" + raw
+			return "127.0.0.1" + raw
 		}
 		if _, _, err := net.SplitHostPort(raw); err == nil {
 			return raw
@@ -157,7 +193,7 @@ func resolveBindAddr() string {
 			return fmt.Sprintf("%s:%d", raw, port)
 		}
 	}
-	return fmt.Sprintf("0.0.0.0:%d", port)
+	return fmt.Sprintf("127.0.0.1:%d", port)
 }
 
 func resolveCodexBin(current string) string {
@@ -180,10 +216,41 @@ func defaultDataDir(home string) string {
 }
 
 func HashPassword(password string) string {
-	sum := sha256.Sum256([]byte(password))
-	return hex.EncodeToString(sum[:])
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return ""
+	}
+	return string(hash)
 }
 
 func VerifyPassword(password, encoded string) bool {
-	return strings.EqualFold(HashPassword(password), strings.TrimSpace(encoded))
+	clean := strings.TrimSpace(encoded)
+	if clean == "" {
+		return false
+	}
+	if isLegacySHA256(clean) {
+		sum := sha256.Sum256([]byte(password))
+		return strings.EqualFold(hex.EncodeToString(sum[:]), clean)
+	}
+	if !strings.HasPrefix(clean, "$2") {
+		return false
+	}
+	return bcrypt.CompareHashAndPassword([]byte(clean), []byte(password)) == nil
+}
+
+func PasswordHashNeedsUpgrade(encoded string) bool {
+	return isLegacySHA256(strings.TrimSpace(encoded))
+}
+
+func isLegacySHA256(encoded string) bool {
+	if len(encoded) != 64 {
+		return false
+	}
+	for _, r := range encoded {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }

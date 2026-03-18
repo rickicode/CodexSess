@@ -106,7 +106,11 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/claude/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.Handle("/", webui.Handler())
 	handler := s.withAccessLog(withCORS(s.withManagementAuth(mux)))
-	srv := &http.Server{Addr: s.bindAddr, Handler: handler}
+	srv := &http.Server{
+		Addr:              s.bindAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
@@ -402,7 +406,7 @@ func (s *Server) issueAuthCookieValue() string {
 	return base64.RawURLEncoding.EncodeToString([]byte(payload))
 }
 
-func (s *Server) setAuthCookie(w http.ResponseWriter) {
+func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "codexsess_auth",
 		Value:    s.issueAuthCookieValue(),
@@ -410,10 +414,11 @@ func (s *Server) setAuthCookie(w http.ResponseWriter) {
 		MaxAge:   30 * 24 * 60 * 60,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   s.requiresSecureCookie(r),
 	})
 }
 
-func (s *Server) clearAuthCookie(w http.ResponseWriter) {
+func (s *Server) clearAuthCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "codexsess_auth",
 		Value:    "",
@@ -421,6 +426,7 @@ func (s *Server) clearAuthCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   s.requiresSecureCookie(r),
 	})
 }
 
@@ -433,7 +439,13 @@ func (s *Server) verifyAdminCredentials(username, password string) bool {
 	if user != s.adminUsername {
 		return false
 	}
-	return config.VerifyPassword(pass, s.adminPasswordHash)
+	if !config.VerifyPassword(pass, s.adminPasswordHash) {
+		return false
+	}
+	if config.PasswordHashNeedsUpgrade(s.adminPasswordHash) {
+		s.upgradeAdminPasswordHash(pass)
+	}
+	return true
 }
 
 func (s *Server) handleAPIAuthLogin(w http.ResponseWriter, r *http.Request) {
@@ -453,16 +465,13 @@ func (s *Server) handleAPIAuthLogin(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, http.StatusUnauthorized, "unauthorized", "invalid username or password")
 		return
 	}
-	s.setAuthCookie(w)
+	s.setAuthCookie(w, r)
 	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleWebAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		nextPath := strings.TrimSpace(r.URL.Query().Get("next"))
-		if nextPath == "" {
-			nextPath = "/"
-		}
+		nextPath := safeNextPath(r.URL.Query().Get("next"))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(`<!doctype html>
 <html lang="en">
@@ -620,6 +629,13 @@ button[disabled]{
   const btn = document.getElementById("loginButton");
   const err = document.getElementById("loginError");
   if (!form || !btn) return;
+  const safeNext = (value) => {
+    const next = String(value || "/").trim();
+    if (!next.startsWith("/")) return "/";
+    if (next.startsWith("//")) return "/";
+    if (next.includes("\\")) return "/";
+    return next;
+  };
   const defaultButtonHTML = 'Sign In';
   const loadingButtonHTML = '<span class="spin" aria-hidden="true"></span><span>Signing in...</span>';
   const setError = (message) => {
@@ -650,7 +666,7 @@ button[disabled]{
         body: JSON.stringify({ username, password }),
       });
       if (res.ok) {
-        window.location.assign(next || "/");
+        window.location.assign(safeNext(next));
         return;
       }
       let msg = "Invalid username or password";
@@ -684,16 +700,13 @@ button[disabled]{
 	}
 	username := r.Form.Get("username")
 	password := r.Form.Get("password")
-	nextPath := strings.TrimSpace(r.Form.Get("next"))
-	if nextPath == "" {
-		nextPath = "/"
-	}
+	nextPath := safeNextPath(r.Form.Get("next"))
 	if !s.verifyAdminCredentials(username, password) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte("invalid username or password"))
 		return
 	}
-	s.setAuthCookie(w)
+	s.setAuthCookie(w, r)
 	http.Redirect(w, r, nextPath, http.StatusFound)
 }
 
@@ -702,13 +715,73 @@ func (s *Server) handleWebAuthLogout(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	s.clearAuthCookie(w)
+	s.clearAuthCookie(w, r)
 	http.Redirect(w, r, "/auth/login", http.StatusFound)
 }
 
 func templateEscape(v string) string {
 	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
 	return replacer.Replace(v)
+}
+
+func safeNextPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "/"
+	}
+	if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "\\") {
+		return "/"
+	}
+	if strings.Contains(trimmed, "\\") {
+		return "/"
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil || parsed.IsAbs() || parsed.Scheme != "" || parsed.Host != "" {
+		return "/"
+	}
+	if !strings.HasPrefix(parsed.Path, "/") {
+		return "/"
+	}
+	return parsed.String()
+}
+
+func (s *Server) requiresSecureCookie(r *http.Request) bool {
+	if r != nil && (r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")) {
+		return true
+	}
+	host := strings.TrimSpace(s.bindAddr)
+	if host == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !ip.IsLoopback()
+	}
+	return true
+}
+
+func (s *Server) upgradeAdminPasswordHash(password string) {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	encoded := strings.TrimSpace(config.HashPassword(password))
+	if encoded == "" {
+		return
+	}
+	cfg := s.svc.Cfg
+	cfg.AdminPasswordHash = encoded
+	if err := config.Save(cfg); err != nil {
+		return
+	}
+	s.svc.Cfg = cfg
+	s.adminPasswordHash = encoded
 }
 
 func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
@@ -2411,6 +2484,7 @@ func (s *Server) handleWebBrowserCallback(w http.ResponseWriter, r *http.Request
 		_, err = s.svc.CompleteBrowserLoginCodeByState(r.Context(), code, state)
 	}
 	if err != nil {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte("authentication failed: " + err.Error()))
 		return

@@ -90,6 +90,29 @@
     status = { text, kind };
   }
 
+  function toAPIURL(url) {
+    const raw = String(url || '').trim();
+    if (!apiBase || /^https?:\/\//i.test(raw)) return raw;
+    if (raw.startsWith('/')) return `${apiBase}${raw}`;
+    return `${apiBase}/${raw}`;
+  }
+
+  function sendClientEvent(type, message, data = {}, level = 'info') {
+    const payload = {
+      type: String(type || 'event'),
+      source: 'web-console',
+      level: String(level || 'info'),
+      message: String(message || ''),
+      data: (data && typeof data === 'object') ? data : {}
+    };
+    fetch(toAPIURL('/api/events/log'), {
+      method: 'POST',
+      headers: jsonHeaders,
+      credentials: 'same-origin',
+      body: JSON.stringify(payload)
+    }).catch(() => {});
+  }
+
   function statusClass(kind) {
     if (kind === 'error') return 'error';
     if (kind === 'success') return 'success';
@@ -423,6 +446,13 @@
     if (lastUsageAlertSignature !== signature) {
       playNotificationTone('alert');
       setStatus(alertMessage, percent <= switchThreshold ? 'error' : 'info');
+      sendClientEvent('usage-alert', alertMessage, {
+        account_id: active.id,
+        window: windowLabel,
+        remaining_percent: percent,
+        alert_threshold: alertThreshold,
+        auto_switch_threshold: switchThreshold
+      }, percent <= switchThreshold ? 'error' : 'warning');
       lastUsageAlertSignature = signature;
     }
 
@@ -435,12 +465,20 @@
     if (candidates.length === 0) {
       const noCandidateMessage = 'Auto-switch skipped: no backup account with usage data.';
       setStatus(noCandidateMessage, 'error');
+      sendClientEvent('auto-switch-skipped', noCandidateMessage, {
+        account_id: active.id,
+        reason: 'no_backup_usage'
+      }, 'error');
       return;
     }
     const best = candidates[0];
     if (best.percent <= 0) {
       const exhaustedMessage = 'Auto-switch failed: semua API habis (remaining 0%).';
       setStatus(exhaustedMessage, 'error');
+      sendClientEvent('auto-switch-failed', exhaustedMessage, {
+        account_id: active.id,
+        reason: 'all_accounts_exhausted'
+      }, 'error');
       activeUsageAlert = {
         level: 'critical',
         message: exhaustedMessage,
@@ -452,6 +490,12 @@
     if (best.percent <= percent) {
       const noBetterMessage = `Auto-switch skipped: no backup account better than current (${percent}%).`;
       setStatus(noBetterMessage, 'error');
+      sendClientEvent('auto-switch-skipped', noBetterMessage, {
+        account_id: active.id,
+        current_percent: percent,
+        best_percent: best.percent,
+        reason: 'no_better_candidate'
+      }, 'warning');
       return;
     }
     const target = best.account;
@@ -459,10 +503,26 @@
     autoSwitchInProgress = true;
     usageAutomationBusy = true;
     lastAutoSwitchAt = Date.now();
+    sendClientEvent('auto-switch-start', `Auto-switch starting to ${target.email || target.id}.`, {
+      from_account_id: active.id,
+      to_account_id: target.id,
+      from_percent: percent,
+      to_percent: best.percent
+    }, 'warning');
     try {
       await useAccount(target.id, { source: 'auto', suppressTone: false, suppressStatus: true, refreshStatusMessage: false });
       setStatus(`Auto-switched account to ${target.email || target.id} because active ${windowLabel} reached ${percent}%.`, 'success');
+      sendClientEvent('auto-switch-success', `Auto-switch success to ${target.email || target.id}.`, {
+        from_account_id: active.id,
+        to_account_id: target.id,
+        from_percent: percent,
+        to_percent: best.percent
+      }, 'success');
     } catch {
+      sendClientEvent('auto-switch-failed', `Auto-switch failed to ${target.email || target.id}.`, {
+        from_account_id: active.id,
+        to_account_id: target.id
+      }, 'error');
     } finally {
       usageAutomationBusy = false;
       autoSwitchInProgress = false;
@@ -598,12 +658,7 @@
   }
 
   async function req(url, options = {}) {
-    const targetURL = (() => {
-      const raw = String(url || '').trim();
-      if (!apiBase || /^https?:\/\//i.test(raw)) return raw;
-      if (raw.startsWith('/')) return `${apiBase}${raw}`;
-      return `${apiBase}/${raw}`;
-    })();
+    const targetURL = toAPIURL(url);
     const response = await fetch(targetURL, {
       headers: jsonHeaders,
       ...options
@@ -1069,6 +1124,10 @@
       return;
     }
     autoRefreshBusy = true;
+    sendClientEvent('background-refresh-start', 'Background usage refresh started.', {
+      force,
+      minutes: Math.max(1, Number(autoRefreshMinutes) || 30)
+    });
     try {
       const ran = await withUsageRefreshLock(async () => {
         await req('/api/usage/refresh', {
@@ -1079,6 +1138,9 @@
       });
       if (!ran) return;
       backgroundRefreshLastAt = Date.now();
+      sendClientEvent('background-refresh-success', 'Background usage refresh completed.', {
+        accounts: Array.isArray(accounts) ? accounts.length : 0
+      }, 'success');
       await evaluateActiveAccountUsage({ allowAutoSwitch: true, source: 'background-refresh' });
       if (backgroundRefreshError && !silent) {
         setStatus('Background usage refresh recovered.', 'success');
@@ -1088,6 +1150,9 @@
       const message = String(error?.message || 'unknown error');
       const isNewError = backgroundRefreshError !== message;
       backgroundRefreshError = message;
+      sendClientEvent('background-refresh-failed', `Background refresh failed: ${message}`, {
+        force
+      }, 'error');
       if (isNewError && !silent) {
         setStatus(`Background auto refresh failed: ${message}`, 'error');
       }

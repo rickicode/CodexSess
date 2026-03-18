@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os/exec"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ricki/codexsess/internal/config"
 	icrypto "github.com/ricki/codexsess/internal/crypto"
@@ -80,12 +84,68 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("codexsess listening on http://%s", cfg.BindAddr)
+	appURL := localAppURL(cfg.BindAddr)
+	log.Printf("codexsess listening on %s", appURL)
+	if shouldAutoOpenBrowser() {
+		go waitAndOpenBrowser(appURL)
+	}
 	err = srv.ListenAndServe(ctx)
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
+}
+
+func shouldAutoOpenBrowser() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CODEXSESS_NO_OPEN_BROWSER")))
+	return raw != "1" && raw != "true" && raw != "yes"
+}
+
+func localAppURL(bindAddr string) string {
+	host, port, err := net.SplitHostPort(strings.TrimSpace(bindAddr))
+	if err != nil {
+		trimmed := strings.TrimSpace(bindAddr)
+		if strings.HasPrefix(trimmed, ":") {
+			return "http://127.0.0.1" + trimmed
+		}
+		return "http://127.0.0.1:3061"
+	}
+	h := strings.TrimSpace(host)
+	if h == "" || h == "0.0.0.0" || h == "::" || h == "[::]" {
+		h = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s:%s", h, port)
+}
+
+func waitAndOpenBrowser(appURL string) {
+	healthURL := strings.TrimRight(appURL, "/") + "/healthz"
+	client := &http.Client{Timeout: 700 * time.Millisecond}
+	for i := 0; i < 20; i++ {
+		resp, err := client.Get(healthURL)
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+				if err := openDefaultBrowser(appURL); err != nil {
+					log.Printf("failed to open browser automatically: %v", err)
+				} else {
+					log.Printf("opened browser: %s", appURL)
+				}
+				return
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func openDefaultBrowser(url string) error {
+	switch runtime.GOOS {
+	case "windows":
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
+	case "darwin":
+		return exec.Command("open", url).Start()
+	default:
+		return exec.Command("xdg-open", url).Start()
+	}
 }
 
 func changePassword() error {

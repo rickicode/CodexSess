@@ -1,150 +1,58 @@
-# codexsess
+# CodexSess
 
-OpenAI-compatible wrapper for Codex with:
-- `POST /v1/chat/completions` (+streaming SSE)
-- `GET /v1/models`
-- `POST /v1/responses` (non-stream)
-- Multi-account management
-- Usage refresh from `chatgpt.com/backend-api/wham/usage`
-- Web-first SPA console (embedded) in a single Go binary
-- Dedicated auth-account storage directory (cockpit-style switching)
+[English](./README.md) | [Bahasa Indonesia](./README.id.md)
 
-## Build
+CodexSess is a web-first account management gateway for Codex/OpenAI usage.
+It provides an OpenAI-compatible API surface and a built-in management console in one binary.
 
-```bash
-go build -o codexsess .
-```
+## What CodexSess Is
 
-Or use:
+CodexSess is designed to sit between your clients and Codex/OpenAI access tokens.
+It helps you manage multiple accounts, choose which account is active for API and CLI flows, monitor usage, and switch quickly when limits are low.
 
-```bash
-make run
-```
+## Why This Project Exists
 
-`make run` will:
-- build Svelte SPA frontend from `web/`
-- build Go binary
-- start `codexsess`
+CodexSess was created to:
+- simplify multi-account Codex management in one place
+- separate active account selection for API and Codex CLI
+- reduce downtime by enabling fast account switching
+- provide a practical web console without extra setup complexity
+- run in web mode on Linux/Windows with the same operational flow
 
-Development mode:
+## Core Capabilities
 
-```bash
-make dev
-```
+- OpenAI-compatible endpoints:
+  - `POST /v1/chat/completions` (including SSE streaming)
+  - `GET /v1/models`
+  - `POST /v1/responses`
+- Multi-account management UI
+- Manual and automated account switching logic
+- Usage refresh/monitoring integration
+- Single-binary deployment with embedded SPA
 
-This runs:
-- Svelte dev server on `http://127.0.0.1:3051/`
-- Go backend with `air` on `http://127.0.0.1:3052`
+## Authentication and Session
 
-Windows build with default icon:
+- Management console login uses local admin credentials
+- Default credential on first run:
+  - username: `admin`
+  - password: `hijilabs`
+- Session is remembered for 30 days via cookie
+- Password can be changed via CLI:
+  - `--changepassword`
 
-```bash
-make build-windows
-```
+## API Compatibility Scope
 
-## First run
+- Management routes are protected by web login
+- API compatibility routes under `/v1/*` and `/claude/v1/*` keep API-key style access
 
-```bash
-./codexsess
-```
+## Get It
 
-Supported CLI:
-- `--changepassword` to change admin web-console credential.
-No `.env` file is used.
+Do not build manually for normal usage.
+Use the latest published binaries from GitHub Releases:
 
-This generates:
-- Linux/macOS:
-  - `~/.codexsess/config.yaml`
-  - `~/.codexsess/master.key`
-  - `~/.codexsess/data.db`
-  - `~/.codexsess/auth-accounts/` (per-account auth data)
-- Windows:
-  - `%APPDATA%/codexsess/config.yaml`
-  - `%APPDATA%/codexsess/master.key`
-  - `%APPDATA%/codexsess/data.db`
-  - `%APPDATA%/codexsess/auth-accounts/`
+- Latest release: https://github.com/rickicode/CodexSess/releases/latest
 
-Default web-console auth:
-- username: `admin`
-- password: `hijilabs`
+## Project Goal
 
-Change password:
-
-```bash
-./codexsess --changepassword
-```
-
-Default server/web port is `3061`.
-You can override it with environment variable:
-
-```bash
-PORT=3062 ./codexsess
-```
-
-## Web-only operations
-
-Use `http://127.0.0.1:3061/`:
-- import account token JSON
-- list all accounts
-- switch account (`use`)
-- refresh usage
-- remove account
-- auth session cookie remembers login for 30 days
-
-## Run
-
-```bash
-./codexsess
-```
-
-This starts server + SPA web console.  
-Use `codexsess_api_key` from `~/.codexsess/config.yaml`.  
-Web console is available at `http://127.0.0.1:3061/` by default.
-
-### Chat completions example
-
-```bash
-curl http://127.0.0.1:3061/v1/chat/completions \
-  -H "Authorization: Bearer sk-..." \
-  -H "X-Codex-Account: <id|email|alias>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"gpt-5",
-    "messages":[{"role":"user","content":"Reply exactly with: OK"}],
-    "stream":false
-  }'
-```
-
-### Models example
-
-```bash
-curl http://127.0.0.1:3061/v1/models \
-  -H "Authorization: Bearer sk-..."
-```
-
-### Responses example
-
-```bash
-curl http://127.0.0.1:3061/v1/responses \
-  -H "Authorization: Bearer sk-..." \
-  -H "X-Codex-Account: <id|email|alias>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"gpt-5",
-    "input":"Reply exactly with: OK",
-    "stream":false
-  }'
-```
-
-## Web Console
-
-Running `./codexsess` starts web mode automatically.
-
-You can:
-- list all accounts
-- import account token JSON
-- switch active account (`use`)
-- refresh usage
-- remove account
-
-When you switch account via web `use`, `codexsess` syncs that account to `~/.codex/auth.json` so Codex CLI follows the active account.
+CodexSess focuses on operational reliability for account-based Codex usage:
+clear active-state control, usage-aware switching, and predictable API behavior.

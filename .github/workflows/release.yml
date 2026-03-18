@@ -42,6 +42,54 @@ jobs:
           mkdir -p dist
           GOOS=linux GOARCH=amd64 go build -o dist/codexsess-linux-amd64 .
 
+      - name: Prepare Linux desktop assets
+        run: |
+          mkdir -p dist/linux
+          go run ./scripts/gen_default_icon.go dist/linux/codexsess.png
+          cp packaging/linux/codexsess.desktop dist/linux/codexsess.desktop
+          chmod +x packaging/linux/postinstall.sh packaging/linux/postremove.sh
+
+      - name: Install nFPM
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build DEB and RPM packages
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist/packages
+          PKG_VERSION="${VERSION#v}"
+          cat > dist/nfpm.yaml <<EOF
+          name: codexsess
+          arch: amd64
+          platform: linux
+          version: ${PKG_VERSION}
+          section: default
+          priority: optional
+          maintainer: rickicode
+          description: CodexSess - Codex account management gateway
+          vendor: CodexSess
+          homepage: https://github.com/rickicode/CodexSess
+          license: MIT
+          contents:
+            - src: ./dist/codexsess-linux-amd64
+              dst: /usr/bin/codexsess
+              file_info:
+                mode: 0755
+            - src: ./dist/linux/codexsess.desktop
+              dst: /usr/share/applications/codexsess.desktop
+              file_info:
+                mode: 0644
+            - src: ./dist/linux/codexsess.png
+              dst: /usr/share/icons/hicolor/64x64/apps/codexsess.png
+              file_info:
+                mode: 0644
+          scripts:
+            postinstall: ./packaging/linux/postinstall.sh
+            postremove: ./packaging/linux/postremove.sh
+          EOF
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm.yaml --packager deb --target dist/packages/codexsess_${PKG_VERSION}_amd64.deb
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm.yaml --packager rpm --target dist/packages/codexsess-${PKG_VERSION}-1.x86_64.rpm
+
       - name: Build Windows binary with icon
         run: |
           mkdir -p build/windows
@@ -52,13 +100,19 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt
+          sha256sum codexsess-linux-amd64 codexsess-windows-amd64.exe > SHA256SUMS.txt
+          sha256sum packages/*.deb packages/*.rpm >> SHA256SUMS.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: codexsess-build-${{ github.run_number }}
-          path: dist/*
+          path: |
+            dist/codexsess-linux-amd64
+            dist/codexsess-windows-amd64.exe
+            dist/SHA256SUMS.txt
+            dist/packages/*.deb
+            dist/packages/*.rpm
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -68,3 +122,5 @@ jobs:
             dist/codexsess-linux-amd64
             dist/codexsess-windows-amd64.exe
             dist/SHA256SUMS.txt
+            dist/packages/*.deb
+            dist/packages/*.rpm

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -70,6 +71,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/auth/logout", s.handleWebAuthLogout)
 	mux.HandleFunc("/api/auth/device/start", s.handleWebDeviceStart)
 	mux.HandleFunc("/api/auth/device/poll", s.handleWebDevicePoll)
+	mux.HandleFunc("/api/events/log", s.handleWebClientEventLog)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		respondJSON(w, 200, map[string]any{"ok": true})
 	})
@@ -80,13 +82,75 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.HandleFunc("/claude/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
 	mux.Handle("/", webui.Handler())
-	handler := withCORS(s.withManagementAuth(mux))
+	handler := s.withAccessLog(withCORS(s.withManagementAuth(mux)))
 	srv := &http.Server{Addr: s.bindAddr, Handler: handler}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
 	}()
 	return srv.ListenAndServe()
+}
+
+func (s *Server) withAccessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &accessLogRecorder{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+		}
+		next.ServeHTTP(rec, r)
+
+		remote := strings.TrimSpace(r.RemoteAddr)
+		if host, _, err := net.SplitHostPort(remote); err == nil && host != "" {
+			remote = host
+		}
+		path := strings.TrimSpace(r.URL.Path)
+		if path == "" {
+			path = "/"
+		}
+		log.Printf(
+			"[ACCESS] %-7s %-42s status=%3d latency=%4dms from=%s kind=%s",
+			strings.ToUpper(strings.TrimSpace(r.Method)),
+			path,
+			rec.status,
+			time.Since(start).Milliseconds(),
+			firstNonEmpty(remote, "-"),
+			requestKind(path),
+		)
+	})
+}
+
+func requestKind(path string) string {
+	p := strings.TrimSpace(path)
+	switch {
+	case strings.HasPrefix(p, "/v1"), strings.HasPrefix(p, "/claude/v1"):
+		return "proxy-api"
+	case strings.HasPrefix(p, "/api/"):
+		return "web-api"
+	case strings.HasPrefix(p, "/auth/"):
+		return "auth"
+	case strings.HasPrefix(p, "/assets/"), strings.HasPrefix(p, "/sounds/"), p == "/favicon.svg":
+		return "asset"
+	default:
+		return "web-ui"
+	}
+}
+
+type accessLogRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *accessLogRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *accessLogRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	return r.ResponseWriter.Write(p)
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -1212,6 +1276,16 @@ func escape(s string) string {
 	return s
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		x := strings.TrimSpace(v)
+		if x != "" {
+			return x
+		}
+	}
+	return ""
+}
+
 func extractResponsesInput(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -1449,6 +1523,36 @@ func (s *Server) handleWebLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondJSON(w, 200, map[string]any{"ok": true, "lines": lines})
+}
+
+func (s *Server) handleWebClientEventLog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		Type    string         `json:"type"`
+		Source  string         `json:"source"`
+		Level   string         `json:"level"`
+		Message string         `json:"message"`
+		Data    map[string]any `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	eventType := firstNonEmpty(strings.TrimSpace(req.Type), "event")
+	eventSource := firstNonEmpty(strings.TrimSpace(req.Source), "web-console")
+	eventLevel := firstNonEmpty(strings.TrimSpace(req.Level), "info")
+	eventMessage := firstNonEmpty(strings.TrimSpace(req.Message), "-")
+	meta := "-"
+	if len(req.Data) > 0 {
+		if b, err := json.Marshal(req.Data); err == nil {
+			meta = string(b)
+		}
+	}
+	log.Printf("[EVENT] source=%s type=%s level=%s message=%s meta=%s", eventSource, eventType, eventLevel, eventMessage, meta)
+	respondJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) handleWebModelMappings(w http.ResponseWriter, r *http.Request) {

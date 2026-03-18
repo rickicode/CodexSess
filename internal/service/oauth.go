@@ -26,6 +26,10 @@ import (
 	"github.com/ricki/codexsess/internal/util"
 )
 
+var oauthHTTPClient = &http.Client{
+	Timeout: 20 * time.Second,
+}
+
 const (
 	oauthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	authEndpoint  = "https://auth.openai.com/oauth/authorize"
@@ -502,7 +506,7 @@ func exchangeCode(ctx context.Context, q url.Values, pending OAuthPending) (Toke
 		return TokenSet{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return TokenSet{}, err
 	}
@@ -536,7 +540,7 @@ func refreshAccessToken(ctx context.Context, refreshToken string) (TokenSet, err
 		return TokenSet{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return TokenSet{}, err
 	}

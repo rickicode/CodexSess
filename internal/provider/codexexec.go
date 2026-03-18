@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -33,19 +35,12 @@ func NewCodexExec(binary string) *CodexExec {
 }
 
 func (c *CodexExec) Chat(ctx context.Context, codexHome string, model string, prompt string) (ChatResult, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		c.Binary,
-		"exec",
-		"--json",
-		"--skip-git-repo-check",
-		"--sandbox",
-		"read-only",
-		"-m",
-		model,
-		prompt,
-	)
-	cmd.Env = append(cmd.Environ(), "CODEX_HOME="+codexHome)
+	clean := resolveCleanExecMode()
+	cmd := exec.CommandContext(ctx, c.Binary, c.buildExecArgs(model, prompt, clean)...)
+	if dir := strings.TrimSpace(codexHome); dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = c.buildExecEnv(cmd.Environ(), codexHome, clean)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return ChatResult{}, err
@@ -101,19 +96,12 @@ func (c *CodexExec) Chat(ctx context.Context, codexHome string, model string, pr
 }
 
 func (c *CodexExec) StreamChat(ctx context.Context, codexHome string, model string, prompt string, onEvent func(ChatEvent) error) (ChatResult, error) {
-	cmd := exec.CommandContext(
-		ctx,
-		c.Binary,
-		"exec",
-		"--json",
-		"--skip-git-repo-check",
-		"--sandbox",
-		"read-only",
-		"-m",
-		model,
-		prompt,
-	)
-	cmd.Env = append(cmd.Environ(), "CODEX_HOME="+codexHome)
+	clean := resolveCleanExecMode()
+	cmd := exec.CommandContext(ctx, c.Binary, c.buildExecArgs(model, prompt, clean)...)
+	if dir := strings.TrimSpace(codexHome); dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Env = c.buildExecEnv(cmd.Environ(), codexHome, clean)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return ChatResult{}, err
@@ -182,4 +170,58 @@ func number(v any) float64 {
 	default:
 		return 0
 	}
+}
+
+func (c *CodexExec) buildExecArgs(model, prompt string, clean bool) []string {
+	sandbox := resolveSandboxMode()
+	args := []string{
+		"exec",
+		"--json",
+		"--skip-git-repo-check",
+		"--sandbox",
+		sandbox,
+		"-m",
+		model,
+		prompt,
+	}
+	if clean {
+		args = append(args, "--ephemeral")
+	}
+	return args
+}
+
+func resolveSandboxMode() string {
+	if v := strings.TrimSpace(os.Getenv("CODEXSESS_CODEX_SANDBOX")); v != "" {
+		return v
+	}
+	// default should allow BrowserOS/tooling agents to create local sockets/temp files.
+	return "workspace-write"
+}
+
+func resolveCleanExecMode() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("CODEXSESS_CLEAN_EXEC")))
+	if v == "" {
+		return true
+	}
+	return v != "0" && v != "false" && v != "no"
+}
+
+func (c *CodexExec) buildExecEnv(base []string, codexHome string, clean bool) []string {
+	env := append([]string{}, base...)
+	env = append(env, "CODEX_HOME="+codexHome)
+	if !clean {
+		return env
+	}
+	homeRoot := filepath.Join(strings.TrimSpace(codexHome), ".codexsess-clean-home")
+	if strings.TrimSpace(codexHome) == "" {
+		homeRoot = filepath.Join(os.TempDir(), "codexsess-clean-home")
+	}
+	_ = os.MkdirAll(filepath.Join(homeRoot, ".config"), 0o700)
+	_ = os.MkdirAll(filepath.Join(homeRoot, ".local", "share"), 0o700)
+	env = append(env,
+		"HOME="+homeRoot,
+		"XDG_CONFIG_HOME="+filepath.Join(homeRoot, ".config"),
+		"XDG_DATA_HOME="+filepath.Join(homeRoot, ".local", "share"),
+	)
+	return env
 }

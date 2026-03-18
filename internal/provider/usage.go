@@ -10,6 +10,10 @@ import (
 
 const usageURL = "https://chatgpt.com/backend-api/wham/usage"
 
+var usageHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+}
+
 type UsageResult struct {
 	HourlyPct       int
 	WeeklyPct       int
@@ -30,7 +34,7 @@ func FetchUsage(ctx context.Context, accessToken string, accountID string) (Usag
 	if accountID != "" {
 		req.Header.Set("ChatGPT-Account-Id", accountID)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := usageHTTPClient.Do(req)
 	if err != nil {
 		return UsageResult{}, err
 	}

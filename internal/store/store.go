@@ -223,6 +223,38 @@ func (s *Store) GetUsage(ctx context.Context, accountID string) (UsageSnapshot, 
 	return u, nil
 }
 
+func (s *Store) ListUsageSnapshots(ctx context.Context) (map[string]UsageSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT account_id,hourly_pct,weekly_pct,hourly_reset_at,weekly_reset_at,raw_json,fetched_at,last_error,window_primary,window_secondary FROM usage_snapshots`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]UsageSnapshot{}
+	for rows.Next() {
+		var u UsageSnapshot
+		var hr, wr sql.NullString
+		var fetched string
+		if err := rows.Scan(&u.AccountID, &u.HourlyPct, &u.WeeklyPct, &hr, &wr, &u.RawJSON, &fetched, &u.LastError, &u.WindowPrimary, &u.WindowSecondary); err != nil {
+			return nil, err
+		}
+		u.FetchedAt, _ = time.Parse(time.RFC3339, fetched)
+		if hr.Valid {
+			t, _ := time.Parse(time.RFC3339, hr.String)
+			u.HourlyResetAt = &t
+		}
+		if wr.Valid {
+			t, _ := time.Parse(time.RFC3339, wr.String)
+			u.WeeklyResetAt = &t
+		}
+		out[u.AccountID] = u
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) InsertAudit(ctx context.Context, r AuditRecord) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO request_audit(request_id,account_id,model,stream,status,latency_ms,created_at) VALUES(?,?,?,?,?,?,?)`, r.RequestID, r.AccountID, r.Model, boolToInt(r.Stream), r.Status, r.LatencyMS, r.CreatedAt.UTC().Format(time.RFC3339))
 	return err

@@ -10,6 +10,7 @@ import (
 
 	"github.com/ricki/codexsess/internal/config"
 	"github.com/ricki/codexsess/internal/service"
+	"github.com/ricki/codexsess/internal/store"
 	"github.com/ricki/codexsess/internal/trafficlog"
 )
 
@@ -184,6 +185,52 @@ func TestWithTrafficLog_CapturesRequestAndResponse(t *testing.T) {
 	}
 }
 
+func TestWithTrafficLog_CapturesResolvedAccountWithoutLeakingHeaders(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "traffic.log")
+	logger, err := trafficlog.New(logPath, 2*1024*1024)
+	if err != nil {
+		t.Fatalf("new traffic logger: %v", err)
+	}
+
+	s := &Server{traffic: logger}
+	wrapped := s.withTrafficLog("openai", func(w http.ResponseWriter, _ *http.Request) {
+		setResolvedAccountHeaders(w, store.Account{
+			ID:    "acc_test_1",
+			Email: "tester@example.com",
+		})
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.2-codex","stream":false}`))
+	rec := httptest.NewRecorder()
+	wrapped(rec, req)
+
+	if got := rec.Header().Get("X-Codex-Resolved-Account-ID"); got != "" {
+		t.Fatalf("expected no leaked account id header, got %q", got)
+	}
+	if got := rec.Header().Get("X-Codex-Resolved-Account-Email"); got != "" {
+		t.Fatalf("expected no leaked account email header, got %q", got)
+	}
+
+	lines, err := logger.ReadTail(5)
+	if err != nil {
+		t.Fatalf("read tail: %v", err)
+	}
+	if len(lines) != 1 {
+		t.Fatalf("expected one log line, got %d", len(lines))
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("decode log entry: %v", err)
+	}
+	if got, _ := entry["account_id"].(string); got != "acc_test_1" {
+		t.Fatalf("expected account_id acc_test_1, got %q", got)
+	}
+	if got, _ := entry["account_email"].(string); got != "tester@example.com" {
+		t.Fatalf("expected account_email tester@example.com, got %q", got)
+	}
+}
+
 func TestDetectTrafficModelAndStream_SupportsNewClaudePath(t *testing.T) {
 	model, stream := detectTrafficModelAndStream("/v1/messages", []byte(`{"model":"gpt-5.2-codex","stream":true}`))
 	if model != "gpt-5.2-codex" {
@@ -194,3 +241,40 @@ func TestDetectTrafficModelAndStream_SupportsNewClaudePath(t *testing.T) {
 	}
 }
 
+func TestParseToolCallsFromText_WrappedJSON(t *testing.T) {
+	defs := []ChatToolDef{
+		{Type: "function", Function: ChatToolFunctionDef{Name: "navigate_page"}},
+	}
+	text := `{"tool_calls":[{"name":"navigate_page","arguments":{"page":1,"action":"url","url":"https://www.speedtest.net"}}]}`
+	calls, ok := parseToolCallsFromText(text, defs)
+	if !ok {
+		t.Fatalf("expected tool calls to parse")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(calls))
+	}
+	if calls[0].Function.Name != "navigate_page" {
+		t.Fatalf("unexpected tool name: %s", calls[0].Function.Name)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(calls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments must be valid json: %v", err)
+	}
+	if got, _ := args["url"].(string); !strings.Contains(got, "speedtest.net") {
+		t.Fatalf("unexpected url argument: %q", got)
+	}
+}
+
+func TestParseToolCallsFromText_RejectsUnknownTool(t *testing.T) {
+	defs := []ChatToolDef{
+		{Type: "function", Function: ChatToolFunctionDef{Name: "navigate_page"}},
+	}
+	text := `{"name":"delete_all","arguments":{"confirm":true}}`
+	calls, ok := parseToolCallsFromText(text, defs)
+	if ok {
+		t.Fatalf("expected parse to fail for unknown tool")
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected no calls")
+	}
+}

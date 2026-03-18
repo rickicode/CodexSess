@@ -108,14 +108,20 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		if path == "" {
 			path = "/"
 		}
+		accountHint := firstNonEmpty(strings.TrimSpace(r.Header.Get("X-Codex-Account")), "-")
+		apiAuth := classifyAuthSource(r)
+		ua := firstNonEmpty(truncateForLog(strings.TrimSpace(r.UserAgent()), 72), "-")
 		log.Printf(
-			"[ACCESS] %-7s %-42s status=%3d latency=%4dms from=%s kind=%s",
+			"[ACCESS] %-7s %-38s status=%3d latency=%4dms from=%s kind=%s auth=%s account=%s ua=%s",
 			strings.ToUpper(strings.TrimSpace(r.Method)),
 			path,
 			rec.status,
 			time.Since(start).Milliseconds(),
 			firstNonEmpty(remote, "-"),
 			requestKind(path),
+			apiAuth,
+			accountHint,
+			ua,
 		)
 	})
 }
@@ -134,6 +140,34 @@ func requestKind(path string) string {
 	default:
 		return "web-ui"
 	}
+}
+
+func classifyAuthSource(r *http.Request) string {
+	bearer := strings.TrimSpace(BearerToken(r.Header.Get("Authorization")))
+	xAPIKey := strings.TrimSpace(r.Header.Get("x-api-key"))
+	switch {
+	case bearer != "":
+		return "bearer:" + maskSecret(bearer)
+	case xAPIKey != "":
+		return "x-api-key:" + maskSecret(xAPIKey)
+	default:
+		return "none"
+	}
+}
+
+func maskSecret(v string) string {
+	s := strings.TrimSpace(v)
+	if s == "" {
+		return "-"
+	}
+	if len(s) <= 6 {
+		return s[:1] + "***"
+	}
+	return s[:3] + "..." + s[len(s)-2:]
+}
+
+func ptrString(v string) *string {
+	return &v
 }
 
 type accessLogRecorder struct {
@@ -588,6 +622,10 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		Accounts []webAccount `json:"accounts"`
 	}{}
+	usageMap, err := s.svc.Store.ListUsageSnapshots(r.Context())
+	if err != nil {
+		usageMap = map[string]store.UsageSnapshot{}
+	}
 	cliActiveID, err := s.svc.ActiveCLIAccountID(r.Context())
 	if err != nil {
 		respondErr(w, 500, "internal_error", err.Error())
@@ -605,7 +643,7 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 			ActiveAPI: isAPI,
 			ActiveCLI: isCLI,
 		}
-		if u, err := s.svc.Store.GetUsage(r.Context(), a.ID); err == nil {
+		if u, ok := usageMap[a.ID]; ok {
 			ux := u
 			item.Usage = &ux
 		}
@@ -733,9 +771,36 @@ func (s *Server) handleWebRefreshUsage(w http.ResponseWriter, r *http.Request) {
 			respondErr(w, 500, "internal_error", err.Error())
 			return
 		}
-		ok := 0
+		if len(accounts) == 0 {
+			respondJSON(w, 200, map[string]any{"ok": true, "refreshed": 0, "total": 0})
+			return
+		}
+		workerCount := 4
+		if len(accounts) < workerCount {
+			workerCount = len(accounts)
+		}
+		jobs := make(chan string, len(accounts))
+		results := make(chan bool, len(accounts))
+		var wg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for id := range jobs {
+					_, err := s.svc.RefreshUsage(r.Context(), id)
+					results <- err == nil
+				}
+			}()
+		}
 		for _, a := range accounts {
-			if _, err := s.svc.RefreshUsage(r.Context(), a.ID); err == nil {
+			jobs <- a.ID
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+		ok := 0
+		for v := range results {
+			if v {
 				ok++
 			}
 		}
@@ -832,12 +897,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Model = "gpt-5.2-codex"
 	}
 	req.Model = s.resolveMappedModel(req.Model)
-	prompt := promptFromMessages(req.Messages)
+	prompt := promptFromMessagesWithTools(req.Messages, req.Tools, req.ToolChoice)
 	account, _, err := s.svc.ResolveForRequest(r.Context(), selector)
 	if err != nil {
 		respondErr(w, 404, "account_not_found", err.Error())
 		return
 	}
+	setResolvedAccountHeaders(w, account)
 	usage, usageErr := s.svc.Store.GetUsage(r.Context(), account.ID)
 	if usageErr != nil {
 		if snap, err := s.svc.RefreshUsage(r.Context(), account.ID); err == nil {
@@ -879,7 +945,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				Object:  "chat.completion.chunk",
 				Created: time.Now().Unix(),
 				Model:   req.Model,
-				Choices: []ChatChunkChoice{{Index: 0, Delta: ChatMessage{Role: "assistant", Content: evt.Text}, FinishReason: ""}},
+				Choices: []ChatChunkChoice{{Index: 0, Delta: ChatMessage{Role: "assistant", Content: evt.Text}}},
 			}
 			b, _ := json.Marshal(chunk)
 			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
@@ -898,7 +964,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Object:  "chat.completion.chunk",
 			Created: time.Now().Unix(),
 			Model:   req.Model,
-			Choices: []ChatChunkChoice{{Index: 0, Delta: ChatMessage{}, FinishReason: "stop"}},
+			Choices: []ChatChunkChoice{{Index: 0, Delta: ChatMessage{}, FinishReason: ptrString("stop")}},
 			Usage:   &Usage{PromptTokens: res.InputTokens, CompletionTokens: res.OutputTokens, TotalTokens: res.InputTokens + res.OutputTokens},
 		}
 		b, _ := json.Marshal(final)
@@ -914,12 +980,26 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 500, "upstream_error", err.Error())
 		return
 	}
+	toolCalls, hasToolCalls := parseToolCallsFromText(res.Text, req.Tools)
+	choice := ChatChoice{
+		Index:        0,
+		Message:      ChatMessage{Role: "assistant", Content: res.Text},
+		FinishReason: "stop",
+	}
+	if hasToolCalls {
+		choice.Message = ChatMessage{
+			Role:      "assistant",
+			Content:   "",
+			ToolCalls: toolCalls,
+		}
+		choice.FinishReason = "tool_calls"
+	}
 	resp := ChatCompletionsResponse{
 		ID:      "chatcmpl-" + reqID,
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   req.Model,
-		Choices: []ChatChoice{{Index: 0, Message: ChatMessage{Role: "assistant", Content: res.Text}, FinishReason: "stop"}},
+		Choices: []ChatChoice{choice},
 		Usage:   Usage{PromptTokens: res.InputTokens, CompletionTokens: res.OutputTokens, TotalTokens: res.InputTokens + res.OutputTokens},
 	}
 	respondJSON(w, 200, resp)
@@ -956,6 +1036,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 404, "account_not_found", err.Error())
 		return
 	}
+	setResolvedAccountHeaders(w, account)
 	usage, usageErr := s.svc.Store.GetUsage(r.Context(), account.ID)
 	if usageErr != nil {
 		if snap, err := s.svc.RefreshUsage(r.Context(), account.ID); err == nil {
@@ -1118,6 +1199,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 404, "account_not_found", err.Error())
 		return
 	}
+	setResolvedAccountHeaders(w, account)
 	usage, usageErr := s.svc.Store.GetUsage(r.Context(), account.ID)
 	if usageErr != nil {
 		if snap, err := s.svc.RefreshUsage(r.Context(), account.ID); err == nil {
@@ -1214,10 +1296,57 @@ func promptFromMessages(msgs []ChatMessage) string {
 			role = "user"
 		}
 		sb.WriteString(role)
+		if role == "tool" && strings.TrimSpace(m.ToolCallID) != "" {
+			sb.WriteString("(")
+			sb.WriteString(strings.TrimSpace(m.ToolCallID))
+			sb.WriteString(")")
+		}
 		sb.WriteString(": ")
 		sb.WriteString(strings.TrimSpace(m.Content))
+		if len(m.ToolCalls) > 0 {
+			sb.WriteString("\nassistant_tool_calls: ")
+			for i, tc := range m.ToolCalls {
+				if i > 0 {
+					sb.WriteString(" | ")
+				}
+				sb.WriteString(strings.TrimSpace(tc.Function.Name))
+				sb.WriteString("(")
+				sb.WriteString(strings.TrimSpace(tc.Function.Arguments))
+				sb.WriteString(")")
+			}
+		}
 		sb.WriteString("\n")
 	}
+	return strings.TrimSpace(sb.String())
+}
+
+func promptFromMessagesWithTools(msgs []ChatMessage, tools []ChatToolDef, toolChoice json.RawMessage) string {
+	base := promptFromMessages(msgs)
+	if len(tools) == 0 {
+		return base
+	}
+	var sb strings.Builder
+	sb.WriteString(base)
+	sb.WriteString("\n\nAVAILABLE_TOOLS_JSON:\n")
+	sb.WriteString("[\n")
+	for i, t := range tools {
+		if i > 0 {
+			sb.WriteString(",\n")
+		}
+		b, _ := json.Marshal(t)
+		sb.WriteString(string(b))
+	}
+	sb.WriteString("\n]\n")
+	if len(bytes.TrimSpace(toolChoice)) > 0 {
+		sb.WriteString("TOOL_CHOICE_JSON:\n")
+		sb.WriteString(strings.TrimSpace(string(toolChoice)))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("TOOL_OUTPUT_RULES:\n")
+	sb.WriteString("- If a tool is required, respond with JSON only.\n")
+	sb.WriteString("- JSON format must be exactly: {\"tool_calls\":[{\"name\":\"<tool_name>\",\"arguments\":{...}}]}.\n")
+	sb.WriteString("- Do not wrap JSON in markdown fences.\n")
+	sb.WriteString("- If no tool is needed, respond normally with plain assistant text.\n")
 	return strings.TrimSpace(sb.String())
 }
 
@@ -1318,12 +1447,112 @@ func extractResponsesInput(raw json.RawMessage) string {
 	return ""
 }
 
+func parseToolCallsFromText(text string, defs []ChatToolDef) ([]ChatToolCall, bool) {
+	raw := strings.TrimSpace(text)
+	if raw == "" {
+		return nil, false
+	}
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```JSON")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+	start := strings.IndexAny(raw, "{[")
+	end := strings.LastIndexAny(raw, "}]")
+	if start < 0 || end < start {
+		return nil, false
+	}
+	candidate := strings.TrimSpace(raw[start : end+1])
+	allowed := map[string]struct{}{}
+	for _, d := range defs {
+		if strings.EqualFold(strings.TrimSpace(d.Type), "function") {
+			name := strings.TrimSpace(d.Function.Name)
+			if name != "" {
+				allowed[name] = struct{}{}
+			}
+		}
+	}
+	type simpleCall struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	type wrapped struct {
+		ToolCalls []simpleCall `json:"tool_calls"`
+	}
+	var calls []simpleCall
+	var w wrapped
+	if err := json.Unmarshal([]byte(candidate), &w); err == nil && len(w.ToolCalls) > 0 {
+		calls = w.ToolCalls
+	} else {
+		var one simpleCall
+		if err := json.Unmarshal([]byte(candidate), &one); err == nil && strings.TrimSpace(one.Name) != "" {
+			calls = []simpleCall{one}
+		} else {
+			var arr []simpleCall
+			if err := json.Unmarshal([]byte(candidate), &arr); err == nil && len(arr) > 0 {
+				calls = arr
+			}
+		}
+	}
+	if len(calls) == 0 {
+		return nil, false
+	}
+	out := make([]ChatToolCall, 0, len(calls))
+	for _, c := range calls {
+		name := strings.TrimSpace(c.Name)
+		if name == "" {
+			continue
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[name]; !ok {
+				continue
+			}
+		}
+		args := normalizeToolArguments(c.Arguments)
+		out = append(out, ChatToolCall{
+			ID:   "call_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+			Type: "function",
+			Function: ChatToolFunctionCall{
+				Name:      name,
+				Arguments: args,
+			},
+		})
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func normalizeToolArguments(raw json.RawMessage) string {
+	b := bytes.TrimSpace(raw)
+	if len(b) == 0 || string(b) == "null" {
+		return "{}"
+	}
+	if json.Valid(b) {
+		return string(b)
+	}
+	enc, _ := json.Marshal(string(b))
+	return string(enc)
+}
+
 func writeSSE(w http.ResponseWriter, event string, payload any) {
 	b, _ := json.Marshal(payload)
 	if strings.TrimSpace(event) != "" {
 		_, _ = fmt.Fprintf(w, "event: %s\n", event)
 	}
 	_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+}
+
+func setResolvedAccountHeaders(w http.ResponseWriter, account store.Account) {
+	if w == nil {
+		return
+	}
+	if rec, ok := w.(*trafficRecorder); ok {
+		rec.accountID = strings.TrimSpace(account.ID)
+		rec.accountEmail = strings.TrimSpace(account.Email)
+		return
+	}
 }
 
 func (s *Server) currentAPIKey() string {
@@ -1615,7 +1844,7 @@ func (s *Server) withTrafficLog(protocol string, next http.HandlerFunc) http.Han
 		}
 		var bodyBytes []byte
 		if r.Body != nil {
-			bodyBytes, _ = io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			bodyBytes, _ = io.ReadAll(r.Body)
 			_ = r.Body.Close()
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
@@ -1623,7 +1852,7 @@ func (s *Server) withTrafficLog(protocol string, next http.HandlerFunc) http.Han
 		rec := &trafficRecorder{
 			ResponseWriter:    w,
 			status:            http.StatusOK,
-			responseBodyLimit: 4000,
+			responseBodyLimit: -1,
 		}
 		next(rec, r)
 
@@ -1633,9 +1862,6 @@ func (s *Server) withTrafficLog(protocol string, next http.HandlerFunc) http.Han
 			remote = host
 		}
 		responseBody := strings.TrimSpace(string(rec.responseBody))
-		if rec.bodyTruncated {
-			responseBody += "...(truncated)"
-		}
 		_ = s.traffic.Append(trafficlog.Entry{
 			Timestamp:    time.Now().UTC(),
 			Protocol:     protocol,
@@ -1646,9 +1872,11 @@ func (s *Server) withTrafficLog(protocol string, next http.HandlerFunc) http.Han
 			RemoteAddr:   strings.TrimSpace(remote),
 			UserAgent:    strings.TrimSpace(r.UserAgent()),
 			AccountHint:  strings.TrimSpace(r.Header.Get("X-Codex-Account")),
+			AccountID:    strings.TrimSpace(rec.accountID),
+			AccountEmail: strings.TrimSpace(rec.accountEmail),
 			Model:        model,
 			Stream:       stream,
-			RequestBody:  truncateForLog(string(bodyBytes), 2000),
+			RequestBody:  strings.TrimSpace(string(bodyBytes)),
 			ResponseBody: responseBody,
 		})
 	}
@@ -1660,6 +1888,8 @@ type trafficRecorder struct {
 	responseBody      []byte
 	responseBodyLimit int
 	bodyTruncated     bool
+	accountID         string
+	accountEmail      string
 }
 
 func (r *trafficRecorder) WriteHeader(code int) {
@@ -1671,7 +1901,9 @@ func (r *trafficRecorder) Write(p []byte) (int, error) {
 	if r.status == 0 {
 		r.status = http.StatusOK
 	}
-	if r.responseBodyLimit > 0 && !r.bodyTruncated {
+	if r.responseBodyLimit <= 0 {
+		r.responseBody = append(r.responseBody, p...)
+	} else if !r.bodyTruncated {
 		remaining := r.responseBodyLimit - len(r.responseBody)
 		if remaining > 0 {
 			if len(p) <= remaining {
@@ -1685,6 +1917,12 @@ func (r *trafficRecorder) Write(p []byte) (int, error) {
 		}
 	}
 	return r.ResponseWriter.Write(p)
+}
+
+func (r *trafficRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func detectTrafficModelAndStream(path string, body []byte) (string, bool) {

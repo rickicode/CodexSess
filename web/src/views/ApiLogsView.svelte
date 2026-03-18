@@ -9,12 +9,12 @@
   } = $props();
 </script>
 
-<section class="panel">
-  <div class="panel-header panel-header-inline">
+<section class="logs-panel">
+  <div class="panel-header panel-header-inline logs-header">
     <h2>API Logs</h2>
     <button class="btn btn-secondary" onclick={onLoadAPILogs} disabled={busy}>Refresh</button>
   </div>
-  <p class="panel-note">Only proxy API traffic is logged (OpenAI/Claude). Dashboard requests are excluded.</p>
+  <p class="panel-note logs-note">Only proxy API traffic is logged (OpenAI/Claude). Dashboard requests are excluded.</p>
 
   <div class="logs-box">
     {#if apiLogs.length === 0}
@@ -33,6 +33,9 @@
               <span>{entry.latencyMS} ms</span>
               {#if entry.model}
                 <span>{entry.model}</span>
+              {/if}
+              {#if entry.accountEmail || entry.accountID || entry.accountHint}
+                <span>{entry.accountEmail || entry.accountID || entry.accountHint}</span>
               {/if}
             </p>
           </div>

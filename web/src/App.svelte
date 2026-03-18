@@ -596,6 +596,9 @@
       status: 0,
       latencyMS: 0,
       model: '',
+      accountHint: '',
+      accountID: '',
+      accountEmail: '',
       requestBody: '',
       responseBody: '',
       invalid: true
@@ -610,6 +613,9 @@
       const status = Number(obj.status) || 0;
       const latencyMS = Number(obj.latency_ms) || 0;
       const model = String(obj.model || '').trim();
+      const accountHint = String(obj.account_hint || '').trim();
+      const accountID = String(obj.account_id || '').trim();
+      const accountEmail = String(obj.account_email || '').trim();
       const requestBody = prettyJSONText(obj.request_body);
       const responseBody = prettyJSONText(obj.response_body);
       return {
@@ -622,6 +628,9 @@
         status,
         latencyMS,
         model,
+        accountHint,
+        accountID,
+        accountEmail,
         requestBody,
         responseBody,
         invalid: false
@@ -1596,8 +1605,6 @@
       <span>Codex Account Management</span>
     </div>
 
-    <div class="mode-badge">{appMode === 'desktop' ? 'desktop mode' : 'web mode'}</div>
-
     <nav class="nav" aria-label="Main menu">
       <button class={activeMenu === 'dashboard' ? 'is-active' : ''} onclick={() => (activeMenu = 'dashboard')}>
         <span class="nav-icon" aria-hidden="true">
@@ -1625,7 +1632,7 @@
     </div>
   </aside>
 
-  <main class="content">
+  <main class="content {activeMenu === 'logs' ? 'content-logs' : ''}">
     <section class="status-banner status-{statusClass(status.kind)}" aria-live="polite">
       <span class="status-icon">{statusIcon(status.kind)}</span>
       <p>{status.text}</p>
@@ -1863,6 +1870,10 @@
               <span class="mono">{logDetailEntry.path}</span>
               <span> · </span>
               <span class="mono">{logDetailEntry.status || '-'}</span>
+              {#if logDetailEntry.accountEmail || logDetailEntry.accountID || logDetailEntry.accountHint}
+                <span> · </span>
+                <span class="mono">{logDetailEntry.accountEmail || logDetailEntry.accountID || logDetailEntry.accountHint}</span>
+              {/if}
             </p>
           </div>
           <button class="btn btn-secondary btn-small" onclick={closeLogDetailModal}>Close</button>

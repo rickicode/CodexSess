@@ -33,6 +33,31 @@ body {
   line-height: 1.45;
 }
 
+/* Custom scrollbar (dark + primary green accent) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2fdcb8 #171717;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #171717;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #20c9a6 0%, #16b594 100%);
+  border-radius: 999px;
+  border: 2px solid #171717;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #39e3c0 0%, #1dc09d 100%);
+}
+
 button,
 input,
 select,
@@ -74,17 +99,6 @@ textarea {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
-}
-
-.mode-badge {
-  justify-self: start;
-  color: var(--muted);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 4px 8px;
-  font-size: 11px;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
 }
 
 .nav {
@@ -149,6 +163,14 @@ textarea {
   padding: 20px;
   display: grid;
   gap: 16px;
+  align-content: start;
+}
+
+.content.content-logs {
+  height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  grid-template-rows: auto auto auto;
   align-content: start;
 }
 
@@ -620,13 +642,29 @@ input[type='range'].threshold-slider:focus-visible {
 }
 
 .logs-box {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  max-height: 64vh;
-  overflow: auto;
+  min-height: 0;
+  overflow: visible;
   display: grid;
   gap: 8px;
-  padding: 8px;
+  padding: 2px 0 12px;
+}
+
+.logs-panel {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto auto;
+}
+
+.logs-header {
+  margin-bottom: 6px;
+}
+
+.logs-note {
+  margin: 0 0 10px;
 }
 
 .log-row {

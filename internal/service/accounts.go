@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ricki/codexsess/internal/config"
@@ -24,6 +25,10 @@ type Service struct {
 	Store  *store.Store
 	Crypto *icrypto.Crypto
 	Codex  *provider.CodexExec
+
+	cliActiveMu       sync.RWMutex
+	cliActiveCachedID string
+	cliActiveCachedAt time.Time
 }
 
 type TokenSet struct {
@@ -127,6 +132,7 @@ func (s *Service) UseAccountCLI(ctx context.Context, selector string) (store.Acc
 	if err := s.syncAccountAuthToCodexHome(a); err != nil {
 		return store.Account{}, err
 	}
+	s.setCLIActiveCache(a.ID)
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
 
@@ -143,6 +149,10 @@ func (s *Service) RemoveAccount(ctx context.Context, selector string) error {
 }
 
 func (s *Service) ResolveForRequest(ctx context.Context, selector string) (store.Account, TokenSet, error) {
+	return s.resolveForRequest(ctx, selector, false)
+}
+
+func (s *Service) ResolveForRequestWithCLISync(ctx context.Context, selector string) (store.Account, TokenSet, error) {
 	return s.resolveForRequest(ctx, selector, true)
 }
 
@@ -324,10 +334,22 @@ func (s *Service) syncAccountAuthToCodexHome(a store.Account) error {
 	if err := os.MkdirAll(s.Cfg.CodexHome, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(s.Cfg.CodexHome, "auth.json"), b, 0o600)
+	if err := os.WriteFile(filepath.Join(s.Cfg.CodexHome, "auth.json"), b, 0o600); err != nil {
+		return err
+	}
+	s.setCLIActiveCache(a.ID)
+	return nil
 }
 
 func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
+	s.cliActiveMu.RLock()
+	if s.cliActiveCachedID != "" && time.Since(s.cliActiveCachedAt) < 5*time.Second {
+		id := s.cliActiveCachedID
+		s.cliActiveMu.RUnlock()
+		return id, nil
+	}
+	s.cliActiveMu.RUnlock()
+
 	authPath := filepath.Join(s.Cfg.CodexHome, "auth.json")
 	b, err := os.ReadFile(authPath)
 	if err != nil {
@@ -375,18 +397,28 @@ func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
 			continue
 		}
 		if string(accIDTokenRaw) == idToken && string(accAccessTokenRaw) == accessToken {
+			s.setCLIActiveCache(a.ID)
 			return a.ID, nil
 		}
 	}
 	for _, a := range accounts {
 		if claimAccountID != "" && a.AccountID != "" && a.AccountID == claimAccountID {
+			s.setCLIActiveCache(a.ID)
 			return a.ID, nil
 		}
 	}
 	for _, a := range accounts {
 		if claims.Email != "" && strings.EqualFold(a.Email, claims.Email) {
+			s.setCLIActiveCache(a.ID)
 			return a.ID, nil
 		}
 	}
 	return "", nil
+}
+
+func (s *Service) setCLIActiveCache(id string) {
+	s.cliActiveMu.Lock()
+	s.cliActiveCachedID = strings.TrimSpace(id)
+	s.cliActiveCachedAt = time.Now()
+	s.cliActiveMu.Unlock()
 }

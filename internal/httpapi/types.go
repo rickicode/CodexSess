@@ -3,14 +3,18 @@ package httpapi
 import "encoding/json"
 
 type ChatCompletionsRequest struct {
-	Model    string        `json:"model"`
-	Messages []ChatMessage `json:"messages"`
-	Stream   bool          `json:"stream"`
+	Model      string           `json:"model"`
+	Messages   []ChatMessage    `json:"messages"`
+	Stream     bool             `json:"stream"`
+	Tools      []ChatToolDef    `json:"tools,omitempty"`
+	ToolChoice json.RawMessage  `json:"tool_choice,omitempty"`
 }
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string         `json:"role,omitempty"`
+	Content    string         `json:"content,omitempty"`
+	ToolCalls  []ChatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
 }
 
 type ChatCompletionsResponse struct {
@@ -46,7 +50,29 @@ type ChatCompletionsChunk struct {
 type ChatChunkChoice struct {
 	Index        int         `json:"index"`
 	Delta        ChatMessage `json:"delta"`
-	FinishReason string      `json:"finish_reason"`
+	FinishReason *string     `json:"finish_reason,omitempty"`
+}
+
+type ChatToolDef struct {
+	Type     string              `json:"type"`
+	Function ChatToolFunctionDef `json:"function"`
+}
+
+type ChatToolFunctionDef struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type ChatToolCall struct {
+	ID       string               `json:"id"`
+	Type     string               `json:"type"`
+	Function ChatToolFunctionCall `json:"function"`
+}
+
+type ChatToolFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 type ModelsResponse struct {

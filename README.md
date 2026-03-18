@@ -45,6 +45,19 @@ CodexSess was created to:
 - Management routes are protected by web login
 - API compatibility routes under `/v1/*` and `/claude/v1/*` keep API-key style access
 
+## Environment Variables
+
+| Variable | Default | Example | Description |
+|---|---|---|---|
+| `PORT` | `3061` | `PORT=8080` | HTTP server port. Bind address is `127.0.0.1:<PORT>`. |
+| `CODEXSESS_NO_OPEN_BROWSER` | `false` (auto-open enabled) | `CODEXSESS_NO_OPEN_BROWSER=true` | Disable automatic browser opening on startup. Truthy values: `1`, `true`, `yes`. |
+| `CODEXSESS_CODEX_SANDBOX` | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only` | Sandbox mode passed to `codex exec`. Supported values depend on Codex CLI (for example: `read-only`, `workspace-write`, `danger-full-access`). |
+| `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Run Codex API execution in clean/isolated mode. `true` isolates `HOME`/`XDG_*` and uses ephemeral Codex session; `false` uses normal environment. |
+
+Notes:
+- On Windows, data directory defaults to `%APPDATA%\\codexsess` when `APPDATA` is available.
+- `CODEX_HOME` is set internally per selected account and is not intended as an external runtime switch for CodexSess itself.
+
 ## Get It
 
 Do not build manually for normal usage.

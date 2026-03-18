@@ -19,6 +19,8 @@ type Entry struct {
 	RemoteAddr   string    `json:"remote_addr"`
 	UserAgent    string    `json:"user_agent,omitempty"`
 	AccountHint  string    `json:"account_hint,omitempty"`
+	AccountID    string    `json:"account_id,omitempty"`
+	AccountEmail string    `json:"account_email,omitempty"`
 	Model        string    `json:"model,omitempty"`
 	Stream       bool      `json:"stream,omitempty"`
 	RequestBody  string    `json:"request_body,omitempty"`

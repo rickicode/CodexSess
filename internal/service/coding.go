@@ -1,9 +1,11 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -93,6 +95,9 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	}
 	if commandMode == "chat" && isStatusSlashCommand(promptInput) {
 		return s.handleLocalStatusCommand(ctx, session, useModel, useWorkDir, useSandboxMode, userVisibleContent, nil)
+	}
+	if commandMode == "chat" && isMCPSlashCommand(promptInput) {
+		return s.handleLocalMCPCommand(ctx, session, useModel, useWorkDir, useSandboxMode, userVisibleContent, nil)
 	}
 
 	prompt := buildCodingPrompt(commandMode, promptInput)
@@ -228,6 +233,9 @@ func (s *Service) SendCodingMessageStream(
 	}
 	if commandMode == "chat" && isStatusSlashCommand(promptInput) {
 		return s.handleLocalStatusCommand(ctx, session, useModel, useWorkDir, useSandboxMode, userVisibleContent, onEvent)
+	}
+	if commandMode == "chat" && isMCPSlashCommand(promptInput) {
+		return s.handleLocalMCPCommand(ctx, session, useModel, useWorkDir, useSandboxMode, userVisibleContent, onEvent)
 	}
 
 	prompt := buildCodingPrompt(commandMode, promptInput)
@@ -442,6 +450,11 @@ func isStatusSlashCommand(prompt string) bool {
 	return raw == "/status" || strings.HasPrefix(raw, "/status ")
 }
 
+func isMCPSlashCommand(prompt string) bool {
+	raw := strings.TrimSpace(strings.ToLower(prompt))
+	return raw == "/mcp" || strings.HasPrefix(raw, "/mcp ")
+}
+
 func isRawSlashCommand(prompt string) bool {
 	raw := strings.TrimSpace(prompt)
 	if raw == "" {
@@ -513,6 +526,80 @@ func (s *Service) handleLocalStatusCommand(
 	}, nil
 }
 
+func (s *Service) handleLocalMCPCommand(
+	ctx context.Context,
+	session store.CodingSession,
+	model string,
+	workDir string,
+	sandboxMode string,
+	userVisibleContent string,
+	onEvent func(provider.ChatEvent) error,
+) (CodingChatResult, error) {
+	mcpText, err := s.buildLocalMCPText(ctx)
+	if err != nil {
+		mcpText = "Failed to load MCP list: " + strings.TrimSpace(err.Error())
+	}
+	if onEvent != nil {
+		if err := onEvent(provider.ChatEvent{Type: "assistant_message", Text: mcpText}); err != nil {
+			return CodingChatResult{}, err
+		}
+	}
+	return s.persistLocalCommandResponse(ctx, session, model, workDir, sandboxMode, userVisibleContent, mcpText, "MCP")
+}
+
+func (s *Service) persistLocalCommandResponse(
+	ctx context.Context,
+	session store.CodingSession,
+	model string,
+	workDir string,
+	sandboxMode string,
+	userVisibleContent string,
+	assistantText string,
+	defaultTitle string,
+) (CodingChatResult, error) {
+	userMsg, err := s.Store.AppendCodingMessage(ctx, store.CodingMessage{
+		ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		SessionID: session.ID,
+		Role:      "user",
+		Content:   strings.TrimSpace(userVisibleContent),
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return CodingChatResult{}, err
+	}
+	assistantMsg, err := s.Store.AppendCodingMessage(ctx, store.CodingMessage{
+		ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		SessionID: session.ID,
+		Role:      "assistant",
+		Content:   strings.TrimSpace(assistantText),
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return CodingChatResult{}, err
+	}
+	session.Model = normalizeCodingModel(firstNonEmpty(model, session.Model))
+	session.WorkDir = normalizeWorkDir(firstNonEmpty(workDir, session.WorkDir))
+	session.SandboxMode = normalizeCodingSandboxMode(firstNonEmpty(sandboxMode, session.SandboxMode))
+	session.UpdatedAt = time.Now().UTC()
+	session.LastMessageAt = session.UpdatedAt
+	if strings.EqualFold(strings.TrimSpace(session.Title), "new session") {
+		session.Title = strings.TrimSpace(defaultTitle)
+	}
+	if err := s.Store.UpdateCodingSession(ctx, session); err != nil {
+		return CodingChatResult{}, err
+	}
+	updatedSession, err := s.Store.GetCodingSession(ctx, session.ID)
+	if err != nil {
+		return CodingChatResult{}, err
+	}
+	return CodingChatResult{
+		Session:    updatedSession,
+		User:       userMsg,
+		Assistant:  assistantMsg,
+		Assistants: []store.CodingMessage{assistantMsg},
+	}, nil
+}
+
 func (s *Service) buildLocalStatusText(ctx context.Context, session store.CodingSession, model, workDir, sandboxMode string) string {
 	apiActive := "-"
 	cliActive := "-"
@@ -555,6 +642,62 @@ func (s *Service) buildLocalStatusText(ctx context.Context, session store.Coding
 	b.WriteString("Thread: ")
 	b.WriteString(threadID)
 	return b.String()
+}
+
+func (s *Service) buildLocalMCPText(ctx context.Context) (string, error) {
+	bin := strings.TrimSpace(s.Cfg.CodexBin)
+	if bin == "" {
+		bin = "codex"
+	}
+	runCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, bin, "mcp", "list")
+	if home := strings.TrimSpace(s.Cfg.CodexHome); home != "" {
+		cmd.Env = append(os.Environ(), "CODEX_HOME="+home)
+	}
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(err.Error())
+		}
+		return "", fmt.Errorf("%s", msg)
+	}
+	rawLines := strings.Split(out.String(), "\n")
+	enabled := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "WARNING:") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Name") {
+			continue
+		}
+		if strings.Trim(trimmed, "-") == "" {
+			continue
+		}
+		flat := " " + strings.ToLower(trimmed) + " "
+		if strings.Contains(flat, " enabled ") {
+			enabled = append(enabled, trimmed)
+		}
+	}
+	if len(enabled) == 0 {
+		return "No active MCP servers found.", nil
+	}
+	var b strings.Builder
+	b.WriteString("Active MCP servers:\n")
+	for _, line := range enabled {
+		b.WriteString("- ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return strings.TrimSpace(b.String()), nil
 }
 
 func normalizeCodingModel(model string) string {

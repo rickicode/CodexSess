@@ -6,6 +6,16 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 
 ## [1.0.2] - 2026-03-18
 
+### Web Coding (`/chat`)
+- Added dedicated `/chat` web coding workspace with full-screen chat layout and persisted session history.
+- Added workspace-aware new session flow with folder picker and server-side path suggestions.
+- Added session route targeting via query parameter (`/chat?id=<session_id>`) for direct open/resume behavior.
+- Added coding activity timeline rendering alongside assistant outputs in the web chat UI.
+- Added coding slash commands support focused for web workflow (`/status` and `/review`).
+- Added skill picker integration to insert `$skill_name` hints directly into the composer.
+- Added streaming-focused chat UX updates (in-progress state + progressive assistant output).
+- Updated README explanation for `/chat` in user-facing language (clear workflow and practical usage context).
+
 ### Added
 - Dedicated GitHub workflow for PR code review with synthesized final review output.
 - Optional PR autofix helper workflow that generates patch suggestions and uploads patch artifacts for manual application.

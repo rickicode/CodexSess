@@ -12,6 +12,7 @@
   let status = $state({ text: 'Initializing...', kind: 'info' });
 
   let apiKey = $state('');
+  let apiMode = $state('codex_cli');
   let openAIEndpoint = $state('');
   let claudeEndpoint = $state('');
   let authJSONEndpoint = $state('');
@@ -782,6 +783,7 @@
   async function loadSettings() {
     const data = await req('/api/settings');
     apiKey = data.api_key || '';
+    apiMode = String(data.api_mode || 'codex_cli').trim().toLowerCase() === 'direct_api' ? 'direct_api' : 'codex_cli';
     openAIEndpoint = data.openai_endpoint || '';
     claudeEndpoint = data.claude_endpoint || '';
     authJSONEndpoint = data.auth_json_endpoint || '';
@@ -1115,6 +1117,24 @@
       setTimeout(() => {
         playNotificationTone('switch');
       }, 140);
+    }
+  }
+
+  async function setAPIMode(nextMode) {
+    const normalized = String(nextMode || '').trim().toLowerCase() === 'direct_api' ? 'direct_api' : 'codex_cli';
+    if (apiMode === normalized) return;
+    settingsBusy = true;
+    try {
+      const data = await req('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ api_mode: normalized })
+      });
+      apiMode = String(data.api_mode || normalized).trim().toLowerCase() === 'direct_api' ? 'direct_api' : 'codex_cli';
+      setStatus(`API mode changed to ${apiMode === 'direct_api' ? 'Direct API' : 'Codex CLI'}.`, 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
     }
   }
 
@@ -1902,6 +1922,8 @@
     {#if !isChatRoute && activeMenu === 'settings'}
       <SettingsView
         busy={settingsBusy}
+        {apiMode}
+        onSetAPIMode={setAPIMode}
         {showAccountEmail}
         onToggleShowAccountEmail={toggleShowAccountEmail}
         {autoRefreshEnabled}

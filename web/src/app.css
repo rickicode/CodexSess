@@ -623,6 +623,23 @@ pre,
   grid-template-columns: 1fr auto auto;
 }
 
+.api-mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.api-mode-btn {
+  justify-content: center;
+}
+
+.api-mode-btn.is-active {
+  border-color: rgba(0, 212, 170, 0.76);
+  background: rgba(0, 212, 170, 0.18);
+  color: #bafaf0;
+  cursor: not-allowed;
+}
+
 .slider-wrap {
   border: 1px solid var(--border);
   border-radius: 10px;

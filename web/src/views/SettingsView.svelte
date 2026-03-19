@@ -1,6 +1,8 @@
 <script>
   let {
     busy,
+    apiMode,
+    onSetAPIMode,
     showAccountEmail,
     onToggleShowAccountEmail,
     autoRefreshEnabled,
@@ -49,6 +51,40 @@
   </div>
 
   <div class="settings-list">
+    <section class="setting-category">
+      <h3 class="setting-category-title">API Mode</h3>
+      <div class="setting-row">
+        <p class="setting-title">Proxy Execution Mode</p>
+        <div class="api-mode-switch" role="group" aria-label="API mode switch">
+          <button
+            type="button"
+            class="btn btn-secondary api-mode-btn {apiMode === 'codex_cli' ? 'is-active' : ''}"
+            onclick={() => onSetAPIMode('codex_cli')}
+            disabled={busy || apiMode === 'codex_cli'}
+            aria-pressed={apiMode === 'codex_cli'}
+          >
+            Codex CLI
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary api-mode-btn {apiMode === 'direct_api' ? 'is-active' : ''}"
+            onclick={() => onSetAPIMode('direct_api')}
+            disabled={busy || apiMode === 'direct_api'}
+            aria-pressed={apiMode === 'direct_api'}
+          >
+            Direct API
+          </button>
+        </div>
+        <p class="setting-title">
+          {#if apiMode === 'direct_api'}
+            /v1 endpoints call ChatGPT backend API directly.
+          {:else}
+            /v1 endpoints call local codex CLI execution pipeline.
+          {/if}
+        </p>
+      </div>
+    </section>
+
     <section class="setting-category">
       <h3 class="setting-category-title">Account Display</h3>
       <div class="setting-row">

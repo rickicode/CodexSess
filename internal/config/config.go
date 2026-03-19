@@ -24,6 +24,7 @@ type Config struct {
 	CodexHome                string            `yaml:"codex_home"`
 	CodexBin                 string            `yaml:"codex_bin"`
 	ProxyAPIKey              string            `yaml:"codexsess_api_key"`
+	APIMode                  string            `yaml:"api_mode"`
 	ModelMappings            map[string]string `yaml:"model_mappings"`
 	UsageAlertThreshold      int               `yaml:"usage_alert_threshold"`
 	UsageAutoSwitchThreshold int               `yaml:"usage_auto_switch_threshold"`
@@ -42,6 +43,7 @@ func Default() Config {
 		AuthStoreDir:             filepath.Join(base, "auth-accounts"),
 		CodexHome:                filepath.Join(home, ".codex"),
 		CodexBin:                 resolveCodexBin(""),
+		APIMode:                  "codex_cli",
 		ModelMappings:            map[string]string{},
 		UsageAlertThreshold:      5,
 		UsageAutoSwitchThreshold: 2,
@@ -91,6 +93,7 @@ func LoadOrInit() (Config, error) {
 		cfg.CodexHome = def.CodexHome
 	}
 	cfg.CodexBin = resolveCodexBin(cfg.CodexBin)
+	cfg.APIMode = NormalizeAPIMode(cfg.APIMode)
 	if cfg.ModelMappings == nil {
 		cfg.ModelMappings = map[string]string{}
 	}
@@ -168,6 +171,16 @@ func resolveCodexBin(current string) string {
 		return raw
 	}
 	return "codex"
+}
+
+func NormalizeAPIMode(v string) string {
+	mode := strings.TrimSpace(strings.ToLower(v))
+	switch mode {
+	case "direct_api":
+		return "direct_api"
+	default:
+		return "codex_cli"
+	}
 }
 
 func defaultDataDir(home string) string {

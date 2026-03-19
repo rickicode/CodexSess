@@ -32,7 +32,9 @@ var appVersion = "dev"
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("codexsess: %v", err)
+		log.Printf("codexsess: %v", err)
+		waitForExitOnWindowsError()
+		os.Exit(1)
 	}
 }
 
@@ -287,4 +289,22 @@ func changePassword() error {
 	}
 	fmt.Println("Admin credential updated successfully.")
 	return nil
+}
+
+func waitForExitOnWindowsError() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("CODEXSESS_NO_PAUSE_ON_ERROR")))
+	if raw == "1" || raw == "true" || raw == "yes" {
+		return
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		_ = exec.Command("cmd", "/c", "pause").Run()
+		return
+	}
+	fmt.Print("Press Enter to exit...")
+	if _, err := bufio.NewReader(os.Stdin).ReadString('\n'); err != nil {
+		_ = exec.Command("cmd", "/c", "pause").Run()
+	}
 }

@@ -1065,7 +1065,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Model = s.resolveMappedModel(req.Model)
 	prompt := promptFromMessagesWithTools(req.Messages, req.Tools, req.ToolChoice)
-	account, err := s.resolveAPIAccount(r.Context(), selector)
+	account, tk, err := s.resolveAPIAccountWithTokens(r.Context(), selector)
 	if err != nil {
 		msg := strings.ToLower(strings.TrimSpace(err.Error()))
 		switch {
@@ -1101,6 +1101,42 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			respondErr(w, 500, "internal_error", "streaming not supported")
 			return
 		}
+		if s.currentAPIMode() == "direct_api" {
+			res, err := s.callDirectCodexResponses(r.Context(), account, tk, req.Model, prompt, func(delta string) error {
+				chunk := ChatCompletionsChunk{
+					ID:      "chatcmpl-" + reqID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   req.Model,
+					Choices: []ChatChunkChoice{{Index: 0, Delta: ChatMessage{Role: "assistant", Content: delta}}},
+				}
+				b, _ := json.Marshal(chunk)
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+				flusher.Flush()
+				return nil
+			})
+			if err != nil {
+				status = 500
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"`+escape(err.Error())+`"}}`)
+				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			final := ChatCompletionsChunk{
+				ID:      "chatcmpl-" + reqID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Choices: []ChatChunkChoice{{Index: 0, Delta: ChatMessage{Role: "assistant"}, FinishReason: ptrString("stop")}},
+				Usage:   &Usage{PromptTokens: res.InputTokens, CompletionTokens: res.OutputTokens, TotalTokens: res.InputTokens + res.OutputTokens},
+			}
+			b, _ := json.Marshal(final)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+
 		res, err := s.svc.Codex.StreamChat(r.Context(), s.svc.APICodexHome(account.ID), req.Model, prompt, func(evt provider.ChatEvent) error {
 			chunk := ChatCompletionsChunk{
 				ID:      "chatcmpl-" + reqID,
@@ -1133,6 +1169,39 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
 		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		return
+	}
+
+	if s.currentAPIMode() == "direct_api" {
+		res, err := s.callDirectCodexResponses(r.Context(), account, tk, req.Model, prompt, nil)
+		if err != nil {
+			status = 500
+			respondErr(w, 500, "upstream_error", err.Error())
+			return
+		}
+		toolCalls, hasToolCalls := parseToolCallsFromText(res.Text, req.Tools)
+		choice := ChatChoice{
+			Index:        0,
+			Message:      ChatMessage{Role: "assistant", Content: res.Text},
+			FinishReason: "stop",
+		}
+		if hasToolCalls {
+			choice.Message = ChatMessage{
+				Role:      "assistant",
+				Content:   "",
+				ToolCalls: toolCalls,
+			}
+			choice.FinishReason = "tool_calls"
+		}
+		resp := ChatCompletionsResponse{
+			ID:      "chatcmpl-" + reqID,
+			Object:  "chat.completion",
+			Created: time.Now().Unix(),
+			Model:   req.Model,
+			Choices: []ChatChoice{choice},
+			Usage:   Usage{PromptTokens: res.InputTokens, CompletionTokens: res.OutputTokens, TotalTokens: res.InputTokens + res.OutputTokens},
+		}
+		respondJSON(w, 200, resp)
 		return
 	}
 
@@ -1193,7 +1262,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 400, "bad_request", "input is required")
 		return
 	}
-	account, err := s.resolveAPIAccount(r.Context(), selector)
+	account, tk, err := s.resolveAPIAccountWithTokens(r.Context(), selector)
 	if err != nil {
 		msg := strings.ToLower(strings.TrimSpace(err.Error()))
 		switch {
@@ -1240,6 +1309,61 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		writeSSE(w, "response.created", createdEvent)
 		flusher.Flush()
+
+		if s.currentAPIMode() == "direct_api" {
+			result, err := s.callDirectCodexResponses(r.Context(), account, tk, req.Model, inputText, func(delta string) error {
+				deltaEvent := map[string]any{
+					"type":        "response.output_text.delta",
+					"response_id": reqID,
+					"delta":       delta,
+				}
+				writeSSE(w, "response.output_text.delta", deltaEvent)
+				flusher.Flush()
+				return nil
+			})
+			if err != nil {
+				status = 500
+				writeSSE(w, "error", map[string]any{
+					"type": "error",
+					"error": map[string]any{
+						"type":    "upstream_error",
+						"message": err.Error(),
+					},
+				})
+				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			completedEvent := map[string]any{
+				"type": "response.completed",
+				"response": map[string]any{
+					"id":     reqID,
+					"object": "response",
+					"model":  req.Model,
+					"status": "completed",
+					"output": []map[string]any{
+						{
+							"type":   "message",
+							"id":     "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+							"status": "completed",
+							"role":   "assistant",
+							"content": []map[string]any{
+								{"type": "output_text", "text": result.Text},
+							},
+						},
+					},
+					"usage": map[string]any{
+						"input_tokens":  result.InputTokens,
+						"output_tokens": result.OutputTokens,
+						"total_tokens":  result.InputTokens + result.OutputTokens,
+					},
+				},
+			}
+			writeSSE(w, "response.completed", completedEvent)
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
 
 		result, err := s.svc.Codex.StreamChat(r.Context(), s.svc.APICodexHome(account.ID), req.Model, inputText, func(evt provider.ChatEvent) error {
 			deltaEvent := map[string]any{
@@ -1292,6 +1416,38 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeSSE(w, "response.completed", completedEvent)
 		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		return
+	}
+
+	if s.currentAPIMode() == "direct_api" {
+		result, err := s.callDirectCodexResponses(r.Context(), account, tk, req.Model, inputText, nil)
+		if err != nil {
+			status = 500
+			respondErr(w, 500, "upstream_error", err.Error())
+			return
+		}
+		resp := ResponsesResponse{
+			ID:     reqID,
+			Object: "response",
+			Model:  req.Model,
+			Output: []ResponsesItem{
+				{
+					Type:   "message",
+					ID:     "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+					Status: "completed",
+					Role:   "assistant",
+					Content: []ResponsesText{
+						{Type: "output_text", Text: result.Text},
+					},
+				},
+			},
+			Usage: ResponsesUsage{
+				InputTokens:  result.InputTokens,
+				OutputTokens: result.OutputTokens,
+				TotalTokens:  result.InputTokens + result.OutputTokens,
+			},
+		}
+		respondJSON(w, 200, resp)
 		return
 	}
 
@@ -1351,7 +1507,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 400, "bad_request", "messages are required")
 		return
 	}
-	account, err := s.resolveAPIAccount(r.Context(), selector)
+	account, tk, err := s.resolveAPIAccountWithTokens(r.Context(), selector)
 	if err != nil {
 		msg := strings.ToLower(strings.TrimSpace(err.Error()))
 		switch {
@@ -1397,6 +1553,29 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 		flusher.Flush()
+		if s.currentAPIMode() == "direct_api" {
+			_, err := s.callDirectCodexResponses(r.Context(), account, tk, req.Model, prompt, func(delta string) error {
+				writeSSE(w, "content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]any{"type": "text_delta", "text": delta},
+				})
+				flusher.Flush()
+				return nil
+			})
+			if err != nil {
+				status = 500
+				writeSSE(w, "error", map[string]any{"type": "error", "error": map[string]any{"message": err.Error()}})
+				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
+			_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+
 		_, err := s.svc.Codex.StreamChat(r.Context(), s.svc.APICodexHome(account.ID), req.Model, prompt, func(evt provider.ChatEvent) error {
 			writeSSE(w, "content_block_delta", map[string]any{
 				"type":  "content_block_delta",
@@ -1416,6 +1595,34 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 		writeSSE(w, "message_stop", map[string]any{"type": "message_stop"})
 		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 		flusher.Flush()
+		return
+	}
+
+	if s.currentAPIMode() == "direct_api" {
+		res, err := s.callDirectCodexResponses(r.Context(), account, tk, req.Model, prompt, nil)
+		if err != nil {
+			status = 500
+			respondErr(w, 500, "upstream_error", err.Error())
+			return
+		}
+		resp := ClaudeMessagesResponse{
+			ID:    reqID,
+			Type:  "message",
+			Role:  "assistant",
+			Model: req.Model,
+			Content: []ClaudeContentBlock{
+				{
+					Type: "text",
+					Text: res.Text,
+				},
+			},
+			StopReason: "end_turn",
+			Usage: ClaudeMessagesUsage{
+				InputTokens:  res.InputTokens,
+				OutputTokens: res.OutputTokens,
+			},
+		}
+		respondJSON(w, 200, resp)
 		return
 	}
 
@@ -1727,6 +1934,12 @@ func (s *Server) setAPIKey(v string) {
 	s.mu.Unlock()
 }
 
+func (s *Server) currentAPIMode() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return config.NormalizeAPIMode(s.svc.Cfg.APIMode)
+}
+
 func (s *Server) currentModelMappings() map[string]string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1822,6 +2035,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		updateInfo := s.getUpdateInfo(r.Context(), false)
 		respondJSON(w, 200, map[string]any{
 			"api_key":                     s.currentAPIKey(),
+			"api_mode":                    s.currentAPIMode(),
 			"openai_endpoint":             strings.TrimRight(base, "/") + "/v1/chat/completions",
 			"claude_endpoint":             strings.TrimRight(base, "/") + "/v1/messages",
 			"auth_json_endpoint":          strings.TrimRight(base, "/") + "/v1/auth.json",
@@ -1844,8 +2058,9 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	case http.MethodPost:
 		var req struct {
-			UsageAlertThreshold      *int `json:"usage_alert_threshold"`
-			UsageAutoSwitchThreshold *int `json:"usage_auto_switch_threshold"`
+			APIMode                  *string `json:"api_mode"`
+			UsageAlertThreshold      *int    `json:"usage_alert_threshold"`
+			UsageAutoSwitchThreshold *int    `json:"usage_auto_switch_threshold"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			respondErr(w, 400, "bad_request", "invalid JSON")
@@ -1853,6 +2068,9 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Lock()
 		cfg := s.svc.Cfg
+		if req.APIMode != nil {
+			cfg.APIMode = config.NormalizeAPIMode(strings.TrimSpace(*req.APIMode))
+		}
 		if req.UsageAlertThreshold != nil {
 			v := *req.UsageAlertThreshold
 			if v < 0 || v > 100 {
@@ -1879,6 +2097,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		s.svc.Cfg = cfg
 		s.mu.Unlock()
 		respondJSON(w, 200, map[string]any{
+			"api_mode":                    cfg.APIMode,
 			"ok":                          true,
 			"usage_alert_threshold":       cfg.UsageAlertThreshold,
 			"usage_auto_switch_threshold": cfg.UsageAutoSwitchThreshold,

@@ -25,6 +25,7 @@
     <a href="#overview">Overview</a> •
     <a href="#installation-linux">Installation</a> •
     <a href="#core-capabilities">Core Capabilities</a> •
+    <a href="#web-coding-workspace-chat">Web Coding Workspace</a> •
     <a href="#github-code-review-workflow">GitHub Code Review Workflow</a> •
     <a href="#todo">TODO</a> •
     <a href="#ui-preview">UI Preview</a> •
@@ -107,6 +108,23 @@ Windows installation:
   - threshold alerts
   - configurable auto-switch behavior
 - Embedded web console and API proxy in one binary
+
+## Web Coding Workspace (`/chat`)
+
+`/chat` is the coding area in CodexSess.
+
+In simple terms, this is where you talk to Codex from the browser instead of opening Codex CLI manually.
+You create a session, choose your workspace folder, then continue coding in that same session.
+Your chat history and workspace context are saved, so you can leave and come back without losing the flow.
+
+The experience is designed to feel practical for daily work:
+- You can resume existing sessions from the session list.
+- New session flow includes workspace picker with path suggestions.
+- Assistant responses and activity updates are shown in real time.
+- Helpful commands like `/status` and `/review` are available in chat.
+- Skill hints can be inserted quickly using `$skill_name`.
+
+This makes CodexSess useful as a browser-based coding companion for desktop and remote/mobile access while keeping session context organized.
 
 ## UI Preview
 

@@ -23,6 +23,7 @@
 
   <p>
     <a href="#overview">Overview</a> •
+    <a href="#latest-major-updates">Latest Major Updates</a> •
     <a href="#installation-linux">Installation</a> •
     <a href="#core-capabilities">Core Capabilities</a> •
     <a href="#web-coding-workspace-chat">Web Coding Workspace</a> •
@@ -46,6 +47,25 @@ It is designed for operators who need:
 
 For normal usage, download binaries/packages from the latest release page:
 - https://github.com/rickicode/CodexSess/releases/latest
+
+## Latest Major Updates
+
+- New `/chat` coding workspace:
+  - persistent sessions and message history
+  - workspace picker + path suggestions
+  - live activity stream, slash commands (`/status`, `/review`), and skill picker
+- Zo OpenAI-compatible integration:
+  - multi Zo API key management in dashboard
+  - per-key request tracking (`Requests` + `Last request`)
+  - cached Zo model list and mapping support
+- Direct API and routing automation upgrades:
+  - direct API mode improvements for OpenAI-compatible + Claude-compatible clients
+  - codex CLI strategy supports `round_robin` (scheduled rotation) and `manual` (threshold-based switch)
+  - default auto-switch threshold set to `15%`
+  - backend scheduler handles periodic usage checks and active-account fallback
+- New system observability:
+  - System Logs page with DB-backed log rotation
+  - clearer usage refresh source and CLI/API switch logs
 
 ## Why CodexSess Exists
 
@@ -81,10 +101,10 @@ curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/in
 curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/install.sh | bash -s -- --mode update
 ```
 
-GUI mode bind override (via `~/.bashrc`):
+GUI mode public access toggle (via `~/.bashrc`):
 
 ```bash
-echo 'export CODEXSESS_BIND_ADDR=0.0.0.0:3061' >> ~/.bashrc
+echo 'export CODEXSESS_PUBLIC=true' >> ~/.bashrc
 source ~/.bashrc
 ```
 
@@ -104,9 +124,21 @@ Windows installation:
 - Separate active account state:
   - API active account
   - CLI (Codex) active account
+- Multi-account routing strategy:
+  - CLI `round_robin` rotation (default scheduler interval: 5 minutes)
+  - CLI `manual` auto-switch when remaining usage is below threshold
 - Usage refresh and automation:
   - threshold alerts
   - configurable auto-switch behavior
+  - default auto-switch threshold is 15% (configurable in Settings/API)
+- Zo API key operations:
+  - add/remove multiple Zo API keys
+  - monitor request count per key
+  - use Zo model list for mapping
+- Browser coding workspace:
+  - `/chat` sessions with persisted context and activity timeline
+- System observability:
+  - System Logs view with automatic log rotation
 - Embedded web console and API proxy in one binary
 
 ## Web Coding Workspace (`/chat`)
@@ -201,11 +233,12 @@ Behavior:
 
 | Variable | Default | Example | Description |
 |---|---|---|---|
-| `PORT` | `3061` | `PORT=8080` | HTTP server port used when `CODEXSESS_BIND_ADDR` is not explicitly set. |
-| `CODEXSESS_BIND_ADDR` | `0.0.0.0:<PORT>` | `CODEXSESS_BIND_ADDR=0.0.0.0:3061` | Full bind address override (`host:port`) for HTTP server. |
+| `PORT` | `3061` | `PORT=8080` | HTTP server port. |
+| `CODEXSESS_PUBLIC` | `false` | `CODEXSESS_PUBLIC=true` | Enable network/public bind (`0.0.0.0:<PORT>`). When false, bind is local-only (`127.0.0.1:<PORT>`). |
 | `CODEXSESS_NO_OPEN_BROWSER` | `false` | `CODEXSESS_NO_OPEN_BROWSER=true` | Disable automatic browser opening on startup. Truthy values: `1`, `true`, `yes`. |
-| `CODEXSESS_CODEX_SANDBOX` | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only` | Sandbox mode passed to `codex exec`. |
+| `CODEXSESS_CODEX_SANDBOX` | `full-access` | `CODEXSESS_CODEX_SANDBOX=full-access` | Sandbox mode passed to `codex exec` (`write/workspace-write` is normalized to `full-access`). |
 | `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Run Codex execution in isolated mode (`true`) or normal environment (`false`). |
+| `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | `` | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Optional command executed when CLI active account changes. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
 
 Notes:
 - On Windows, data directory defaults to `%APPDATA%\\codexsess` when `APPDATA` is available.

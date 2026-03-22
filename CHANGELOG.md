@@ -4,7 +4,11 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINOR.PATCH`).
 
-## [1.0.2] - 2026-03-18
+## [Unreleased]
+
+- No entries yet.
+
+## [1.0.3] - 2026-03-22
 
 ### Web Coding (`/chat`)
 - Added dedicated `/chat` web coding workspace with full-screen chat layout and persisted session history.
@@ -14,19 +18,39 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Added coding slash commands support focused for web workflow (`/status` and `/review`).
 - Added skill picker integration to insert `$skill_name` hints directly into the composer.
 - Added streaming-focused chat UX updates (in-progress state + progressive assistant output).
-- Updated README explanation for `/chat` in user-facing language (clear workflow and practical usage context).
+- Added runtime session APIs (`/api/coding/sessions`, `/api/coding/messages`, `/api/coding/chat`) and persistent storage tables for coding sessions/messages.
+
+### Added
+- Zo API key management (multi-key add/remove, per-key request counters, last-request info, and OpenAI-compatible Zo endpoint support).
+- System Logs page with database-backed rotation and log detail viewer for account switch/usage events.
+
+### Changed
+- Codex CLI Strategy now includes:
+  - `round_robin` rotation (automatic periodic switch)
+  - `manual` mode with auto-switch when remaining usage is below configured threshold.
+- API Workspace refinement: Zo model caching, model mapping list improvements, and cleaner endpoint examples.
+- Usage automation and account switching behavior were stabilized for large multi-account pools.
+- Runtime bind mode is now simplified: use `CODEXSESS_PUBLIC=true` for public bind (`0.0.0.0:<PORT>`), otherwise local bind (`127.0.0.1:<PORT>`). `CODEXSESS_BIND_ADDR` is no longer used.
+- Startup logs now clearly show bind scope (`public` or `local`) to avoid ambiguous network status messages.
+- Installer systemd unit now uses `CODEXSESS_PUBLIC=true` for server mode.
+- README (`EN`/`ID`) was updated to document `CODEXSESS_PUBLIC` and remove old `CODEXSESS_BIND_ADDR` guidance.
+- System Logs filter UI was refined: search/filter row now has proper bottom spacing and full-width control layout.
+
+## [1.0.2] - 2026-03-18
 
 ### Added
 - Dedicated GitHub workflow for PR code review with synthesized final review output.
 - Optional PR autofix helper workflow that generates patch suggestions and uploads patch artifacts for manual application.
 - New API-key protected endpoint `GET /v1/auth.json` to export the active API account auth payload for external Codex CLI runners.
-- Web coding runtime session APIs (`/api/coding/sessions`, `/api/coding/messages`, `/api/coding/chat`) for ChatGPT-style session list and message history.
-- Persistent storage tables for coding sessions and coding messages in the local SQLite store.
 
 ### Changed
+- API Logs endpoint now supports `DELETE /api/logs` to clear captured proxy traffic in one action.
+- API Logs web panel now includes a `Clear Logs` button to reset traffic history from the dashboard.
+- API Mode selector was moved from Settings into API Workspace so proxy mode control lives with endpoint credentials/config.
 - OpenAI `/v1` root payload validation now only dispatches to chat completions and responses APIs.
 - API settings payload now exposes `auth_json_endpoint` for automation clients.
 - API Workspace UI now shows Auth JSON endpoint and download example for automation use.
+- API Workspace UI now shows a dedicated OpenAI Responses endpoint field (`/v1/responses`) with copy action.
 - Code-review automation flow is now review-first and can be configured to avoid direct push/merge behavior.
 - API logging and automation coverage were refined so review flows stay visible and traceable in API logs.
 - Settings and documentation were expanded with automation usage details and cURL examples.
@@ -62,30 +86,6 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - GitHub code-review workflow now installs security tooling in CI (`semgrep`, `gitleaks`, `gosec`, `govulncheck`) so Codex can run direct security checks during review/autofix when needed.
 - GitHub code-review autofix commit step now strips CI scratch artifacts and excludes `.github/workflows/*` from automation commits to avoid push rejections when workflow-token lacks `workflows` permission.
 - GitHub code-review PR comments now prioritize analysis output (review findings + autofix summary) and strip raw code blocks from posted comment content.
-- Sidebar navigation now includes a dedicated `Sessions` menu and opens to that page by default.
-- New `Sessions` web UI provides first-open auto session creation, left-side session list, and coding chat composer/messages in a desktop app layout.
-- Codex executor now supports explicit `workdir` options so web coding sessions can run in project context while keeping `CODEX_HOME` auth separation.
-- `Sessions` flow now opens a workspace/folder picker modal on `New Session` with default path `~/`.
-- Added path suggestion API (`/api/coding/path-suggestions`) and UI autocomplete that suggests directories from server-side listing (`ls`-style).
-- Coding session metadata now persists `work_dir`, and active path is shown directly in the chat panel.
-- Sessions/chat now uses dedicated route `/chat` for full coding layout.
-- `/chat` view now hides dashboard shell elements (sidebar, status banner, API/CLI summary) and focuses only on coding UI.
-- `Sessions` navigation button now redirects to `/chat`, and `/chat` provides an explicit `Back to Dashboard` action.
-- `/chat` layout height was rebalanced to avoid whole-page scrolling; only the coding message area is scrollable.
-- Workspace path visibility in chat was improved (`Workspace Path` bar), and `New Session` workspace picker modal visibility was hardened.
-- Chat composer now supports slash commands (`/help`, `/model`, `/path`, `/new`) for quick runtime control without leaving chat.
-- Chat composer now supports `$skill` markers, which are passed as skill hints into the request payload.
-- Send button in coding chat was redesigned for clearer action state and better visual affordance.
-- Added `/status` slash command to quickly show current session/model/path context in the chat status line.
-- Added dedicated Skill Picker modal (with search) to insert available `$skill_name` tokens into composer directly from UI.
-- Added backend skills listing endpoint (`/api/coding/skills`) that discovers installed skills from local Codex/agents skill directories.
-- Fixed coding session persistence flow so user messages are only stored after successful Codex response, preventing duplicate history on retry after upstream failures.
-- `$skill` handling now preserves original user prompt text (no token stripping) while still passing skill hints.
-- Added coding session preferences update API (`PUT /api/coding/sessions`) so model/path changes persist immediately on active session.
-- Model dropdown and `/model` + `/path` commands now auto-save session preferences (debounced), reducing state drift between UI and stored session.
-- Skills discovery now supports custom roots via `CODEXSESS_SKILL_DIRS` (path-list env) in addition to default local skill directories.
-- Chat header controls were reorganized: model dropdown + `New Session` + `Delete` now live in the topbar only for cleaner layout.
-- Session list is now accessible via a dedicated `Sessions` sidebar modal drawer, including full session selection flow.
 
 ## [1.0.1] - 2026-03-18
 
@@ -107,4 +107,45 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Browser login modal now includes manual callback URL input with inline submit action.
 - OAuth callback base URL resolution now respects request/forwarded host instead of forcing localhost.
 - OpenAI streaming final chunk now sends assistant role in `delta` for stricter client compatibility.
+- OpenAI `chat/completions` streaming now emits structured `tool_calls` delta chunks (including `index`, `id`, `function.name`, `function.arguments`) and ends with `finish_reason: "tool_calls"` when tool invocation is selected.
+- OpenAI `chat/completions` streaming now filters Codex activity events from output stream and only forwards assistant text deltas for better client compatibility.
+- OpenAI `/v1/responses` now supports tool-aware request/response flow: request `tools` + `tool_choice`, non-stream `output.type=function_call`, and stream events for `response.output_item.*` plus `response.function_call_arguments.*`.
+- Responses prompt extraction now preserves prior `function_call` and `function_call_output` items to keep tool-loop context across turns.
+- Responses API compatibility was tightened for OpenCode parser requirements: added `created_at` on `/v1/responses` payloads and `item_id` + message item lifecycle events on streaming text deltas.
+- Tool schema handling now accepts both OpenAI Chat-style (`function.name`) and OpenAI Responses-style (`name`/`parameters`) definitions, improving cross-client compatibility with OpenCode tool requests.
+- Responses streaming text flow now emits `response.output_text.done` before item completion for broader OpenAI Responses event compatibility.
+- Non-stream `/v1/responses` assistant `output_text` entries now include explicit `annotations` arrays to satisfy stricter OpenAI Responses schema consumers.
+- Direct API SSE parsing now extracts native `function_call` items from `response.completed.output` and prioritizes those tool calls over text heuristics for OpenAI-compatible tool-loop responses.
+- Codex CLI (`codex exec --json`) parsing now extracts native tool/function calls from `item.*` and `response.*` events, carries them in provider results, and reuses them in `/v1/chat/completions` + `/v1/responses` before text-based fallback parsing.
+- Responses streaming now emits both `response.completed` and `response.done` final events for broader OpenCode/plugin parser compatibility.
+- Direct API SSE parser now accepts both `response.completed` and `response.done` as finalization events, improving compatibility with varied Responses stream emitters.
+- Responses endpoint audit records now correctly persist the request stream mode (`stream=true|false`) for accurate observability.
+- Codex CLI native tool-call extraction now requires explicit tool/function item types, preventing false-positive tool-call detection from generic event payloads.
+- Tool-call text fallback parser now accepts additional OpenCode-shaped outputs (`tool_calls` as object and concatenated JSON objects), preventing raw tool-call JSON from leaking to chat text output.
+- Streaming tool mode now emits periodic SSE keep-alive comments (configurable via `CODEXSESS_SSE_KEEPALIVE_SECONDS`) to prevent idle client timeouts during buffered tool-call resolution.
+- Direct API upstream timeout was increased and made configurable via `CODEXSESS_DIRECT_API_TIMEOUT_SECONDS` (bounded to 30-600s) to reduce premature `context deadline exceeded` failures on long responses.
+- Streaming responses now set `X-Accel-Buffering: no` to reduce reverse-proxy buffering-induced idle timeouts on SSE clients.
+- Backend now runs usage auto-switch checks every 5 minutes for both API active account and CLI active account, and automatically switches to the best account when remaining quota is at/below configured auto-switch threshold.
+- Direct API mode now performs automatic account switch + one-time retry when upstream returns HTTP `429`, reducing hard-fail rate limit errors for OpenCode/Codex clients.
+- Settings now include backend scheduler control (`usage_scheduler_enabled`) so Background Auto Refresh Usage is replaced by backend-driven usage autoswitch scheduling.
+- Backend usage scheduler now runs progressive checks in batches (max 3 accounts per loop) to reduce refresh pressure on large account pools.
+- Direct API settings now include account strategy (`direct_api_strategy`) with `round_robin` and `load_balance` options for multi-account routing behavior.
+- Settings UI now hides `Usage Auto-Switch Threshold` controls when `Background Auto Switch Scheduler` is disabled, so threshold tuning only appears when scheduler logic is active.
+- Settings UI usage automation copy was simplified to backend-scheduler status only, removing stale manual-refresh indicators that could misreport scheduler activity.
+- Dashboard now keeps both `Use API` and `Use CLI` actions visible in `direct_api` mode, so manual API/CLI context switching remains available.
+- Dashboard account actions now use icon-only buttons for `Refresh` and `Remove`, while `Use API` and `Use CLI` remain text buttons for clearer mode-switch intent.
+- Dashboard account list now supports usage filters (`Exhausted (Weekly or 5h)` and `Has Remaining Usage`) and prioritizes `API ACTIVE`/`CODEX ACTIVE` accounts at the top of the list.
+- Dashboard filters layout now keeps `All Account Types` and `All Usage` side-by-side on desktop/tablet for faster filtering, and stacks only on small mobile screens.
+- Added full account backup/restore flow: backend endpoints for exporting all managed accounts (tokens + usage snapshot metadata) and restoring from JSON backup, with Dashboard actions for download/upload.
+- Backup restore now validates backup version and hardens active-account fallback selection, reducing partial-failure risk from malformed/inconsistent backup payloads.
+- Backend auto-switch synchronization was refactored to remove shared scheduler/request mutex contention, reducing Direct API request latency spikes during 5-minute background loops.
+- Direct API account selection is now more fault-tolerant: `round_robin` and `load_balance` both continue trying other candidates when one account fails, reducing hard-fail requests in multi-account pools.
+- Direct API `load_balance` now falls back to `round_robin` when usage snapshots are stale/missing or candidates fail, preventing sticky single-account routing and improving resilience when scheduler data is cold.
 - GitHub code-review workflow now uses `jq --rawfile` for large diffs and adds retry/timeout hardening for CodexSess API calls.
+- OpenAI Responses streaming now follows strict standard event shape by removing non-standard `response.done` emissions and finalizing streams with `response.completed` + `[DONE]`.
+- OpenAI Responses objects now include `output_text` in both stream-final and non-stream `/v1/responses` payloads for stricter SDK compatibility.
+- OpenAI `chat/completions` streaming chunks now always serialize `usage` explicitly as `null` or object, avoiding schema drift on strict stream parsers.
+- OpenAI Responses streaming now preserves a stable `created_at` across `response.created` and `response.completed` events for the same response ID.
+- OpenAI Responses non-tool streaming now falls back to accumulated streamed deltas when provider final text is empty, preventing blank `response.output_text.done` text.
+- OpenAI `/v1/responses` streaming now emits data-only SSE frames (without `event:` headers) to better match strict OpenAI-compatible stream parsers.
+- OpenAI `/v1/responses` streaming event payloads now drop non-standard `response_id` fields so strict schema validators no longer reject frames.

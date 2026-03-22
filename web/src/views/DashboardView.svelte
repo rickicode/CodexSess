@@ -1,16 +1,30 @@
 <script>
   let {
+    apiMode,
     accounts,
     totalAccounts,
+    filteredCount,
+    page,
+    totalPages,
+    perPage,
+    pageStart,
+    pageEnd,
+    pageSizeOptions,
+    onSetPage,
+    onSetPageSize,
     showAccountEmail,
     busy,
     accountSearchQuery,
     accountTypeFilter,
+    usageAvailabilityFilter,
     accountTypeOptions,
+    usageAvailabilityOptions,
     onSetAccountSearchQuery,
     onSetAccountTypeFilter,
+    onSetUsageAvailabilityFilter,
     onOpenAddAccountModal,
-    onRefreshAllUsage,
+    onBackupAccounts,
+    onRestoreAccounts,
     onUseApiAccount,
     onUseCliAccount,
     onRefreshUsage,
@@ -21,6 +35,12 @@
     formatResetLabel,
     activeUsageAlert
   } = $props();
+
+  function pickRestoreFile(event) {
+    const file = event?.currentTarget?.files?.[0];
+    if (file) onRestoreAccounts(file);
+    if (event?.currentTarget) event.currentTarget.value = '';
+  }
 </script>
 
 <section class="panel">
@@ -29,7 +49,11 @@
   </div>
   <div class="panel-actions">
     <button class="btn btn-primary" onclick={onOpenAddAccountModal} disabled={busy}>Add Account</button>
-    <button class="btn btn-secondary" onclick={onRefreshAllUsage} disabled={busy}>Refresh All Usage</button>
+    <button class="btn btn-secondary" onclick={onBackupAccounts} disabled={busy}>Backup All Accounts</button>
+    <label class="btn btn-secondary btn-file {busy ? 'is-disabled' : ''}">
+      Restore Accounts
+      <input type="file" accept=".json,application/json" onchange={pickRestoreFile} disabled={busy} />
+    </label>
   </div>
   <div class="dashboard-filters">
     <input
@@ -47,6 +71,15 @@
         <option value={option.value}>{option.label}</option>
       {/each}
     </select>
+    <select
+      aria-label="Filter usage availability"
+      value={usageAvailabilityFilter}
+      onchange={(event) => onSetUsageAvailabilityFilter(event.currentTarget.value)}
+    >
+      {#each usageAvailabilityOptions as option}
+        <option value={option.value}>{option.label}</option>
+      {/each}
+    </select>
   </div>
 </section>
 
@@ -60,7 +93,41 @@
 <section class="panel" aria-label="Managed accounts">
   <div class="panel-header panel-header-inline">
     <h2>Managed Accounts</h2>
-    <span class="panel-meta">{accounts.length} of {totalAccounts} account(s)</span>
+    <span class="panel-meta">{pageStart}-{pageEnd} of {filteredCount} filtered ({totalAccounts} total)</span>
+  </div>
+  <div class="dashboard-pagination">
+    <div class="dashboard-pagination-right">
+      <label class="dashboard-page-size-control">
+        <span class="panel-meta">Per page</span>
+        <select
+          class="dashboard-page-size-select"
+          aria-label="Accounts per page"
+          value={String(perPage)}
+          onchange={(event) => onSetPageSize(event.currentTarget.value)}
+        >
+          {#each pageSizeOptions as size}
+            <option value={String(size)}>{size}</option>
+          {/each}
+        </select>
+      </label>
+      <div class="dashboard-page-nav">
+        <button
+          class="btn btn-small btn-secondary pagination-nav-btn"
+          onclick={() => onSetPage(page - 1)}
+          disabled={page <= 1}
+        >
+          Prev
+        </button>
+        <span class="dashboard-page-label panel-meta">Page {page} / {totalPages}</span>
+        <button
+          class="btn btn-small btn-secondary pagination-nav-btn"
+          onclick={() => onSetPage(page + 1)}
+          disabled={page >= totalPages}
+        >
+          Next
+        </button>
+      </div>
+    </div>
   </div>
 
   {#if accounts.length === 0}
@@ -69,6 +136,8 @@
     <div class="accounts-grid">
       {#each accounts as account (account.id)}
         {@const usageWindows = parseUsageWindows(account.usage)}
+        {@const revoked = account?.revoked === true}
+        {@const revokedReason = String(account?.revoked_reason || '').trim()}
         <article class="account-card {account.active ? 'is-active' : ''}">
           <div class="account-head">
             <div>
@@ -108,14 +177,51 @@
               {/each}
             </div>
           {/if}
+          {#if revoked}
+            <div class="empty-state compact">Token revoked (401). Account tidak bisa dipakai sampai login ulang.</div>
+          {/if}
 
           <div class="account-foot">
             <span class="plan-type">{(account.plan_type || 'unknown').toUpperCase()}</span>
             <div class="inline-actions">
-              <button class="btn btn-small btn-primary" onclick={() => onUseApiAccount(account.id)} disabled={busy || account.active_api}>Use API</button>
-              <button class="btn btn-small btn-secondary" onclick={() => onUseCliAccount(account.id)} disabled={busy || account.active_cli}>Use CLI</button>
-              <button class="btn btn-small btn-secondary" onclick={() => onRefreshUsage(account.id)} disabled={busy}>Refresh</button>
-              <button class="btn btn-small btn-danger" onclick={() => onOpenRemoveModal(account)} disabled={busy}>Remove</button>
+              <button
+                class="btn btn-small btn-primary"
+                onclick={() => onUseApiAccount(account.id)}
+                disabled={busy || account.active_api || revoked}
+                title={revoked ? (revokedReason || 'Token revoked') : ''}
+              >
+                Use API
+              </button>
+              <button
+                class="btn btn-small btn-secondary"
+                onclick={() => onUseCliAccount(account.id)}
+                disabled={busy || account.active_cli || revoked}
+                title={revoked ? (revokedReason || 'Token revoked') : ''}
+              >
+                Use CLI
+              </button>
+              <button
+                class="btn btn-small btn-secondary btn-icon-only btn-refresh-icon"
+                onclick={() => onRefreshUsage(account.id)}
+                disabled={busy}
+                aria-label="Refresh usage"
+                title="Refresh usage"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5a7 7 0 0 1 6.93 6H21l-3.2 3.2L14.6 11h2.28A4.99 4.99 0 0 0 12 7a5 5 0 0 0-4.9 4H5.07A7 7 0 0 1 12 5Zm6.83 8a7 7 0 0 1-13.66 0H3l3.2-3.2L9.4 13H7.12A4.99 4.99 0 0 0 12 17a5 5 0 0 0 4.9-4h1.93Z"></path>
+                </svg>
+              </button>
+              <button
+                class="btn btn-small btn-danger btn-icon-only btn-remove-icon"
+                onclick={() => onOpenRemoveModal(account)}
+                disabled={busy}
+                aria-label="Remove account"
+                title="Remove account"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm1 6h2v8h-2V9Zm4 0h2v8h-2V9ZM7 9h2v8H7V9Zm1 11h8a2 2 0 0 0 2-2V8H6v10a2 2 0 0 0 2 2Z"></path>
+                </svg>
+              </button>
             </div>
           </div>
         </article>

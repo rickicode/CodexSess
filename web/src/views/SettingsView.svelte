@@ -6,16 +6,16 @@
     showAccountEmail,
     onToggleShowAccountEmail,
     autoRefreshEnabled,
-    autoRefreshMinutes,
-    autoRefreshMinutesInput,
+    directAPIStrategy,
+    codingCLIStrategy,
     usageAlertThreshold,
     usageAlertThresholdInput,
     usageAutoSwitchThreshold,
     usageAutoSwitchThresholdInput,
     usageSoundEnabled,
     onToggleAutoRefreshEnabled,
-    onSetAutoRefreshMinutesInput,
-    onCommitAutoRefreshMinutesInput,
+    onSetDirectAPIStrategy,
+    onSetCodingCLIStrategy,
     onSetUsageAlertThresholdInput,
     onCommitUsageAlertThresholdInput,
     onSetUsageAutoSwitchThresholdInput,
@@ -23,18 +23,8 @@
     onNudgeUsageAlertThreshold,
     onNudgeUsageAutoSwitchThreshold,
     onToggleUsageSoundEnabled,
-    autoRefreshBusy,
-    backgroundRefreshError,
-    backgroundRefreshLastAt
+    autoRefreshBusy
   } = $props();
-
-  function formatBackgroundRefreshTime(timestamp) {
-    const ts = Number(timestamp || 0);
-    if (!Number.isFinite(ts) || ts <= 0) return 'Never';
-    const date = new Date(ts);
-    if (Number.isNaN(date.getTime())) return 'Never';
-    return date.toLocaleString();
-  }
 
   function nudgeAlert(delta) {
     onNudgeUsageAlertThreshold(delta);
@@ -83,6 +73,68 @@
           {/if}
         </p>
       </div>
+      {#if apiMode === 'direct_api'}
+      <div class="setting-row">
+        <p class="setting-title">Direct API Account Strategy</p>
+        <div class="api-mode-switch" role="group" aria-label="direct api strategy switch">
+          <button
+            type="button"
+            class="btn btn-secondary api-mode-btn {directAPIStrategy === 'round_robin' ? 'is-active' : ''}"
+            onclick={() => onSetDirectAPIStrategy('round_robin')}
+            disabled={busy || directAPIStrategy === 'round_robin'}
+            aria-pressed={directAPIStrategy === 'round_robin'}
+          >
+            Round Robin
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary api-mode-btn {directAPIStrategy === 'load_balance' ? 'is-active' : ''}"
+            onclick={() => onSetDirectAPIStrategy('load_balance')}
+            disabled={busy || directAPIStrategy === 'load_balance'}
+            aria-pressed={directAPIStrategy === 'load_balance'}
+          >
+            Load Balance
+          </button>
+        </div>
+        <p class="setting-title">
+          {#if directAPIStrategy === 'load_balance'}
+            Select account by highest fresh remaining usage.
+          {:else}
+            Rotate account every request to distribute load.
+          {/if}
+        </p>
+      </div>
+      {/if}
+      <div class="setting-row">
+        <p class="setting-title">Codex CLI Strategy</p>
+        <div class="api-mode-switch" role="group" aria-label="codex cli strategy switch">
+          <button
+            type="button"
+            class="btn btn-secondary api-mode-btn {codingCLIStrategy === 'manual' ? 'is-active' : ''}"
+            onclick={() => onSetCodingCLIStrategy('manual')}
+            disabled={busy || codingCLIStrategy === 'manual'}
+            aria-pressed={codingCLIStrategy === 'manual'}
+          >
+            Manual
+          </button>
+          <button
+            type="button"
+            class="btn btn-secondary api-mode-btn {codingCLIStrategy === 'round_robin' ? 'is-active' : ''}"
+            onclick={() => onSetCodingCLIStrategy('round_robin')}
+            disabled={busy || codingCLIStrategy === 'round_robin'}
+            aria-pressed={codingCLIStrategy === 'round_robin'}
+          >
+            Round Robin (5m)
+          </button>
+        </div>
+        <p class="setting-title">
+          {#if codingCLIStrategy === 'round_robin'}
+            CLI active account rotates every backend active-check cycle (~5 menit).
+          {:else}
+            CLI only auto-switches when remaining usage is below `Auto-switch when remaining usage is below`.
+          {/if}
+        </p>
+      </div>
     </section>
 
     <section class="setting-category">
@@ -101,36 +153,20 @@
     <section class="setting-category">
       <h3 class="setting-category-title">Usage Automation</h3>
       <div class="setting-row">
-        <p class="setting-title">Background Auto Refresh Usage</p>
-        <div class="setting-actions-grid with-three">
-          <input
-            type="number"
-            min="1"
-            value={autoRefreshMinutesInput}
-            oninput={(event) => onSetAutoRefreshMinutesInput(event.currentTarget.value)}
-            onblur={onCommitAutoRefreshMinutesInput}
-            onkeydown={(event) => event.key === 'Enter' && onCommitAutoRefreshMinutesInput()}
-            disabled={!autoRefreshEnabled}
-            aria-label="Auto refresh interval in minutes"
-          />
-          <button class="btn btn-secondary" onclick={onToggleAutoRefreshEnabled}>
+        <p class="setting-title">Background Auto Switch Scheduler</p>
+        <div class="setting-actions-grid">
+          <button class="btn btn-secondary" onclick={onToggleAutoRefreshEnabled} disabled={busy || autoRefreshBusy}>
             {#if autoRefreshEnabled}Disable{:else}Enable{/if}
           </button>
         </div>
         <p class="setting-title">
           {#if autoRefreshEnabled}
-            Usage refresh runs every {autoRefreshMinutes} minute(s) in background.
+            Scheduler aktif: cek usage progresif (maks 3 akun per loop) dan auto-switch dari backend.
           {:else}
-            Auto refresh is disabled. Default interval is 30 minutes.
+            Scheduler backend nonaktif.
           {/if}
         </p>
-        <p class="setting-title">Last background refresh: {formatBackgroundRefreshTime(backgroundRefreshLastAt)}</p>
-        {#if autoRefreshBusy}
-          <p class="setting-title">Background refresh is running.</p>
-        {/if}
-        {#if backgroundRefreshError}
-          <p class="setting-title">Background refresh error: {backgroundRefreshError}</p>
-        {/if}
+        <p class="setting-title">Scheduler status is handled fully by backend loop.</p>
       </div>
 
       <div class="setting-row">
@@ -165,6 +201,7 @@
         <p class="setting-title">Current alert threshold: {usageAlertThreshold}%</p>
       </div>
 
+      {#if autoRefreshEnabled}
       <div class="setting-row">
         <p class="setting-title">Usage Auto-Switch Threshold (%)</p>
         <div class="slider-wrap">
@@ -195,8 +232,9 @@
           </div>
         </div>
         <p class="setting-title">Current auto-switch threshold: {usageAutoSwitchThreshold}%</p>
-        <p class="setting-title">Default logic: alert at 5%, auto-switch at 2%.</p>
+              <p class="setting-title">Default logic: alert at 5%, auto-switch at 15%.</p>
       </div>
+      {/if}
 
       <div class="setting-row">
         <p class="setting-title">Notification Sound</p>

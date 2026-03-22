@@ -4,7 +4,9 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 )
 
@@ -38,7 +40,23 @@ func Handler() http.Handler {
 		r2.URL.Path = path.Clean(p)
 		assetPath := strings.TrimPrefix(r2.URL.Path, "/")
 		if _, err := fs.Stat(sub, assetPath); err != nil {
-			serveIndex(w)
+			// Dev fallback: serve fresh built assets from disk even if the running
+			// binary/embed is stale.
+			if strings.HasPrefix(assetPath, "assets/") {
+				diskPath := filepath.Join("internal", "webui", "assets", filepath.FromSlash(assetPath))
+				if st, statErr := os.Stat(diskPath); statErr == nil && !st.IsDir() {
+					http.ServeFile(w, r, diskPath)
+					return
+				}
+				http.NotFound(w, r)
+				return
+			}
+			// SPA fallback for app routes only.
+			if !strings.Contains(path.Base(assetPath), ".") {
+				serveIndex(w)
+				return
+			}
+			http.NotFound(w, r)
 			return
 		}
 		fileServer.ServeHTTP(w, &r2)

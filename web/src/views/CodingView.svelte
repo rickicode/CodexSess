@@ -7,7 +7,7 @@
   let draftMessage = $state('');
   let selectedModel = $state('gpt-5.2-codex');
   let selectedWorkDir = $state('~/');
-  let selectedSandboxMode = $state('full-access');
+  let selectedSandboxMode = $state('write');
   let loadingSessions = $state(false);
   let loadingMessages = $state(false);
   let sending = $state(false);
@@ -30,10 +30,19 @@
   let showSessionDrawer = $state(false);
   let codexCLIEmail = $state('');
   let codexIdentityTimer = null;
+  let backgroundMonitorTimer = null;
   let expandedMessageMap = $state({});
+  let logViewMode = $state('compact');
+  let streamAbortController = $state(null);
+  let backgroundProcessing = $state(false);
+  let stopRequested = $state(false);
 
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
   const draftStoragePrefix = 'codexsess.coding.draft.v1:';
+  const viewModeStorageKey = 'codexsess.coding.view_mode.v1';
+  const enableSkillHintWrap = ['1', 'true', 'yes', 'on'].includes(
+    String(import.meta.env.VITE_CODEXSESS_SKILL_HINT_WRAP || '').trim().toLowerCase()
+  );
   const jsonHeaders = { 'Content-Type': 'application/json' };
   const models = ['gpt-5.2-codex', 'gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.4'];
   const slashCommands = ['/status', '/review [optional focus]'];
@@ -73,6 +82,153 @@
     const d = new Date(String(value || ''));
     if (Number.isNaN(d.getTime())) return '-';
     return d.toLocaleString();
+  }
+
+  function normalizeActivityCommandKey(command) {
+    return String(command || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  function parseActivityText(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return { kind: 'other', command: '', exitCode: 0 };
+    let m = text.match(/^Running:\s+(.+)$/i);
+    if (m) {
+      return { kind: 'running', command: String(m[1] || '').trim(), exitCode: 0 };
+    }
+    m = text.match(/^Command done:\s+(.+)$/i);
+    if (m) {
+      return { kind: 'done', command: String(m[1] || '').trim(), exitCode: 0 };
+    }
+    m = text.match(/^Command failed\s+\(exit\s+(\d+)\):\s+(.+)$/i);
+    if (m) {
+      return {
+        kind: 'failed',
+        command: String(m[2] || '').trim(),
+        exitCode: Number(m[1]) || 0
+      };
+    }
+    return { kind: 'other', command: '', exitCode: 0 };
+  }
+
+  function mergeActivityContent(startText, endText) {
+    const first = String(startText || '').trim();
+    const second = String(endText || '').trim();
+    if (!first) return second || '-';
+    if (!second) return first || '-';
+    if (first === second) return first;
+    return `${first}\n${second}`;
+  }
+
+  function compactActivityMessages(inputMessages) {
+    const src = Array.isArray(inputMessages) ? inputMessages : [];
+    const out = [];
+    const runningIndexByKey = new Map();
+
+    for (const item of src) {
+      if (String(item?.role || '').trim().toLowerCase() !== 'activity') {
+        out.push(item);
+        continue;
+      }
+      const parsed = parseActivityText(item?.content || '');
+      const key = normalizeActivityCommandKey(parsed.command);
+      if (parsed.kind === 'running' && key) {
+        if (runningIndexByKey.has(key)) {
+          const idx = runningIndexByKey.get(key);
+          if (typeof idx === 'number' && out[idx]) {
+            out[idx] = {
+              ...out[idx],
+              content: item?.content || out[idx].content || '-'
+            };
+            continue;
+          }
+        }
+        out.push(item);
+        runningIndexByKey.set(key, out.length - 1);
+        continue;
+      }
+      if ((parsed.kind === 'done' || parsed.kind === 'failed') && key) {
+        if (runningIndexByKey.has(key)) {
+          const idx = runningIndexByKey.get(key);
+          if (typeof idx === 'number' && out[idx]) {
+            out[idx] = {
+              ...out[idx],
+              content: mergeActivityContent(out[idx].content || '', item?.content || '')
+            };
+            runningIndexByKey.delete(key);
+            continue;
+          }
+        }
+      }
+      out.push(item);
+    }
+
+    return out;
+  }
+
+  function appendActivityMessage(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return '';
+    const next = {
+      id: `activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      role: 'activity',
+      content: text,
+      created_at: new Date().toISOString(),
+      pending: false
+    };
+    messages = compactActivityMessages([...messages, next]);
+    return String(next.id || '');
+  }
+
+  function appendStreamMetaMessage(role, rawText) {
+    const messageRole = String(role || '').trim().toLowerCase();
+    const text = String(rawText || '').trim();
+    if (!messageRole || !text) return '';
+    const next = {
+      id: `${messageRole}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      role: messageRole,
+      content: text,
+      created_at: new Date().toISOString(),
+      pending: false
+    };
+    messages = [...messages, next];
+    return String(next.id || '');
+  }
+
+  function groupedMessagesForView() {
+    const src = Array.isArray(messages) ? messages : [];
+    const out = [];
+    let openActivityIndex = -1;
+    for (const item of src) {
+      const role = String(item?.role || '').trim().toLowerCase();
+      if (role !== 'activity') {
+        openActivityIndex = -1;
+        out.push(item);
+        continue;
+      }
+      if (openActivityIndex < 0) {
+        out.push({
+          ...item,
+          id: `activity-group-${String(item?.id || Date.now())}`
+        });
+        openActivityIndex = out.length - 1;
+        continue;
+      }
+      const existing = out[openActivityIndex];
+      if (!existing) {
+        out.push({
+          ...item,
+          id: `activity-group-${String(item?.id || Date.now())}`
+        });
+        openActivityIndex = out.length - 1;
+        continue;
+      }
+      out[openActivityIndex] = {
+        ...existing,
+        content: mergeActivityContent(existing?.content || '', item?.content || ''),
+        created_at: item?.created_at || existing?.created_at
+      };
+    }
+    return out;
   }
 
   function activeSession() {
@@ -118,7 +274,28 @@
     const role = String(message?.role || '').trim().toLowerCase();
     if (role === 'assistant') return 'assistant';
     if (role === 'activity') return 'activity';
+    if (role === 'event') return 'event';
+    if (role === 'stderr') return 'stderr';
     return 'user';
+  }
+
+  function renderedMessagesForView() {
+    let rendered = groupedMessagesForView();
+    if (String(logViewMode || '').trim().toLowerCase() !== 'raw') {
+      rendered = rendered.filter((item) => String(item?.role || '').trim().toLowerCase() !== 'event');
+    }
+    return rendered;
+  }
+
+  function setLogViewMode(mode) {
+    const normalized = String(mode || '').trim().toLowerCase() === 'raw' ? 'raw' : 'compact';
+    logViewMode = normalized;
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(viewModeStorageKey, normalized);
+      } catch {
+      }
+    }
   }
 
   function shouldCollapseContent(content) {
@@ -136,6 +313,26 @@
       return `${lines.slice(0, 20).join('\n')}\n...`;
     }
     return `${text.slice(0, 1600)}\n...`;
+  }
+
+  function sanitizeSensitiveLogText(input) {
+    let text = String(input || '');
+    if (!text) return '';
+    text = text.replace(/("(?:access_token|refresh_token|id_token|api[_-]?key|authorization|anthropic_auth_token)"\s*:\s*")([^"]+)(")/gi, '$1[REDACTED]$3');
+    text = text.replace(/\b((?:access_token|refresh_token|id_token|api[_-]?key|authorization|anthropic_auth_token)\s*=\s*)(\S+)/gi, '$1[REDACTED]');
+    text = text.replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]');
+    text = text.replace(/\bsk-[A-Za-z0-9]{12,}\b/g, 'sk-[REDACTED]');
+    text = text.replace(/\/home\/[^/\s]+/g, '/home/[user]');
+    return text;
+  }
+
+  function messageDisplayContent(message) {
+    const role = String(message?.role || '').trim().toLowerCase();
+    const content = String(message?.content || '-');
+    if (role === 'event' || role === 'stderr' || role === 'activity') {
+      return sanitizeSensitiveLogText(content);
+    }
+    return content;
   }
 
   function isMessageExpanded(id) {
@@ -216,7 +413,7 @@
       if (active) {
         selectedModel = String(active.model || selectedModel).trim() || selectedModel;
         selectedWorkDir = String(active.work_dir || '~/').trim() || '~/';
-        selectedSandboxMode = String(active.sandbox_mode || 'full-access').trim() || 'full-access';
+        selectedSandboxMode = String(active.sandbox_mode || 'write').trim() || 'write';
       }
     } finally {
       loadingSessions = false;
@@ -234,7 +431,7 @@
           session_id: session.id,
           model: selectedModel,
           work_dir: selectedWorkDir || '~/',
-          sandbox_mode: selectedSandboxMode || 'full-access'
+          sandbox_mode: selectedSandboxMode || 'write'
         })
       });
       const updated = data?.session;
@@ -263,12 +460,66 @@
     loadingMessages = true;
     try {
       const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}`);
-      messages = Array.isArray(data.messages) ? data.messages : [];
+      messages = compactActivityMessages(Array.isArray(data.messages) ? data.messages : []);
       await tick();
       scrollMessagesToBottom();
     } finally {
       loadingMessages = false;
     }
+  }
+
+  async function refreshBackgroundStatus(sessionID, { syncMessages = false } = {}) {
+    const sid = String(sessionID || '').trim();
+    if (!sid) {
+      backgroundProcessing = false;
+      return false;
+    }
+    const data = await req(`/api/coding/status?session_id=${encodeURIComponent(sid)}`);
+    const inFlight = Boolean(data?.in_flight);
+    const becameDone = backgroundProcessing && !inFlight;
+    backgroundProcessing = inFlight;
+    if (inFlight) {
+      if (!sending) {
+        viewStatus = 'Session is still processing in background...';
+      }
+      if (syncMessages && !loadingMessages) {
+        await loadMessages(sid);
+      }
+      return true;
+    }
+    if (syncMessages && !loadingMessages) {
+      await loadMessages(sid);
+    }
+    if (becameDone) {
+      await loadMessages(sid);
+      viewStatus = 'Background processing finished.';
+    }
+    return false;
+  }
+
+  function stopBackgroundMonitor() {
+    if (backgroundMonitorTimer) {
+      clearInterval(backgroundMonitorTimer);
+      backgroundMonitorTimer = null;
+    }
+  }
+
+  function startBackgroundMonitor(sessionID) {
+    const sid = String(sessionID || '').trim();
+    stopBackgroundMonitor();
+    if (!sid) {
+      backgroundProcessing = false;
+      return;
+    }
+    refreshBackgroundStatus(sid, { syncMessages: true }).catch(() => {});
+    backgroundMonitorTimer = setInterval(() => {
+      const activeID = String(activeSessionID || '').trim();
+      if (!activeID || activeID !== sid) {
+        stopBackgroundMonitor();
+        return;
+      }
+      refreshBackgroundStatus(activeID, { syncMessages: true }).catch(() => {});
+    }, 3000);
   }
 
   function scrollMessagesToBottom() {
@@ -348,7 +599,7 @@
         title: '',
         model: selectedModel,
         work_dir: String(workDir || '~/').trim() || '~/',
-        sandbox_mode: selectedSandboxMode || 'full-access'
+        sandbox_mode: selectedSandboxMode || 'write'
       })
     });
     const created = data?.session;
@@ -359,9 +610,10 @@
       syncSessionIDToURL(created.id);
       selectedModel = String(created.model || selectedModel).trim() || selectedModel;
       selectedWorkDir = String(created.work_dir || '~/').trim() || '~/';
-      selectedSandboxMode = String(created.sandbox_mode || 'full-access').trim() || 'full-access';
+      selectedSandboxMode = String(created.sandbox_mode || 'write').trim() || 'write';
       await loadMessages(created.id);
       draftMessage = loadDraftForSession(created.id);
+      startBackgroundMonitor(created.id);
     }
     viewStatus = 'New session created.';
   }
@@ -400,10 +652,11 @@
     if (active) {
       selectedModel = String(active.model || selectedModel).trim() || selectedModel;
       selectedWorkDir = String(active.work_dir || '~/').trim() || '~/';
-      selectedSandboxMode = String(active.sandbox_mode || 'full-access').trim() || 'full-access';
+      selectedSandboxMode = String(active.sandbox_mode || 'write').trim() || 'write';
     }
     await loadMessages(activeSessionID);
     draftMessage = loadDraftForSession(activeSessionID);
+    startBackgroundMonitor(activeSessionID);
   }
 
   async function selectSession(sessionID) {
@@ -414,9 +667,10 @@
     const selected = sessions.find((item) => item.id === sid);
     if (selected?.model) selectedModel = selected.model;
     selectedWorkDir = String(selected?.work_dir || '~/').trim() || '~/';
-    selectedSandboxMode = String(selected?.sandbox_mode || 'full-access').trim() || 'full-access';
+    selectedSandboxMode = String(selected?.sandbox_mode || 'write').trim() || 'write';
     await loadMessages(sid);
     draftMessage = loadDraftForSession(sid);
+    startBackgroundMonitor(sid);
     showSessionDrawer = false;
   }
 
@@ -444,6 +698,7 @@
         syncSessionIDToURL(activeSessionID);
         await loadMessages(activeSessionID);
         draftMessage = loadDraftForSession(activeSessionID);
+        startBackgroundMonitor(activeSessionID);
       }
     } finally {
       deleting = false;
@@ -474,14 +729,18 @@
       pending: true
     };
     messages = [...messages, pendingMessage];
+    sending = true;
+    stopRequested = false;
+    backgroundProcessing = false;
     await tick();
     scrollMessagesToBottom();
 
-    sending = true;
     const workingDraft = content;
     let liveAssistantID = '';
     let streamedAssistantIDs = [];
+    let streamedMetaIDs = [];
     streamingPending = true;
+    streamAbortController = new AbortController();
     draftMessage = '';
     viewStatus = 'Streaming...';
     try {
@@ -489,12 +748,13 @@
         method: 'POST',
         headers: jsonHeaders,
         credentials: 'same-origin',
+        signal: streamAbortController?.signal,
         body: JSON.stringify({
           session_id: session.id,
           content: slashMeta.contentOverride ?? prepared,
           model: selectedModel,
           work_dir: selectedWorkDir || '~/',
-          sandbox_mode: selectedSandboxMode || 'full-access',
+          sandbox_mode: selectedSandboxMode || 'write',
           command: slashMeta.commandMode || 'chat'
         })
       });
@@ -519,80 +779,97 @@
       let donePayload = null;
       let streamError = '';
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        sseBuffer += decoder.decode(value, { stream: true });
-        sseBuffer = parseSSEFrames(sseBuffer, (frameText) => {
-          let evt = {};
-          try {
-            evt = JSON.parse(frameText || '{}');
-          } catch {
-            return;
-          }
-          const eventType = String(evt?.event || '').trim().toLowerCase();
-          if (eventType === 'assistant_message') {
-            const text = String(evt?.text || '').trim();
-            if (!text) return;
-            streamingPending = false;
-            const liveID = `live-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-            streamedAssistantIDs = [...streamedAssistantIDs, liveID];
-            messages = messages
-              .concat([{
-                id: liveID,
-                role: 'assistant',
-                content: text,
-                created_at: new Date().toISOString(),
-                pending: false
-              }]);
-            return;
-          }
-          if (eventType === 'activity') {
-            const text = String(evt?.text || '').trim();
-            if (!text) return;
-            messages = messages.concat([{
-              id: `activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-              role: 'activity',
+      const handleStreamFrame = (frameText) => {
+        let evt = {};
+        try {
+          evt = JSON.parse(frameText || '{}');
+        } catch {
+          return;
+        }
+        const eventType = String(evt?.event || '').trim().toLowerCase();
+        if (eventType === 'assistant_message') {
+          const text = String(evt?.text || '').trim();
+          if (!text) return;
+          streamingPending = false;
+          const liveID = `live-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          streamedAssistantIDs = [...streamedAssistantIDs, liveID];
+          messages = messages
+            .concat([{
+              id: liveID,
+              role: 'assistant',
               content: text,
               created_at: new Date().toISOString(),
               pending: false
             }]);
-            return;
+          return;
+        }
+        if (eventType === 'activity') {
+          const text = sanitizeSensitiveLogText(String(evt?.text || '').trim());
+          if (!text) return;
+          const id = appendActivityMessage(text);
+          if (id) streamedMetaIDs = [...streamedMetaIDs, id];
+          return;
+        }
+        if (eventType === 'raw_event') {
+          const text = sanitizeSensitiveLogText(String(evt?.text || '').trim());
+          if (!text) return;
+          const id = appendStreamMetaMessage('event', text);
+          if (id) streamedMetaIDs = [...streamedMetaIDs, id];
+          return;
+        }
+        if (eventType === 'stderr') {
+          const text = sanitizeSensitiveLogText(String(evt?.text || '').trim());
+          if (!text) return;
+          const id = appendStreamMetaMessage('stderr', text);
+          if (id) streamedMetaIDs = [...streamedMetaIDs, id];
+          return;
+        }
+        if (eventType === 'delta') {
+          const deltaText = String(evt?.text || '');
+          if (!deltaText) return;
+          streamingPending = false;
+          if (!liveAssistantID) {
+            liveAssistantID = `live-assistant-delta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            streamedAssistantIDs = [...streamedAssistantIDs, liveAssistantID];
+            messages = messages.concat([{
+              id: liveAssistantID,
+              role: 'assistant',
+              content: '',
+              created_at: new Date().toISOString(),
+              pending: false
+            }]);
           }
-          if (eventType === 'delta') {
-            const deltaText = String(evt?.text || '');
-            if (!deltaText) return;
-            streamingPending = false;
-            if (!liveAssistantID) {
-              liveAssistantID = `live-assistant-delta-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-              streamedAssistantIDs = [...streamedAssistantIDs, liveAssistantID];
-              messages = messages.concat([{
-                id: liveAssistantID,
-                role: 'assistant',
-                content: '',
-                created_at: new Date().toISOString(),
-                pending: false
-              }]);
-            }
-            messages = messages.map((item) =>
-              item?.id === liveAssistantID
-                ? { ...item, content: `${item.content || ''}${deltaText}` }
-                : item
-            );
-            return;
-          }
-          if (eventType === 'error') {
-            streamError = String(evt?.message || 'Streaming failed.');
-            return;
-          }
-          if (eventType === 'done') {
-            donePayload = evt;
-          }
-        });
+          messages = messages.map((item) =>
+            item?.id === liveAssistantID
+              ? { ...item, content: `${item.content || ''}${deltaText}` }
+              : item
+          );
+          return;
+        }
+        if (eventType === 'error') {
+          streamError = String(evt?.message || 'Streaming failed.');
+          return;
+        }
+        if (eventType === 'done') {
+          donePayload = evt;
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          sseBuffer += decoder.decode();
+          sseBuffer = parseSSEFrames(sseBuffer, handleStreamFrame, true);
+          break;
+        }
+        sseBuffer += decoder.decode(value, { stream: true });
+        sseBuffer = parseSSEFrames(sseBuffer, handleStreamFrame);
         if (streamError) throw new Error(streamError);
         await tick();
         scrollMessagesToBottom();
       }
+
+      if (streamError) throw new Error(streamError);
 
       if (!donePayload) {
         throw new Error('Streaming ended before completion.');
@@ -600,19 +877,28 @@
 
       const userMessage = donePayload?.user;
       const assistantMessage = donePayload?.assistant;
+      const eventMessages = Array.isArray(donePayload?.event_messages) ? donePayload.event_messages : [];
       const assistantMessages = Array.isArray(donePayload?.assistant_messages) ? donePayload.assistant_messages : [];
       streamingPending = false;
       messages = messages.filter(
         (item) =>
           item?.id !== pendingID &&
-          !streamedAssistantIDs.includes(item?.id)
+          !streamedAssistantIDs.includes(item?.id) &&
+          !streamedMetaIDs.includes(item?.id)
       );
       if (userMessage) messages = [...messages, userMessage];
+      if (eventMessages.length > 0) {
+        messages = [...messages, ...eventMessages.map((item) => ({
+          ...item,
+          content: sanitizeSensitiveLogText(item?.content || '')
+        }))];
+      }
       if (assistantMessages.length > 0) {
         messages = [...messages, ...assistantMessages];
       } else if (assistantMessage) {
         messages = [...messages, assistantMessage];
       }
+      messages = compactActivityMessages(messages);
       clearDraftForSession(session.id);
 
       if (donePayload?.session?.id) {
@@ -620,27 +906,66 @@
         sessions = sessions.map((item) => (item.id === updated.id ? updated : item));
         sessions = [...sessions].sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')));
         selectedWorkDir = String(updated.work_dir || selectedWorkDir).trim() || '~/';
-        selectedSandboxMode = String(updated.sandbox_mode || selectedSandboxMode).trim() || 'full-access';
+        selectedSandboxMode = String(updated.sandbox_mode || selectedSandboxMode).trim() || 'write';
       }
       await tick();
       scrollMessagesToBottom();
       viewStatus = 'Response received.';
       composerError = '';
     } catch (error) {
+      const busy = String(error?.message || '').toLowerCase().includes('already processing');
       messages = messages.filter(
         (item) =>
           item?.id !== pendingID &&
-          !streamedAssistantIDs.includes(item?.id)
+          !streamedAssistantIDs.includes(item?.id) &&
+          !streamedMetaIDs.includes(item?.id)
       );
       draftMessage = workingDraft;
       saveDraftForSession(session.id, workingDraft);
+      const aborted =
+        String(error?.name || '').trim() === 'AbortError' ||
+        String(error?.message || '').toLowerCase().includes('aborted');
       const failReason = String(error?.message || 'Failed to send message.');
-      composerError = failReason;
-      viewStatus = failReason;
+      if (busy) {
+        composerError = '';
+        viewStatus = 'Session is already processing in background.';
+        startBackgroundMonitor(session.id);
+      } else {
+        composerError = aborted ? '' : failReason;
+        viewStatus = aborted ? (stopRequested ? 'Stopped.' : 'Streaming canceled.') : failReason;
+      }
       streamingPending = false;
     } finally {
       sending = false;
+      streamAbortController = null;
       if (streamingPending) streamingPending = false;
+      if (!stopRequested) {
+        startBackgroundMonitor(session.id);
+      } else {
+        backgroundProcessing = false;
+      }
+      stopRequested = false;
+    }
+  }
+
+  async function cancelStreaming() {
+    if (!sending) return;
+    stopRequested = true;
+    viewStatus = 'Stopping...';
+    const session = activeSession();
+    if (session?.id) {
+      try {
+        await req('/api/coding/stop', {
+          method: 'POST',
+          body: JSON.stringify({ session_id: session.id })
+        });
+      } catch {
+      }
+    }
+    if (!streamAbortController) return;
+    try {
+      streamAbortController.abort();
+    } catch {
     }
   }
 
@@ -694,6 +1019,7 @@
   function prepareMessageContent(raw) {
     const original = String(raw || '').trim();
     if (!original) return '';
+    if (!enableSkillHintWrap) return original;
     const skillMatches = [...original.matchAll(/\$([a-zA-Z0-9._-]+)/g)];
     if (skillMatches.length === 0) return original;
     const skills = [...new Set(skillMatches.map((match) => String(match[1] || '').trim()).filter(Boolean))];
@@ -701,8 +1027,8 @@
     return `Skill hints requested: ${skills.join(', ')}.\n\nUser request (unaltered):\n${original}`;
   }
 
-  function parseSSEFrames(buffer, onFrame) {
-    let rest = String(buffer || '');
+  function parseSSEFrames(buffer, onFrame, flush = false) {
+    let rest = String(buffer || '').replace(/\r\n/g, '\n');
     let boundary = rest.indexOf('\n\n');
     while (boundary !== -1) {
       const rawFrame = rest.slice(0, boundary);
@@ -715,10 +1041,28 @@
       if (dataLines.length > 0) onFrame(dataLines.join('\n'));
       boundary = rest.indexOf('\n\n');
     }
+    if (flush) {
+      const lines = rest.split('\n');
+      const dataLines = lines
+        .map((line) => String(line || ''))
+        .filter((line) => line.startsWith('data:'))
+        .map((line) => line.slice(5).trimStart());
+      if (dataLines.length > 0) onFrame(dataLines.join('\n'));
+      return '';
+    }
     return rest;
   }
 
   onMount(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const persisted = String(localStorage.getItem(viewModeStorageKey) || '').trim().toLowerCase();
+        if (persisted === 'raw' || persisted === 'compact') {
+          logViewMode = persisted;
+        }
+      } catch {
+      }
+    }
     ensureSessionOnFirstOpen().catch((error) => {
       viewStatus = String(error?.message || 'Failed to initialize coding sessions.');
     });
@@ -747,6 +1091,14 @@
       clearInterval(codexIdentityTimer);
       codexIdentityTimer = null;
     }
+    stopBackgroundMonitor();
+    if (streamAbortController) {
+      try {
+        streamAbortController.abort();
+      } catch {
+      }
+      streamAbortController = null;
+    }
   });
 </script>
 
@@ -768,6 +1120,14 @@
           <option value={model}>{model}</option>
         {/each}
       </select>
+      <div class="coding-view-mode-toggle" role="group" aria-label="coding output mode">
+        <button class="btn btn-secondary {logViewMode === 'compact' ? 'is-active' : ''}" type="button" onclick={() => setLogViewMode('compact')}>
+          Compact
+        </button>
+        <button class="btn btn-secondary {logViewMode === 'raw' ? 'is-active' : ''}" type="button" onclick={() => setLogViewMode('raw')}>
+          Raw CLI
+        </button>
+      </div>
       <button class="btn btn-secondary" onclick={openNewSessionModal} disabled={loadingSessions || sending}>
         New Session
       </button>
@@ -785,40 +1145,47 @@
         <div class="coding-messages" bind:this={messagesViewport}>
           {#if loadingMessages}
             <p class="empty-note">Loading messages...</p>
-          {:else if messages.length === 0}
-            <p class="empty-note">Start by sending a coding instruction.</p>
           {:else}
-            {#each messages as message (message.id)}
-              <article class="coding-message {messageRoleClass(message)} {message.pending ? 'pending' : ''} {message.failed ? 'failed' : ''}">
-                <div class="coding-message-head">
-                  <strong>
-                    {#if message.role === 'assistant'}
-                      {assistantDisplayName()}
-                    {:else if message.role === 'activity'}
-                      Activity
-                    {:else}
-                      You
-                    {/if}
-                  </strong>
-                  <span>
-                    {#if message.failed}
-                      Failed to send
-                    {:else if !message.pending}
-                      {formatWhen(message.created_at)}
-                    {/if}
-                  </span>
-                </div>
-                <pre>{isMessageExpanded(message.id) ? (message.content || '-') : messagePreviewContent(message.content || '-')}</pre>
-                {#if shouldCollapseContent(message.content || '')}
-                  <button class="btn btn-secondary btn-small coding-show-more" type="button" onclick={() => toggleMessageExpanded(message.id)}>
-                    {isMessageExpanded(message.id) ? 'Show less' : 'Show more'}
-                  </button>
-                {/if}
-                {#if message.pending && message.role === 'assistant' && !String(message.content || '').trim()}
-                  <p class="coding-message-status">Coding...</p>
-                {/if}
-              </article>
-            {/each}
+            {@const renderedMessages = renderedMessagesForView()}
+            {#if renderedMessages.length === 0}
+              <p class="empty-note">Start by sending a coding instruction.</p>
+            {:else}
+              {#each renderedMessages as message (message.id)}
+                <article class="coding-message {messageRoleClass(message)} {message.pending ? 'pending' : ''} {message.failed ? 'failed' : ''}">
+                  <div class="coding-message-head">
+                    <strong>
+                      {#if message.role === 'assistant'}
+                        {assistantDisplayName()}
+                      {:else if message.role === 'activity'}
+                        Activity
+                      {:else if message.role === 'event'}
+                        CLI Event
+                      {:else if message.role === 'stderr'}
+                        CLI stderr
+                      {:else}
+                        You
+                      {/if}
+                    </strong>
+                    <span>
+                      {#if message.failed}
+                        Failed to send
+                      {:else if !message.pending}
+                        {formatWhen(message.created_at)}
+                      {/if}
+                    </span>
+                  </div>
+                  <pre>{isMessageExpanded(message.id) ? (messageDisplayContent(message) || '-') : messagePreviewContent(messageDisplayContent(message) || '-')}</pre>
+                  {#if shouldCollapseContent(messageDisplayContent(message) || '')}
+                    <button class="btn btn-secondary btn-small coding-show-more" type="button" onclick={() => toggleMessageExpanded(message.id)}>
+                      {isMessageExpanded(message.id) ? 'Show less' : 'Show more'}
+                    </button>
+                  {/if}
+                  {#if message.pending && message.role === 'assistant' && !String(message.content || '').trim()}
+                    <p class="coding-message-status">Coding...</p>
+                  {/if}
+                </article>
+              {/each}
+            {/if}
           {/if}
           {#if sending && streamingPending}
             <div class="coding-streaming-note" role="status" aria-live="polite">
@@ -826,6 +1193,12 @@
               <span class="streaming-label">Streaming</span>
               <span class="streaming-dots" aria-hidden="true"></span>
               <span class="streaming-bar" aria-hidden="true"><i></i></span>
+            </div>
+          {/if}
+          {#if backgroundProcessing && !sending}
+            <div class="coding-streaming-note" role="status" aria-live="polite">
+              <span class="streaming-pulse" aria-hidden="true"></span>
+              <span class="streaming-label">Processing in background</span>
             </div>
           {/if}
         </div>
@@ -839,23 +1212,27 @@
             oninput={() => {
               if (composerError) composerError = '';
             }}
-            disabled={sending}
+            disabled={sending || backgroundProcessing}
           ></textarea>
           {#if composerError}
             <p class="coding-composer-error">Failed to send: {composerError}</p>
           {/if}
           <div class="inline-actions coding-composer-actions">
-            <button class="btn btn-secondary" onclick={openSkillModal} disabled={sending}>Insert Skill</button>
+            <button class="btn btn-secondary" onclick={openSkillModal} disabled={sending || backgroundProcessing}>Insert Skill</button>
             <button
               class="btn btn-secondary sandbox-mode-btn {selectedSandboxMode === 'full-access' ? 'mode-full' : 'mode-write'}"
               type="button"
               onclick={toggleSandboxMode}
-              disabled={sending}
+              disabled={sending || backgroundProcessing}
             >
               {selectedSandboxMode === 'full-access' ? 'Full Access' : 'Write'}
             </button>
-            <button class="btn btn-primary btn-send" onclick={sendMessage} disabled={sending || !draftMessage.trim()}>
-              <span>{sending ? 'Sending...' : 'Send'}</span>
+            <button
+              class="btn {sending ? 'btn-danger' : 'btn-primary'} btn-send"
+              onclick={sending ? cancelStreaming : sendMessage}
+              disabled={(!sending && backgroundProcessing) || (!sending && !draftMessage.trim())}
+            >
+              <span>{sending ? 'Stop' : (backgroundProcessing ? 'Processing...' : 'Send')}</span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12l18-9-6 9 6 9-18-9z"></path></svg>
             </button>
           </div>

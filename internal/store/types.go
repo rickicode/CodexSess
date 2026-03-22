@@ -2,6 +2,19 @@ package store
 
 import "time"
 
+const (
+	SettingLegacyAPIKey      = "api_key"
+	SettingAPIKey            = "codexsess_api_key"
+	SettingAPIMode           = "api_mode"
+	SettingDirectAPIStrategy = "direct_api_strategy"
+	SettingCodingCLIStrategy = "coding_cli_strategy"
+	SettingZoAPIStrategy     = "zo_api_strategy"
+	SettingModelMappings     = "model_mappings"
+	SettingAdminPasswordHash = "admin_password_hash"
+	SettingCodexHome         = "codex_home"
+	SettingUsageCursor       = "usage_scheduler_cursor"
+)
+
 type Account struct {
 	ID             string
 	Email          string
@@ -13,10 +26,24 @@ type Account struct {
 	TokenAccess    string
 	TokenRefresh   string
 	CodexHome      string
+	ActiveAPI      bool
+	ActiveCLI      bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	LastUsedAt     time.Time
 	Active         bool
+	UsageHourlyPct       int
+	UsageWeeklyPct       int
+	UsageHourlyResetAt   *time.Time
+	UsageWeeklyResetAt   *time.Time
+	UsageRawJSON         string
+	UsageFetchedAt       time.Time
+	UsageLastError       string
+	UsageWindowPrimary   string
+	UsageWindowSecondary string
+	UsageLastCheckedAt   *time.Time
+	UsageNextCheckAt     *time.Time
+	UsageFailCount       int
 }
 
 type UsageSnapshot struct {
@@ -63,4 +90,28 @@ type CodingMessage struct {
 	InputTokens  int
 	OutputTokens int
 	CreatedAt    time.Time
+}
+
+type ZoAPIKey struct {
+	ID                    string
+	Name                  string
+	Token                 string
+	Active                bool
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	LastUsedAt            time.Time
+	ConversationID        string
+	ConversationUpdatedAt *time.Time
+}
+
+type ZoAPIKeyUsage struct {
+	KeyID         string
+	TotalRequests int
+	LastRequestAt *time.Time
+	LastResetAt   *time.Time
+}
+
+type ZoAPIKeyWithUsage struct {
+	Key   ZoAPIKey
+	Usage ZoAPIKeyUsage
 }

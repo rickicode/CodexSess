@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := Default()
@@ -13,29 +18,40 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MasterKeyPath == "" {
 		t.Fatal("MasterKeyPath empty")
 	}
+	if cfg.SystemLogMaxRows <= 0 {
+		t.Fatalf("SystemLogMaxRows unexpected: %d", cfg.SystemLogMaxRows)
+	}
 }
 
-func TestResolveBindAddr_DefaultIsAllInterfaces(t *testing.T) {
+func TestResolveBindAddr_DefaultIsLocalhost(t *testing.T) {
 	t.Setenv("PORT", "")
-	t.Setenv("CODEXSESS_BIND_ADDR", "")
-	if got := resolveBindAddr(); got != "0.0.0.0:3061" {
+	t.Setenv("CODEXSESS_PUBLIC", "")
+	if got := resolveBindAddr(); got != "127.0.0.1:3061" {
 		t.Fatalf("unexpected default bind addr: %q", got)
 	}
 }
 
 func TestResolveBindAddr_UsesPortEnv(t *testing.T) {
 	t.Setenv("PORT", "4021")
-	t.Setenv("CODEXSESS_BIND_ADDR", "")
-	if got := resolveBindAddr(); got != "0.0.0.0:4021" {
+	t.Setenv("CODEXSESS_PUBLIC", "")
+	if got := resolveBindAddr(); got != "127.0.0.1:4021" {
 		t.Fatalf("unexpected bind addr with PORT: %q", got)
 	}
 }
 
-func TestResolveBindAddr_UsesExplicitBindAddr(t *testing.T) {
+func TestResolveBindAddr_PublicEnabled(t *testing.T) {
 	t.Setenv("PORT", "3061")
-	t.Setenv("CODEXSESS_BIND_ADDR", "127.0.0.1:9090")
-	if got := resolveBindAddr(); got != "127.0.0.1:9090" {
-		t.Fatalf("unexpected explicit bind addr: %q", got)
+	t.Setenv("CODEXSESS_PUBLIC", "true")
+	if got := resolveBindAddr(); got != "0.0.0.0:3061" {
+		t.Fatalf("unexpected public bind addr: %q", got)
+	}
+}
+
+func TestResolveBindAddr_PublicEnvInvalidFallsBackToLocalhost(t *testing.T) {
+	t.Setenv("PORT", "3061")
+	t.Setenv("CODEXSESS_PUBLIC", "invalid")
+	if got := resolveBindAddr(); got != "127.0.0.1:3061" {
+		t.Fatalf("unexpected fallback bind addr: %q", got)
 	}
 }
 
@@ -57,5 +73,88 @@ func TestResolveCodexBin_EnvOverride(t *testing.T) {
 	t.Setenv("CODEXSESS_CODEX_BIN", "/opt/codex/bin/codex")
 	if got := resolveCodexBin("codex"); got != "/opt/codex/bin/codex" {
 		t.Fatalf("unexpected codex bin from env override: %q", got)
+	}
+}
+
+func TestNormalizeCodingCLIStrategy(t *testing.T) {
+	if got := NormalizeCodingCLIStrategy("round_robin"); got != "round_robin" {
+		t.Fatalf("expected round_robin, got %q", got)
+	}
+	if got := NormalizeCodingCLIStrategy("manual"); got != "manual" {
+		t.Fatalf("expected manual, got %q", got)
+	}
+	if got := NormalizeCodingCLIStrategy("unknown"); got != "manual" {
+		t.Fatalf("expected manual default, got %q", got)
+	}
+}
+
+func TestLoadOrInit_RepairsEmptyPathFields(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PORT", "")
+	t.Setenv("CODEXSESS_PUBLIC", "")
+	t.Setenv("CODEXSESS_CODEX_BIN", "")
+
+	cfgDir := filepath.Join(home, ".codexsess")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatalf("mkdir cfg dir: %v", err)
+	}
+	raw := "" +
+		"data_dir: \"\"\n" +
+		"master_key_path: \"\"\n" +
+		"auth_store_dir: \"\"\n" +
+		"codex_home: /home/test/.codex\n" +
+		"codex_bin: codex\n" +
+		"codexsess_api_key: sk-test\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadOrInit()
+	if err != nil {
+		t.Fatalf("LoadOrInit error: %v", err)
+	}
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		t.Fatal("expected DataDir to be repaired")
+	}
+	if strings.TrimSpace(cfg.MasterKeyPath) == "" {
+		t.Fatal("expected MasterKeyPath to be repaired")
+	}
+	if strings.TrimSpace(cfg.AuthStoreDir) == "" {
+		t.Fatal("expected AuthStoreDir to be repaired")
+	}
+}
+
+func TestLoadOrInit_BackfillsMissingBooleanDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PORT", "")
+	t.Setenv("CODEXSESS_PUBLIC", "")
+	t.Setenv("CODEXSESS_CODEX_BIN", "")
+
+	cfgDir := filepath.Join(home, ".codexsess")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatalf("mkdir cfg dir: %v", err)
+	}
+	raw := "" +
+		"data_dir: " + filepath.Join(home, ".codexsess") + "\n" +
+		"master_key_path: " + filepath.Join(home, ".codexsess", "master.key") + "\n" +
+		"auth_store_dir: " + filepath.Join(home, ".codexsess", "auth-accounts") + "\n" +
+		"codex_home: /home/test/.codex\n" +
+		"codex_bin: codex\n" +
+		"codexsess_api_key: sk-test\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.yaml"), []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadOrInit()
+	if err != nil {
+		t.Fatalf("LoadOrInit error: %v", err)
+	}
+	if !cfg.UsageSchedulerEnabled {
+		t.Fatal("expected UsageSchedulerEnabled to backfill to true default when key missing")
+	}
+	if !cfg.DirectAPIInjectPrompt {
+		t.Fatal("expected DirectAPIInjectPrompt to backfill to true default when key missing")
 	}
 }

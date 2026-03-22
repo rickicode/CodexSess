@@ -26,10 +26,17 @@ type ChatResult struct {
 	ThreadID     string
 	InputTokens  int
 	OutputTokens int
+	ToolCalls    []ToolCall
 }
 
 type CodexExec struct {
 	Binary string
+}
+
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
 }
 
 type ExecOptions struct {
@@ -53,7 +60,7 @@ func NewCodexExec(binary string) *CodexExec {
 func (c *CodexExec) Chat(ctx context.Context, codexHome string, model string, prompt string) (ChatResult, error) {
 	return c.ChatWithOptions(ctx, ExecOptions{
 		CodexHome:   codexHome,
-		WorkDir:     codexHome,
+		WorkDir:     defaultExecWorkDir(codexHome),
 		Model:       model,
 		Prompt:      prompt,
 		Persist:     false,
@@ -70,6 +77,9 @@ func (c *CodexExec) ChatWithOptions(ctx context.Context, opts ExecOptions) (Chat
 	cmd := exec.CommandContext(ctx, c.Binary, c.buildExecArgs(opts, clean)...)
 	if dir := firstNonEmpty(workDir, codexHome); dir != "" {
 		cmd.Dir = dir
+	}
+	if prompt := strings.TrimSpace(opts.Prompt); prompt != "" {
+		cmd.Stdin = strings.NewReader(opts.Prompt)
 	}
 	cmd.Env = c.buildExecEnv(cmd.Environ(), codexHome, clean)
 	stdout, err := cmd.StdoutPipe()
@@ -88,6 +98,8 @@ func (c *CodexExec) ChatWithOptions(ctx context.Context, opts ExecOptions) (Chat
 	var out ChatResult
 	var lastExecErr string
 	assistantMessages := make([]string, 0, 4)
+	toolCalls := make([]ToolCall, 0, 4)
+	seenToolCalls := map[string]struct{}{}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	for sc.Scan() {
@@ -113,6 +125,7 @@ func (c *CodexExec) ChatWithOptions(ctx context.Context, opts ExecOptions) (Chat
 				}
 			}
 		}
+		appendUniqueToolCalls(&toolCalls, seenToolCalls, codexEventToolCalls(evt))
 		if t == "turn.completed" {
 			usage, _ := evt["usage"].(map[string]any)
 			out.InputTokens = int(number(usage["input_tokens"]))
@@ -136,7 +149,10 @@ func (c *CodexExec) ChatWithOptions(ctx context.Context, opts ExecOptions) (Chat
 		out.Messages = assistantMessages
 		out.Text = strings.Join(assistantMessages, "\n\n")
 	}
-	if strings.TrimSpace(out.Text) == "" {
+	if len(toolCalls) > 0 {
+		out.ToolCalls = toolCalls
+	}
+	if strings.TrimSpace(out.Text) == "" && len(out.ToolCalls) == 0 {
 		return ChatResult{}, errors.New("empty response from codex")
 	}
 	return out, nil
@@ -145,7 +161,7 @@ func (c *CodexExec) ChatWithOptions(ctx context.Context, opts ExecOptions) (Chat
 func (c *CodexExec) StreamChat(ctx context.Context, codexHome string, model string, prompt string, onEvent func(ChatEvent) error) (ChatResult, error) {
 	return c.StreamChatWithOptions(ctx, ExecOptions{
 		CodexHome:   codexHome,
-		WorkDir:     codexHome,
+		WorkDir:     defaultExecWorkDir(codexHome),
 		Model:       model,
 		Prompt:      prompt,
 		Persist:     false,
@@ -163,6 +179,9 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 	if dir := firstNonEmpty(workDir, codexHome); dir != "" {
 		cmd.Dir = dir
 	}
+	if prompt := strings.TrimSpace(opts.Prompt); prompt != "" {
+		cmd.Stdin = strings.NewReader(opts.Prompt)
+	}
 	cmd.Env = c.buildExecEnv(cmd.Environ(), codexHome, clean)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -175,16 +194,35 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 	if err := cmd.Start(); err != nil {
 		return ChatResult{}, err
 	}
-	stderrBuf, stderrDone := drainPipe(stderr)
+	stderrBuf, stderrDone := drainPipeWithLine(stderr, func(line string) {
+		if onEvent == nil {
+			return
+		}
+		if strings.TrimSpace(line) == "" {
+			return
+		}
+		_ = onEvent(ChatEvent{Type: "stderr", Text: sanitizeSensitiveText(line)})
+	})
 
 	var out ChatResult
 	var lastExecErr string
 	var emittedDelta bool
 	assistantMessages := make([]string, 0, 4)
+	toolCalls := make([]ToolCall, 0, 4)
+	seenToolCalls := map[string]struct{}{}
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
 	for sc.Scan() {
 		line := sc.Bytes()
+		rawLine := strings.TrimSpace(string(line))
+		if rawLine != "" {
+			if err := onEvent(ChatEvent{Type: "raw_event", Text: sanitizeSensitiveText(rawLine)}); err != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+				<-stderrDone
+				return ChatResult{}, err
+			}
+		}
 		var evt map[string]any
 		if err := json.Unmarshal(line, &evt); err != nil {
 			continue
@@ -198,7 +236,7 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 			}
 		}
 		if activity, ok := codexEventActivityText(evt); ok {
-			if err := onEvent(ChatEvent{Type: "activity", Text: activity}); err != nil {
+			if err := onEvent(ChatEvent{Type: "activity", Text: sanitizeSensitiveText(activity)}); err != nil {
 				_ = cmd.Process.Kill()
 				_ = cmd.Wait()
 				<-stderrDone
@@ -230,6 +268,7 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 				}
 			}
 		}
+		appendUniqueToolCalls(&toolCalls, seenToolCalls, codexEventToolCalls(evt))
 		if t == "turn.completed" {
 			usage, _ := evt["usage"].(map[string]any)
 			out.InputTokens = int(number(usage["input_tokens"]))
@@ -253,10 +292,13 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 		out.Messages = assistantMessages
 		out.Text = strings.Join(assistantMessages, "\n\n")
 	}
-	if strings.TrimSpace(out.Text) == "" {
+	if len(toolCalls) > 0 {
+		out.ToolCalls = toolCalls
+	}
+	if strings.TrimSpace(out.Text) == "" && len(out.ToolCalls) == 0 {
 		return ChatResult{}, errors.New("empty response from codex")
 	}
-	if !emittedDelta {
+	if !emittedDelta && strings.TrimSpace(out.Text) != "" {
 		if err := onEvent(ChatEvent{Type: "delta", Text: out.Text}); err != nil {
 			return ChatResult{}, err
 		}
@@ -300,9 +342,23 @@ func codexEventActivityText(evt map[string]any) (string, bool) {
 	if item != nil {
 		itemType, _ = item["type"].(string)
 		itemType = strings.TrimSpace(strings.ToLower(itemType))
-		if itemType != "" && itemType != "command_execution" && itemType != "tool_call" && itemType != "exec_command" {
+		if itemType != "" &&
+			itemType != "command_execution" &&
+			itemType != "tool_call" &&
+			itemType != "exec_command" &&
+			itemType != "collab_tool_call" {
 			return "", false
 		}
+	}
+	toolName := strings.ToLower(strings.TrimSpace(extractSubagentToolName(item)))
+	if toolName == "wait" && itemType != "collab_tool_call" {
+		toolName = ""
+	}
+	if isSubagentToolName(toolName) {
+		if text := formatSubagentActivityText(toolName, t, item); text != "" {
+			return text, true
+		}
+		return "", false
 	}
 
 	cmd := extractActivityCommand(item)
@@ -342,6 +398,226 @@ func codexEventActivityText(evt map[string]any) (string, bool) {
 	}
 }
 
+func isSubagentToolName(name string) bool {
+	switch strings.TrimSpace(strings.ToLower(name)) {
+	case "spawn_agent", "wait_agent", "wait", "send_input", "resume_agent", "close_agent":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractSubagentToolName(item map[string]any) string {
+	if item == nil {
+		return ""
+	}
+	if v, _ := item["tool"].(string); strings.TrimSpace(v) != "" {
+		return strings.TrimSpace(v)
+	}
+	return strings.TrimSpace(extractToolName(item))
+}
+
+func formatSubagentActivityText(toolName, eventType string, item map[string]any) string {
+	args := extractToolArgumentMap(item)
+	isCompleted := eventType == "item.completed" || eventType == "tool.completed" || eventType == "tool.call.completed"
+	isStarted := eventType == "item.started" || eventType == "item.updated" || eventType == "tool.started" || eventType == "tool.call.started"
+
+	switch toolName {
+	case "spawn_agent":
+		// Show spawn card once on completion to avoid started/completed duplication.
+		if !isCompleted {
+			return ""
+		}
+		nickname := firstStringFromMap(args, "nickname", "name")
+		role := firstStringFromMap(args, "agent_type")
+		task := firstStringFromMap(args, "message", "prompt")
+		if task == "" {
+			task = firstStringFromMap(item, "prompt")
+		}
+		header := "• Spawned subagent"
+		if nickname != "" {
+			header = "• Spawned " + nickname
+		}
+		if role != "" {
+			header += " [" + role + "]"
+		}
+		details := make([]string, 0, 2)
+		if nickname == "" {
+			ids := extractStringSliceFromAny(item["receiver_thread_ids"])
+			if len(ids) > 0 {
+				details = append(details, truncateActivityText(ids[0]))
+			}
+		}
+		if task != "" {
+			details = append(details, truncateActivityText(task))
+		}
+		if len(details) == 0 {
+			if summary := extractSubagentActivitySummary(item); summary != "" {
+				details = append(details, truncateActivityText(summary))
+			}
+		}
+		if len(details) > 0 {
+			return header + "\n  └ " + strings.Join(details, "\n    ")
+		}
+		return header
+	case "wait_agent", "wait":
+		if isStarted {
+			ids := extractStringSliceFromAny(args["ids"])
+			if len(ids) == 0 {
+				ids = extractStringSliceFromAny(item["receiver_thread_ids"])
+			}
+			if len(ids) > 0 {
+				return fmt.Sprintf("• Waiting for %d agents\n  └ %s", len(ids), truncateActivityText(strings.Join(ids, ", ")))
+			}
+			return "• Waiting for agents"
+		}
+		if isCompleted {
+			if summary := extractSubagentActivitySummary(item); summary != "" {
+				return "• Subagent wait completed\n  └ " + truncateActivityText(summary)
+			}
+			return "• Subagent wait completed"
+		}
+	case "send_input":
+		if isCompleted {
+			target := firstStringFromMap(args, "id")
+			if target != "" {
+				return "• Sent input to subagent\n  └ " + truncateActivityText(target)
+			}
+			return "• Sent input to subagent"
+		}
+	case "resume_agent":
+		if isCompleted {
+			target := firstStringFromMap(args, "id")
+			if target != "" {
+				return "• Resumed subagent\n  └ " + truncateActivityText(target)
+			}
+			return "• Resumed subagent"
+		}
+	case "close_agent":
+		if isCompleted {
+			target := firstStringFromMap(args, "id")
+			if target != "" {
+				return "• Closed subagent\n  └ " + truncateActivityText(target)
+			}
+			return "• Closed subagent"
+		}
+	}
+	return ""
+}
+
+func extractToolArgumentMap(item map[string]any) map[string]any {
+	if item == nil {
+		return map[string]any{}
+	}
+	if itemType, _ := item["type"].(string); strings.EqualFold(strings.TrimSpace(itemType), "collab_tool_call") {
+		out := map[string]any{}
+		if prompt, _ := item["prompt"].(string); strings.TrimSpace(prompt) != "" {
+			out["prompt"] = strings.TrimSpace(prompt)
+		}
+		if ids := extractStringSliceFromAny(item["receiver_thread_ids"]); len(ids) > 0 {
+			raw := make([]any, 0, len(ids))
+			for _, id := range ids {
+				raw = append(raw, id)
+			}
+			out["ids"] = raw
+		}
+		return out
+	}
+	raw := extractToolArguments(item)
+	switch t := raw.(type) {
+	case map[string]any:
+		return t
+	case string:
+		trimmed := strings.TrimSpace(t)
+		if trimmed == "" {
+			return map[string]any{}
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil && parsed != nil {
+			return parsed
+		}
+	}
+	return map[string]any{}
+}
+
+func extractStringSliceFromAny(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s := strings.TrimSpace(asString(item)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func extractSubagentActivitySummary(item map[string]any) string {
+	if item == nil {
+		return ""
+	}
+	for _, key := range []string{"output_text", "text"} {
+		if v, _ := item[key].(string); strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	for _, key := range []string{"output", "result", "response", "agents_states"} {
+		if text := extractSummaryFromAny(item[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func extractSummaryFromAny(v any) string {
+	switch t := v.(type) {
+	case string:
+		raw := strings.TrimSpace(t)
+		if raw == "" {
+			return ""
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+			return extractSummaryFromAny(parsed)
+		}
+		return raw
+	case map[string]any:
+		for _, key := range []string{"final_message", "message", "summary", "text", "status", "nickname", "agent_id", "id"} {
+			if s, _ := t[key].(string); strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+		}
+		for _, key := range []string{"result", "output", "data"} {
+			if nested := extractSummaryFromAny(t[key]); nested != "" {
+				return nested
+			}
+		}
+		for _, v := range t {
+			if nested := extractSummaryFromAny(v); nested != "" {
+				return nested
+			}
+		}
+	case []any:
+		for _, item := range t {
+			if nested := extractSummaryFromAny(item); nested != "" {
+				return nested
+			}
+		}
+	}
+	return ""
+}
+
 func extractActivityCommand(src map[string]any) string {
 	if src == nil {
 		return ""
@@ -357,13 +633,18 @@ func extractActivityCommand(src map[string]any) string {
 
 func truncateActivityText(s string) string {
 	v := strings.TrimSpace(s)
-	if len(v) <= 120 {
+	runes := []rune(v)
+	if len(runes) <= 120 {
 		return v
 	}
-	return v[:120] + "..."
+	return string(runes[:120]) + "..."
 }
 
 func drainPipe(rc io.ReadCloser) (*bytes.Buffer, <-chan struct{}) {
+	return drainPipeWithLine(rc, nil)
+}
+
+func drainPipeWithLine(rc io.ReadCloser, onLine func(string)) (*bytes.Buffer, <-chan struct{}) {
 	buf := &bytes.Buffer{}
 	done := make(chan struct{})
 	go func() {
@@ -372,7 +653,25 @@ func drainPipe(rc io.ReadCloser) (*bytes.Buffer, <-chan struct{}) {
 			return
 		}
 		defer rc.Close()
-		_, _ = io.Copy(buf, io.LimitReader(rc, 512*1024))
+		reader := bufio.NewReader(io.LimitReader(rc, 512*1024))
+		for {
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				_, _ = buf.WriteString(line)
+				if onLine != nil {
+					trimmed := strings.TrimSpace(line)
+					if trimmed != "" {
+						onLine(trimmed)
+					}
+				}
+			}
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+				return
+			}
+		}
 	}()
 	return buf, done
 }
@@ -394,6 +693,185 @@ func codexEventErrorMessage(evt map[string]any) string {
 		}
 	}
 	return ""
+}
+
+var (
+	quotedSecretPattern = regexp.MustCompile(`(?i)("(?:(?:access|refresh|id)_token|api[_-]?key|authorization|anthropic_auth_token)"\s*:\s*")([^"]+)(")`)
+	assignedSecretRegex = regexp.MustCompile(`(?i)\b((?:(?:access|refresh|id)_token|api[_-]?key|authorization|anthropic_auth_token)\s*=\s*)(\S+)`)
+	bearerTokenPattern  = regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._\-]+`)
+	skTokenPattern      = regexp.MustCompile(`\bsk-[A-Za-z0-9]{12,}\b`)
+	homePathPattern     = regexp.MustCompile(`/home/[^/\s]+`)
+)
+
+func sanitizeSensitiveText(text string) string {
+	s := strings.TrimSpace(text)
+	if s == "" {
+		return ""
+	}
+	s = quotedSecretPattern.ReplaceAllString(s, `${1}[REDACTED]${3}`)
+	s = assignedSecretRegex.ReplaceAllString(s, `${1}[REDACTED]`)
+	s = bearerTokenPattern.ReplaceAllString(s, `Bearer [REDACTED]`)
+	s = skTokenPattern.ReplaceAllString(s, `sk-[REDACTED]`)
+	s = homePathPattern.ReplaceAllString(s, `/home/[user]`)
+	return s
+}
+
+func appendUniqueToolCalls(dst *[]ToolCall, seen map[string]struct{}, incoming []ToolCall) {
+	if len(incoming) == 0 || dst == nil {
+		return
+	}
+	for _, tc := range incoming {
+		name := strings.TrimSpace(tc.Name)
+		if name == "" {
+			continue
+		}
+		tc.Name = name
+		tc.ID = strings.TrimSpace(tc.ID)
+		tc.Arguments = strings.TrimSpace(tc.Arguments)
+		if tc.Arguments == "" {
+			tc.Arguments = "{}"
+		}
+		key := tc.ID + "|" + tc.Name + "|" + tc.Arguments
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		*dst = append(*dst, tc)
+	}
+}
+
+func codexEventToolCalls(evt map[string]any) []ToolCall {
+	if evt == nil {
+		return nil
+	}
+	eventType := strings.TrimSpace(strings.ToLower(asString(evt["type"])))
+	switch eventType {
+	case "item.completed", "item.updated", "item.added", "response.output_item.done":
+		if item, _ := evt["item"].(map[string]any); item != nil {
+			return extractToolCallsFromAny(item)
+		}
+	case "response.completed":
+		if response, _ := evt["response"].(map[string]any); response != nil {
+			if output, _ := response["output"].([]any); len(output) > 0 {
+				return extractToolCallsFromAny(output)
+			}
+		}
+	}
+	if output, _ := evt["output"].([]any); len(output) > 0 {
+		return extractToolCallsFromAny(output)
+	}
+	if item, _ := evt["item"].(map[string]any); item != nil {
+		return extractToolCallsFromAny(item)
+	}
+	return nil
+}
+
+func extractToolCallsFromAny(v any) []ToolCall {
+	switch t := v.(type) {
+	case []any:
+		out := make([]ToolCall, 0, len(t))
+		for _, raw := range t {
+			out = append(out, extractToolCallsFromAny(raw)...)
+		}
+		return out
+	case map[string]any:
+		if len(t) == 0 {
+			return nil
+		}
+		itemType := strings.TrimSpace(strings.ToLower(asString(t["type"])))
+		if itemType == "" {
+			return nil
+		}
+		if !strings.Contains(itemType, "tool_call") && !strings.Contains(itemType, "function_call") {
+			return nil
+		}
+		name := strings.TrimSpace(extractToolName(t))
+		if name == "" {
+			return nil
+		}
+		id := strings.TrimSpace(firstStringFromMap(t, "call_id", "tool_call_id", "id"))
+		args := normalizeToolCallArguments(extractToolArguments(t))
+		return []ToolCall{{
+			ID:        id,
+			Name:      name,
+			Arguments: args,
+		}}
+	default:
+		return nil
+	}
+}
+
+func extractToolName(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	if fn, _ := m["function"].(map[string]any); fn != nil {
+		if name := strings.TrimSpace(firstStringFromMap(fn, "name", "tool_name")); name != "" {
+			return name
+		}
+	}
+	return strings.TrimSpace(firstStringFromMap(m, "name", "tool_name", "tool"))
+}
+
+func extractToolArguments(m map[string]any) any {
+	if m == nil {
+		return map[string]any{}
+	}
+	if fn, _ := m["function"].(map[string]any); fn != nil {
+		if v, ok := fn["arguments"]; ok {
+			return v
+		}
+		if v, ok := fn["input"]; ok {
+			return v
+		}
+	}
+	for _, key := range []string{"arguments", "input", "params", "payload"} {
+		if v, ok := m[key]; ok {
+			return v
+		}
+	}
+	return map[string]any{}
+}
+
+func normalizeToolCallArguments(v any) string {
+	switch t := v.(type) {
+	case string:
+		raw := strings.TrimSpace(t)
+		if raw == "" {
+			return "{}"
+		}
+		var parsed any
+		if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+			b, _ := json.Marshal(parsed)
+			return string(b)
+		}
+		return raw
+	default:
+		b, err := json.Marshal(t)
+		if err != nil || len(bytes.TrimSpace(b)) == 0 || string(bytes.TrimSpace(b)) == "null" {
+			return "{}"
+		}
+		return string(b)
+	}
+}
+
+func firstStringFromMap(m map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		if v, ok := m[key]; ok {
+			if s := strings.TrimSpace(asString(v)); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func firstNonEmpty(values ...string) string {
@@ -461,7 +939,8 @@ func (c *CodexExec) buildExecArgs(opts ExecOptions, clean bool) []string {
 		}
 	}
 	if prompt != "" {
-		args = append(args, prompt)
+		// Use stdin prompt mode to avoid "argument list too long" when prompt/context is large.
+		args = append(args, "-")
 	}
 	if clean && !opts.Persist {
 		args = append(args, "--ephemeral")
@@ -485,9 +964,9 @@ func normalizeSandboxMode(v string) string {
 	case "full", "full-access", "danger-full-access":
 		return "full-access"
 	case "write", "workspace-write":
-		return "write"
+		return "workspace-write"
 	default:
-		return "full-access"
+		return "workspace-write"
 	}
 }
 
@@ -495,16 +974,25 @@ func resolveSandboxMode() string {
 	if v := strings.TrimSpace(os.Getenv("CODEXSESS_CODEX_SANDBOX")); v != "" {
 		return v
 	}
-	// default should allow BrowserOS/tooling agents to create local sockets/temp files.
 	return "workspace-write"
 }
 
 func resolveCleanExecMode() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("CODEXSESS_CLEAN_EXEC")))
 	if v == "" {
-		return true
+		return false
 	}
 	return v != "0" && v != "false" && v != "no"
+}
+
+func defaultExecWorkDir(codexHome string) string {
+	if v := strings.TrimSpace(os.Getenv("CODEXSESS_CODEX_WORKDIR")); v != "" {
+		return v
+	}
+	if wd, err := os.Getwd(); err == nil && strings.TrimSpace(wd) != "" {
+		return strings.TrimSpace(wd)
+	}
+	return strings.TrimSpace(codexHome)
 }
 
 func (c *CodexExec) buildExecEnv(base []string, codexHome string, clean bool) []string {

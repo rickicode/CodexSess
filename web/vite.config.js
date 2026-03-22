@@ -8,9 +8,13 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 3051,
     strictPort: true,
+    headers: {
+      'Cache-Control': 'no-store'
+    },
     proxy: {
-      '/api': 'http://127.0.0.1:3052',
-      '/auth': 'http://127.0.0.1:3052'
+      '/api/': 'http://127.0.0.1:3052',
+      '/auth/': 'http://127.0.0.1:3052',
+      '/zo/': 'http://127.0.0.1:3052'
     }
   },
   build: {

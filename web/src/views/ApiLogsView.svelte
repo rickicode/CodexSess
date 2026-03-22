@@ -31,6 +31,9 @@
             <p class="log-subline">
               <span>{formatLogTimestamp(entry.timestamp)}</span>
               <span>{entry.latencyMS} ms</span>
+              {#if entry.requestTokens || entry.responseTokens || entry.totalTokens}
+                <span>tok {entry.requestTokens || 0}/{entry.responseTokens || 0}/{entry.totalTokens || 0}</span>
+              {/if}
               {#if entry.model}
                 <span>{entry.model}</span>
               {/if}

@@ -6,8 +6,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +33,14 @@ type Service struct {
 	cliActiveMu       sync.RWMutex
 	cliActiveCachedID string
 	cliActiveCachedAt time.Time
+	codingExecMu      sync.Mutex
+	codingRunMu       sync.Mutex
+	codingRuns        map[string]*codingRunState
+}
+
+type codingRunState struct {
+	startedAt time.Time
+	cancel    context.CancelFunc
 }
 
 type TokenSet struct {
@@ -38,16 +50,84 @@ type TokenSet struct {
 	AccountID    string `json:"account_id,omitempty"`
 }
 
+type AccountBackupEntry struct {
+	ID             string               `json:"id"`
+	Email          string               `json:"email"`
+	Alias          string               `json:"alias"`
+	PlanType       string               `json:"plan_type"`
+	AccountID      string               `json:"account_id"`
+	OrganizationID string               `json:"organization_id"`
+	IDToken        string               `json:"id_token"`
+	AccessToken    string               `json:"access_token"`
+	RefreshToken   string               `json:"refresh_token,omitempty"`
+	ActiveAPI      bool                 `json:"active_api"`
+	ActiveCLI      bool                 `json:"active_cli"`
+	Usage          *store.UsageSnapshot `json:"usage,omitempty"`
+}
+
+type AccountsBackupPayload struct {
+	Version          string               `json:"version"`
+	ExportedAt       time.Time            `json:"exported_at"`
+	ActiveAPIAccount string               `json:"active_api_account_id,omitempty"`
+	ActiveCLIAccount string               `json:"active_cli_account_id,omitempty"`
+	Accounts         []AccountBackupEntry `json:"accounts"`
+}
+
+type RestoreAccountsResult struct {
+	Restored int `json:"restored"`
+	Skipped  int `json:"skipped"`
+}
+
+const accountsBackupVersion = "codexsess.accounts.backup.v1"
+
+type cliSwitchReasonKey struct{}
+type apiSwitchReasonKey struct{}
+
+func WithCLISwitchReason(ctx context.Context, reason string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, cliSwitchReasonKey{}, strings.TrimSpace(reason))
+}
+
+func cliSwitchReason(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(cliSwitchReasonKey{}).(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func WithAPISwitchReason(ctx context.Context, reason string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, apiSwitchReasonKey{}, strings.TrimSpace(reason))
+}
+
+func apiSwitchReason(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(apiSwitchReasonKey{}).(string); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
 func New(cfg config.Config, st *store.Store, cry *icrypto.Crypto) *Service {
 	bin := strings.TrimSpace(cfg.CodexBin)
 	if bin == "" {
 		bin = "codex"
 	}
 	return &Service{
-		Cfg:    cfg,
-		Store:  st,
-		Crypto: cry,
-		Codex:  provider.NewCodexExec(bin),
+		Cfg:        cfg,
+		Store:      st,
+		Crypto:     cry,
+		Codex:      provider.NewCodexExec(bin),
+		codingRuns: make(map[string]*codingRunState),
 	}
 }
 
@@ -93,17 +173,31 @@ func (s *Service) SaveAccountFromTokens(ctx context.Context, t TokenSet, _ strin
 		UpdatedAt:      time.Now().UTC(),
 		LastUsedAt:     time.Now().UTC(),
 		Active:         isFirstAccount,
+		ActiveAPI:      isFirstAccount,
+		ActiveCLI:      isFirstAccount,
 	}
 	if err := s.Store.UpsertAccount(ctx, a); err != nil {
 		return store.Account{}, err
+	}
+	usage, usageErr := s.RefreshUsage(ctx, a.ID)
+	if usageErrorLooksRevoked(usage.LastError) {
+		return store.Account{}, fmt.Errorf("account cannot be added: token revoked")
+	}
+	if usageErr != nil {
+		log.Printf("[usage-check] add account usage check failed for %s: %v", strings.TrimSpace(a.ID), usageErr)
 	}
 	if isFirstAccount {
 		// Bootstrap UX: first account becomes both API and CLI active.
 		if err := s.syncAccountAuthToCodexHome(a); err != nil {
 			return store.Account{}, err
 		}
+		if err := s.Store.SetActiveAccount(ctx, a.ID); err != nil {
+			return store.Account{}, err
+		}
+		if err := s.Store.SetActiveCLIAccount(ctx, a.ID); err != nil {
+			return store.Account{}, err
+		}
 		s.setCLIActiveCache(a.ID)
-		_ = s.writeCLISelectedAccountID(a.ID)
 	}
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
@@ -129,26 +223,61 @@ func (s *Service) UseAccount(ctx context.Context, selector string) (store.Accoun
 }
 
 func (s *Service) UseAccountAPI(ctx context.Context, selector string) (store.Account, error) {
+	prev, _ := s.Store.ActiveAccount(ctx)
 	a, err := s.Store.FindAccountBySelector(ctx, selector)
 	if err != nil {
+		return store.Account{}, err
+	}
+	if err := s.ensureAccountUsableForActivation(ctx, a.ID); err != nil {
 		return store.Account{}, err
 	}
 	if err := s.Store.SetActiveAccount(ctx, a.ID); err != nil {
 		return store.Account{}, err
 	}
+	if prev.ID != "" && prev.ID != a.ID {
+		reason := apiSwitchReason(ctx)
+		if reason == "" {
+			reason = "manual"
+		}
+		s.AddSystemLog(ctx, "account_switch", "API active switched", map[string]any{
+			"from":   prev.ID,
+			"to":     a.ID,
+			"reason": reason,
+			"type":   "api",
+		})
+	}
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
 
 func (s *Service) UseAccountCLI(ctx context.Context, selector string) (store.Account, error) {
+	prevID, _ := s.ActiveCLIAccountID(ctx)
 	a, err := s.Store.FindAccountBySelector(ctx, selector)
 	if err != nil {
+		return store.Account{}, err
+	}
+	if err := s.ensureAccountUsableForActivation(ctx, a.ID); err != nil {
 		return store.Account{}, err
 	}
 	if err := s.syncAccountAuthToCodexHome(a); err != nil {
 		return store.Account{}, err
 	}
+	if err := s.Store.SetActiveCLIAccount(ctx, a.ID); err != nil {
+		return store.Account{}, err
+	}
 	s.setCLIActiveCache(a.ID)
-	_ = s.writeCLISelectedAccountID(a.ID)
+	s.notifyCLISwitch(ctx, prevID, a)
+	if strings.TrimSpace(prevID) != strings.TrimSpace(a.ID) {
+		reason := cliSwitchReason(ctx)
+		if reason == "" {
+			reason = "manual"
+		}
+		s.AddSystemLog(ctx, "account_switch", "CLI active switched", map[string]any{
+			"from":   strings.TrimSpace(prevID),
+			"to":     strings.TrimSpace(a.ID),
+			"reason": reason,
+			"type":   "cli",
+		})
+	}
 	return s.Store.FindAccountBySelector(ctx, a.ID)
 }
 
@@ -157,12 +286,39 @@ func (s *Service) RemoveAccount(ctx context.Context, selector string) error {
 	if err != nil {
 		return err
 	}
+	activeAPI, _ := s.Store.ActiveAccount(ctx)
+	activeCLI, _ := s.Store.ActiveCLIAccount(ctx)
+	wasAPIActive := strings.TrimSpace(activeAPI.ID) == strings.TrimSpace(a.ID)
+	wasCLIActive := strings.TrimSpace(activeCLI.ID) == strings.TrimSpace(a.ID)
+
 	if err := s.Store.DeleteAccount(ctx, a.ID); err != nil {
 		return err
 	}
 	_ = os.RemoveAll(s.accountDir(a.ID))
-	if strings.TrimSpace(s.readCLISelectedAccountID()) == a.ID {
-		_ = s.clearCLISelectedAccountID()
+
+	if !wasAPIActive && !wasCLIActive {
+		return nil
+	}
+
+	remaining, err := s.ListAccounts(ctx)
+	if err != nil || len(remaining) == 0 {
+		return err
+	}
+
+	fallbackID := strings.TrimSpace(remaining[0].ID)
+	if fallbackID == "" {
+		return nil
+	}
+
+	if wasAPIActive {
+		if _, err := s.UseAccountAPI(ctx, fallbackID); err != nil {
+			return err
+		}
+	}
+	if wasCLIActive {
+		if _, err := s.UseAccountCLI(ctx, fallbackID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -214,6 +370,36 @@ func (s *Service) resolveForRequest(ctx context.Context, selector string, syncCL
 		}
 	}
 	return refreshed.account, refreshed.tokens, nil
+}
+
+func (s *Service) ensureAccountUsableForActivation(ctx context.Context, accountID string) error {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return fmt.Errorf("account not found")
+	}
+	stored, storedErr := s.Store.GetUsage(ctx, accountID)
+	if storedErr == nil && usageErrorLooksRevoked(stored.LastError) {
+		return fmt.Errorf("account cannot be activated: token revoked")
+	}
+	usage, refreshErr := s.RefreshUsage(ctx, accountID)
+	if usageErrorLooksRevoked(usage.LastError) {
+		return fmt.Errorf("account cannot be activated: token revoked")
+	}
+	if refreshErr != nil {
+		log.Printf("[usage-check] activation usage check failed for %s: %v", accountID, refreshErr)
+	}
+	return nil
+}
+
+func usageErrorLooksRevoked(raw string) bool {
+	msg := strings.ToLower(strings.TrimSpace(raw))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "token_revoked") || strings.Contains(msg, "invalidated oauth token") {
+		return true
+	}
+	return strings.Contains(msg, "status=401") && strings.Contains(msg, "oauth")
 }
 
 func (s *Service) RefreshUsage(ctx context.Context, selector string) (store.UsageSnapshot, error) {
@@ -276,6 +462,212 @@ func (s *Service) ImportTokenJSON(ctx context.Context, path string, alias string
 		return store.Account{}, fmt.Errorf("invalid token JSON: id_token and access_token required")
 	}
 	return s.SaveAccountFromTokens(ctx, tokens, alias)
+}
+
+func (s *Service) ExportAccountsBackup(ctx context.Context) (AccountsBackupPayload, error) {
+	accounts, err := s.Store.ListAccounts(ctx)
+	if err != nil {
+		return AccountsBackupPayload{}, err
+	}
+	usageMap, _ := s.Store.ListUsageSnapshots(ctx)
+
+	payload := AccountsBackupPayload{
+		Version:    accountsBackupVersion,
+		ExportedAt: time.Now().UTC(),
+		Accounts:   make([]AccountBackupEntry, 0, len(accounts)),
+	}
+
+	for _, account := range accounts {
+		idTokenRaw, err := s.Crypto.Decrypt(account.TokenID)
+		if err != nil {
+			return AccountsBackupPayload{}, err
+		}
+		accessTokenRaw, err := s.Crypto.Decrypt(account.TokenAccess)
+		if err != nil {
+			return AccountsBackupPayload{}, err
+		}
+		refreshTokenRaw, err := s.Crypto.Decrypt(account.TokenRefresh)
+		if err != nil {
+			return AccountsBackupPayload{}, err
+		}
+
+		entry := AccountBackupEntry{
+			ID:             strings.TrimSpace(account.ID),
+			Email:          strings.TrimSpace(account.Email),
+			Alias:          strings.TrimSpace(account.Alias),
+			PlanType:       strings.TrimSpace(account.PlanType),
+			AccountID:      strings.TrimSpace(account.AccountID),
+			OrganizationID: strings.TrimSpace(account.OrganizationID),
+			IDToken:        string(idTokenRaw),
+			AccessToken:    string(accessTokenRaw),
+			RefreshToken:   string(refreshTokenRaw),
+			ActiveAPI:      account.ActiveAPI,
+			ActiveCLI:      account.ActiveCLI,
+		}
+		if entry.ActiveAPI {
+			payload.ActiveAPIAccount = entry.ID
+		}
+		if entry.ActiveCLI {
+			payload.ActiveCLIAccount = entry.ID
+		}
+		if usage, ok := usageMap[account.ID]; ok {
+			u := usage
+			entry.Usage = &u
+		}
+		payload.Accounts = append(payload.Accounts, entry)
+	}
+
+	return payload, nil
+}
+
+func (s *Service) RestoreAccountsBackup(ctx context.Context, payload AccountsBackupPayload) (RestoreAccountsResult, error) {
+	result := RestoreAccountsResult{}
+	if v := strings.TrimSpace(payload.Version); v != "" && v != accountsBackupVersion {
+		return result, fmt.Errorf("unsupported backup version: %s", v)
+	}
+	entries := payload.Accounts
+	if len(entries) == 0 {
+		return result, fmt.Errorf("backup does not contain accounts")
+	}
+
+	var (
+		apiCandidate  string
+		cliCandidate  string
+		firstRestored string
+		now           = time.Now().UTC()
+	)
+	restoredIDs := map[string]struct{}{}
+
+	for idx, entry := range entries {
+		idToken := strings.TrimSpace(entry.IDToken)
+		accessToken := strings.TrimSpace(entry.AccessToken)
+		if idToken == "" || accessToken == "" {
+			result.Skipped++
+			continue
+		}
+
+		accountID := strings.TrimSpace(entry.AccountID)
+		organizationID := strings.TrimSpace(entry.OrganizationID)
+		email := strings.TrimSpace(entry.Email)
+		accountStorage := strings.TrimSpace(entry.ID)
+		if accountStorage == "" {
+			seedAccountID := firstNonEmpty(accountID, fmt.Sprintf("restored-%d", idx+1))
+			accountStorage = accountStorageID(firstNonEmpty(email, seedAccountID), seedAccountID, organizationID)
+		}
+
+		encID, err := s.Crypto.Encrypt([]byte(idToken))
+		if err != nil {
+			return result, err
+		}
+		encAccess, err := s.Crypto.Encrypt([]byte(accessToken))
+		if err != nil {
+			return result, err
+		}
+		encRefresh, err := s.Crypto.Encrypt([]byte(strings.TrimSpace(entry.RefreshToken)))
+		if err != nil {
+			return result, err
+		}
+
+		account := store.Account{
+			ID:             accountStorage,
+			Email:          firstNonEmpty(email, accountStorage),
+			Alias:          firstNonEmpty(strings.TrimSpace(entry.Alias), email, accountStorage),
+			PlanType:       strings.TrimSpace(entry.PlanType),
+			AccountID:      accountID,
+			OrganizationID: organizationID,
+			TokenID:        encID,
+			TokenAccess:    encAccess,
+			TokenRefresh:   encRefresh,
+			CodexHome:      s.Cfg.CodexHome,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			LastUsedAt:     now,
+			Active:         false,
+			ActiveAPI:      false,
+			ActiveCLI:      false,
+		}
+		if err := s.Store.UpsertAccount(ctx, account); err != nil {
+			return result, err
+		}
+		if err := util.WriteAuthJSON(s.accountDir(account.ID), idToken, accessToken, strings.TrimSpace(entry.RefreshToken), accountID); err != nil {
+			return result, err
+		}
+		if entry.Usage != nil {
+			u := *entry.Usage
+			u.AccountID = account.ID
+			if u.FetchedAt.IsZero() {
+				u.FetchedAt = now
+			}
+			_ = s.Store.SaveUsage(ctx, u)
+		}
+
+		if firstRestored == "" {
+			firstRestored = account.ID
+		}
+		restoredIDs[account.ID] = struct{}{}
+		if entry.ActiveAPI {
+			apiCandidate = account.ID
+		}
+		if entry.ActiveCLI {
+			cliCandidate = account.ID
+		}
+		result.Restored++
+	}
+
+	if result.Restored == 0 {
+		return result, fmt.Errorf("no valid accounts restored from backup")
+	}
+
+	pickRestoredCandidate := func(candidate string) string {
+		id := strings.TrimSpace(candidate)
+		if id == "" {
+			return ""
+		}
+		if _, ok := restoredIDs[id]; ok {
+			return id
+		}
+		return ""
+	}
+
+	apiCandidate = pickRestoredCandidate(apiCandidate)
+	if apiCandidate == "" {
+		apiCandidate = pickRestoredCandidate(payload.ActiveAPIAccount)
+	}
+	if apiCandidate == "" {
+		apiCandidate = firstRestored
+	}
+	if strings.TrimSpace(apiCandidate) != "" {
+		_, activateErr := s.UseAccountAPI(ctx, apiCandidate)
+		if activateErr != nil {
+			if apiCandidate != firstRestored {
+				_, activateErr = s.UseAccountAPI(ctx, firstRestored)
+			}
+		}
+		if activateErr != nil {
+			return result, activateErr
+		}
+	}
+
+	cliCandidate = pickRestoredCandidate(cliCandidate)
+	if cliCandidate == "" {
+		cliCandidate = pickRestoredCandidate(payload.ActiveCLIAccount)
+	}
+	if cliCandidate == "" {
+		cliCandidate = firstRestored
+	}
+	if strings.TrimSpace(cliCandidate) != "" {
+		_, activateErr := s.UseAccountCLI(ctx, cliCandidate)
+		if activateErr != nil {
+			if cliCandidate != firstRestored {
+				_, activateErr = s.UseAccountCLI(ctx, firstRestored)
+			}
+		}
+		if activateErr != nil {
+			return result, activateErr
+		}
+	}
+
+	return result, nil
 }
 
 func accountStorageID(email, accountID, orgID string) string {
@@ -371,8 +763,15 @@ func (s *Service) syncAccountAuthToCodexHome(a store.Account) error {
 }
 
 func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
-	selectedID := s.readCLISelectedAccountID()
-	if strings.TrimSpace(selectedID) == "" {
+	selected, err := s.Store.ActiveCLIAccount(ctx)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "account not found") {
+			return "", nil
+		}
+		return "", err
+	}
+	selectedID := strings.TrimSpace(selected.ID)
+	if selectedID == "" {
 		return "", nil
 	}
 
@@ -384,63 +783,62 @@ func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
 	}
 	s.cliActiveMu.RUnlock()
 
-	selected, err := s.Store.FindAccountBySelector(ctx, selectedID)
-	if err != nil {
-		_ = s.clearCLISelectedAccountID()
-		return "", nil
-	}
-
+	needsHeal := false
 	authPath := filepath.Join(s.Cfg.CodexHome, "auth.json")
-	b, err := os.ReadFile(authPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	var f struct {
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
-		AccountID   string `json:"account_id"`
-		Tokens      struct {
+	b, readErr := os.ReadFile(authPath)
+	if readErr != nil {
+		needsHeal = true
+	} else {
+		var f struct {
 			IDToken     string `json:"id_token"`
 			AccessToken string `json:"access_token"`
 			AccountID   string `json:"account_id"`
-		} `json:"tokens"`
-	}
-	if err := json.Unmarshal(b, &f); err != nil {
-		return "", nil
-	}
-	idToken := firstNonEmpty(f.Tokens.IDToken, f.IDToken)
-	accessToken := firstNonEmpty(f.Tokens.AccessToken, f.AccessToken)
-	authAccountID := firstNonEmpty(f.Tokens.AccountID, f.AccountID)
-	if strings.TrimSpace(idToken) == "" || strings.TrimSpace(accessToken) == "" {
-		return "", nil
-	}
-	claims, err := util.ParseClaims(idToken, accessToken)
-	if err != nil {
-		return "", nil
-	}
-	claimAccountID := firstNonEmpty(authAccountID, claims.AccountID)
-
-	accIDTokenRaw, err := s.Crypto.Decrypt(selected.TokenID)
-	if err == nil {
-		accAccessTokenRaw, err2 := s.Crypto.Decrypt(selected.TokenAccess)
-		if err2 == nil && string(accIDTokenRaw) == idToken && string(accAccessTokenRaw) == accessToken {
-			s.setCLIActiveCache(selected.ID)
-			return selected.ID, nil
+			Tokens      struct {
+				IDToken     string `json:"id_token"`
+				AccessToken string `json:"access_token"`
+				AccountID   string `json:"account_id"`
+			} `json:"tokens"`
+		}
+		if err := json.Unmarshal(b, &f); err != nil {
+			needsHeal = true
+		} else {
+			idToken := firstNonEmpty(f.Tokens.IDToken, f.IDToken)
+			accessToken := firstNonEmpty(f.Tokens.AccessToken, f.AccessToken)
+			authAccountID := firstNonEmpty(f.Tokens.AccountID, f.AccountID)
+			if strings.TrimSpace(idToken) == "" || strings.TrimSpace(accessToken) == "" {
+				needsHeal = true
+			} else {
+				matched := false
+				accIDTokenRaw, decErr := s.Crypto.Decrypt(selected.TokenID)
+				if decErr == nil {
+					accAccessTokenRaw, decErr2 := s.Crypto.Decrypt(selected.TokenAccess)
+					if decErr2 == nil && string(accIDTokenRaw) == idToken && string(accAccessTokenRaw) == accessToken {
+						matched = true
+					}
+				}
+				if !matched {
+					claims, claimErr := util.ParseClaims(idToken, accessToken)
+					if claimErr == nil {
+						claimAccountID := firstNonEmpty(authAccountID, claims.AccountID)
+						if claimAccountID != "" && selected.AccountID != "" && selected.AccountID == claimAccountID {
+							matched = true
+						}
+						if claims.Email != "" && strings.EqualFold(selected.Email, claims.Email) {
+							matched = true
+						}
+					}
+				}
+				needsHeal = !matched
+			}
 		}
 	}
-	if claimAccountID != "" && selected.AccountID != "" && selected.AccountID == claimAccountID {
-		s.setCLIActiveCache(selected.ID)
-		return selected.ID, nil
+	if needsHeal {
+		if err := s.syncAccountAuthToCodexHome(selected); err != nil {
+			log.Printf("[cli-auth] active cli auth.json heal failed for %s: %v", selectedID, err)
+		}
 	}
-	if claims.Email != "" && strings.EqualFold(selected.Email, claims.Email) {
-		s.setCLIActiveCache(selected.ID)
-		return selected.ID, nil
-	}
-
-	return "", nil
+	s.setCLIActiveCache(selected.ID)
+	return selected.ID, nil
 }
 
 func (s *Service) setCLIActiveCache(id string) {
@@ -450,29 +848,50 @@ func (s *Service) setCLIActiveCache(id string) {
 	s.cliActiveMu.Unlock()
 }
 
-func (s *Service) cliSelectedAccountPath() string {
-	return filepath.Join(s.Cfg.DataDir, "active_cli_account")
+func (s *Service) notifyCLISwitch(ctx context.Context, fromID string, to store.Account) {
+	cmd := strings.TrimSpace(s.Cfg.CLISwitchNotifyCmd)
+	if cmd == "" {
+		return
+	}
+	fromID = strings.TrimSpace(fromID)
+	toID := strings.TrimSpace(to.ID)
+	if fromID == "" || toID == "" || fromID == toID {
+		return
+	}
+	reason := cliSwitchReason(ctx)
+	if reason == "" {
+		reason = "unknown"
+	}
+	env := []string{
+		"CODEXSESS_CLI_SWITCH_FROM=" + fromID,
+		"CODEXSESS_CLI_SWITCH_TO=" + toID,
+		"CODEXSESS_CLI_SWITCH_REASON=" + reason,
+	}
+	if email := strings.TrimSpace(to.Email); email != "" {
+		env = append(env, "CODEXSESS_CLI_SWITCH_TO_EMAIL="+email)
+	}
+	go func() {
+		runCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		if err := runNotifyCommand(runCtx, cmd, env); err != nil {
+			log.Printf("[notify] cli switch command failed: %v", err)
+		}
+	}()
 }
 
-func (s *Service) writeCLISelectedAccountID(id string) error {
-	path := s.cliSelectedAccountPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+func runNotifyCommand(ctx context.Context, command string, extraEnv []string) error {
+	cmdLine := strings.TrimSpace(command)
+	if cmdLine == "" {
+		return nil
 	}
-	return os.WriteFile(path, []byte(strings.TrimSpace(id)), 0o600)
-}
-
-func (s *Service) readCLISelectedAccountID() string {
-	b, err := os.ReadFile(s.cliSelectedAccountPath())
-	if err != nil {
-		return ""
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.CommandContext(ctx, "cmd", "/C", cmdLine)
+	} else {
+		cmd = exec.CommandContext(ctx, "sh", "-c", cmdLine)
 	}
-	return strings.TrimSpace(string(b))
-}
-
-func (s *Service) clearCLISelectedAccountID() error {
-	if err := os.Remove(s.cliSelectedAccountPath()); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run()
 }

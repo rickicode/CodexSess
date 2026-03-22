@@ -10,23 +10,26 @@ import (
 )
 
 type Entry struct {
-	Timestamp    time.Time `json:"timestamp"`
-	Protocol     string    `json:"protocol"`
-	Method       string    `json:"method"`
-	Path         string    `json:"path"`
-	Status       int       `json:"status"`
-	LatencyMS    int64     `json:"latency_ms"`
-	RemoteAddr   string    `json:"remote_addr"`
-	UserAgent    string    `json:"user_agent,omitempty"`
-	AccountHint  string    `json:"account_hint,omitempty"`
-	AccountID    string    `json:"account_id,omitempty"`
-	AccountEmail string    `json:"account_email,omitempty"`
-	Model        string    `json:"model,omitempty"`
-	Stream       bool      `json:"stream,omitempty"`
-	RequestBody  string    `json:"request_body,omitempty"`
-	ResponseBody string    `json:"response_body,omitempty"`
-	RequestTruncated  bool `json:"request_truncated,omitempty"`
-	ResponseTruncated bool `json:"response_truncated,omitempty"`
+	Timestamp         time.Time `json:"timestamp"`
+	Protocol          string    `json:"protocol"`
+	Method            string    `json:"method"`
+	Path              string    `json:"path"`
+	Status            int       `json:"status"`
+	LatencyMS         int64     `json:"latency_ms"`
+	RemoteAddr        string    `json:"remote_addr"`
+	UserAgent         string    `json:"user_agent,omitempty"`
+	AccountHint       string    `json:"account_hint,omitempty"`
+	AccountID         string    `json:"account_id,omitempty"`
+	AccountEmail      string    `json:"account_email,omitempty"`
+	Model             string    `json:"model,omitempty"`
+	Stream            bool      `json:"stream,omitempty"`
+	RequestBody       string    `json:"request_body,omitempty"`
+	ResponseBody      string    `json:"response_body,omitempty"`
+	RequestTokens     int       `json:"request_tokens,omitempty"`
+	ResponseTokens    int       `json:"response_tokens,omitempty"`
+	TotalTokens       int       `json:"total_tokens,omitempty"`
+	RequestTruncated  bool      `json:"request_truncated,omitempty"`
+	ResponseTruncated bool      `json:"response_truncated,omitempty"`
 }
 
 type Logger struct {
@@ -34,6 +37,8 @@ type Logger struct {
 	maxBytes int64
 	mu       sync.Mutex
 }
+
+const maxTrafficLogLines = 50
 
 func New(path string, maxBytes int64) (*Logger, error) {
 	if maxBytes <= 0 {
@@ -76,8 +81,10 @@ func (l *Logger) Append(entry Entry) error {
 		return err
 	}
 	defer f.Close()
-	_, err = f.Write(line)
-	return err
+	if _, err = f.Write(line); err != nil {
+		return err
+	}
+	return l.trimToMaxLines(maxTrafficLogLines)
 }
 
 func (l *Logger) ReadTail(maxLines int) ([]string, error) {
@@ -107,4 +114,38 @@ func (l *Logger) ReadTail(maxLines int) ([]string, error) {
 		out[i], out[j] = out[j], out[i]
 	}
 	return out, nil
+}
+
+func (l *Logger) Clear() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return os.WriteFile(l.path, []byte{}, 0o600)
+}
+
+func (l *Logger) trimToMaxLines(maxLines int) error {
+	if maxLines <= 0 {
+		return nil
+	}
+	b, err := os.ReadFile(l.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(b), "\r\n", "\n"), "\n")
+	trimmed := make([]string, 0, len(lines))
+	for _, line := range lines {
+		v := strings.TrimSpace(line)
+		if v == "" {
+			continue
+		}
+		trimmed = append(trimmed, v)
+	}
+	if len(trimmed) <= maxLines {
+		return nil
+	}
+	trimmed = trimmed[len(trimmed)-maxLines:]
+	out := strings.Join(trimmed, "\n") + "\n"
+	return os.WriteFile(l.path, []byte(out), 0o600)
 }

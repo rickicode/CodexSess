@@ -23,6 +23,7 @@
 
   <p>
     <a href="#ringkasan">Ringkasan</a> •
+    <a href="#pembaruan-besar-terbaru">Pembaruan Besar Terbaru</a> •
     <a href="#fitur-utama">Fitur Utama</a> •
     <a href="#workflow-github-code-review">GitHub Code Review</a> •
     <a href="#pratinjau-ui">Pratinjau UI</a> •
@@ -45,6 +46,25 @@ Dirancang untuk operator yang membutuhkan:
 Untuk penggunaan normal, unduh binary/package dari halaman rilis terbaru:
 - https://github.com/rickicode/CodexSess/releases/latest
 
+## Pembaruan Besar Terbaru
+
+- Workspace coding `/chat` baru:
+  - sesi dan riwayat chat persisten
+  - pemilih workspace + saran path
+  - activity stream realtime, slash command (`/status`, `/review`), dan skill picker
+- Integrasi Zo kompatibel OpenAI:
+  - manajemen multi Zo API key di dashboard
+  - tracking request per key (`Requests` + `Last request`)
+  - cache daftar model Zo dan dukungan model mapping
+- Peningkatan direct API dan otomasi routing:
+  - direct API mode untuk client kompatibel OpenAI + Claude
+  - strategi Codex CLI: `round_robin` (rotasi terjadwal) dan `manual` (switch berbasis threshold)
+  - default auto-switch threshold: `15%`
+  - scheduler backend untuk cek usage periodik dan fallback akun aktif
+- Observability sistem baru:
+  - halaman System Logs dengan rotasi data berbasis database
+  - log source refresh usage dan log perpindahan API/CLI lebih jelas
+
 ## Kenapa CodexSess Dibuat
 
 CodexSess dibuat untuk menyederhanakan operasi multi-akun Codex tanpa memecah tool.
@@ -65,9 +85,21 @@ Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbed
 - Pemisahan status akun aktif:
   - akun API aktif
   - akun CLI (Codex) aktif
+- Strategi routing multi-akun:
+  - CLI `round_robin` (interval scheduler default: 5 menit)
+  - CLI `manual` (auto-switch saat sisa usage di bawah threshold)
 - Refresh usage dan otomasi:
   - threshold alert
   - perilaku auto-switch yang bisa dikonfigurasi
+  - default auto-switch threshold 15% (bisa diubah di Settings/API)
+- Operasi Zo API key:
+  - tambah/hapus banyak Zo API key
+  - pantau jumlah request per key
+  - gunakan daftar model Zo untuk mapping
+- Workspace coding berbasis browser:
+  - sesi `/chat` dengan context persisten dan activity timeline
+- Observability sistem:
+  - tampilan System Logs dengan rotasi log otomatis
 - Web console + API proxy tertanam dalam satu binary
 
 ## Pratinjau UI
@@ -133,11 +165,12 @@ Catatan:
 
 | Variabel | Default | Contoh | Deskripsi |
 |---|---|---|---|
-| `PORT` | `3061` | `PORT=8080` | Port HTTP server saat `CODEXSESS_BIND_ADDR` tidak di-set. |
-| `CODEXSESS_BIND_ADDR` | `0.0.0.0:<PORT>` | `CODEXSESS_BIND_ADDR=0.0.0.0:3061` | Override bind address penuh (`host:port`) untuk HTTP server. |
+| `PORT` | `3061` | `PORT=8080` | Port HTTP server. |
+| `CODEXSESS_PUBLIC` | `false` | `CODEXSESS_PUBLIC=true` | Aktifkan bind public (`0.0.0.0:<PORT>`). Jika false, bind hanya lokal (`127.0.0.1:<PORT>`). |
 | `CODEXSESS_NO_OPEN_BROWSER` | `false` | `CODEXSESS_NO_OPEN_BROWSER=true` | Menonaktifkan auto-open browser saat startup. Nilai truthy: `1`, `true`, `yes`. |
 | `CODEXSESS_CODEX_SANDBOX` | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only` | Mode sandbox yang diteruskan ke `codex exec`. |
 | `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Jalankan eksekusi Codex dalam mode isolasi (`true`) atau environment normal (`false`). |
+| `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | `` | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Command opsional saat akun CLI aktif berpindah. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
 
 Catatan:
 - Di Windows, direktori data default adalah `%APPDATA%\\codexsess` jika `APPDATA` tersedia.

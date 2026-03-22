@@ -383,7 +383,7 @@ Restart=always
 RestartSec=2
 Environment=HOME=${svc_home}
 Environment=CODEX_HOME=${svc_home}/.codex
-Environment=CODEXSESS_BIND_ADDR=0.0.0.0:3061
+Environment=CODEXSESS_PUBLIC=true
 Environment=CODEXSESS_NO_OPEN_BROWSER=1
 
 [Install]

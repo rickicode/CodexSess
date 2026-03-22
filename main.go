@@ -109,7 +109,9 @@ func run() error {
 	appURL := localAppURL(cfg.BindAddr)
 	log.Printf("codexsess bind address %s", strings.TrimSpace(cfg.BindAddr))
 	if bindIsPublic(cfg.BindAddr) {
-		log.Printf("codexsess public bind enabled (accessible via host IP/network): %s", strings.TrimSpace(cfg.BindAddr))
+		log.Printf("codexsess access scope public")
+	} else {
+		log.Printf("codexsess access scope local")
 	}
 	log.Printf("codexsess local console %s", appURL)
 	if shouldAutoOpenBrowser() {

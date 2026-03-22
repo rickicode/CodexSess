@@ -5,6 +5,7 @@
   import SettingsView from './views/SettingsView.svelte';
   import ApiEndpointView from './views/ApiEndpointView.svelte';
   import ApiLogsView from './views/ApiLogsView.svelte';
+  import SystemLogsView from './views/SystemLogsView.svelte';
   import AboutView from './views/AboutView.svelte';
 
   let accounts = $state([]);
@@ -13,12 +14,22 @@
 
   let apiKey = $state('');
   let apiMode = $state('codex_cli');
+  let directAPIStrategy = $state('round_robin');
+  let codingCLIStrategy = $state('manual');
   let openAIEndpoint = $state('');
+  let openAIResponsesEndpoint = $state('');
   let claudeEndpoint = $state('');
   let authJSONEndpoint = $state('');
+  let usageStatusEndpoint = $state('');
+  let zoChatEndpoint = $state('');
+  let zoModelsEndpoint = $state('');
   let isChatRoute = $state(typeof window !== 'undefined' && (window.location.pathname === '/chat' || window.location.pathname.startsWith('/chat/')));
   let activeMenu = $state('dashboard');
   let apiLogs = $state([]);
+  let systemLogs = $state([]);
+  let systemLogsTotal = $state(0);
+  let showSystemLogDetail = $state(false);
+  let systemLogDetail = $state(null);
   let showLogDetailModal = $state(false);
   let logDetailEntry = $state(null);
   let availableModels = $state([]);
@@ -28,15 +39,30 @@
   let editingMappingAlias = $state('');
   let settingsBusy = $state(false);
   let copiedAction = $state('');
+  let zoKeys = $state([]);
+  let zoAvailableModels = $state([]);
+  let zoModelsLoading = $state(false);
+  let zoKeyName = $state('');
+  let zoKeyValue = $state('');
+  let zoStrategy = $state('round_robin');
   let showAccountEmail = $state(true);
   let autoRefreshEnabled = $state(false);
-  let autoRefreshMinutes = $state(30);
-  let autoRefreshMinutesInput = $state('30');
   let usageAlertThreshold = $state(5);
   let usageAlertThresholdInput = $state('5');
   let usageAutoSwitchThreshold = $state(2);
   let usageAutoSwitchThresholdInput = $state('2');
   let usageSoundEnabled = $state(true);
+  let claudeCodeIntegration = $state({
+    connected: false,
+    base_url: '',
+    env_file_path: '',
+    profiles: [],
+    model_preset: {},
+    activate_command: '',
+    provider: 'codex',
+    zo_model: ''
+  });
+  let showClaudeEnableModal = $state(false);
   let appVersion = $state('dev');
   let codexVersion = $state('unknown');
   let latestVersion = $state('');
@@ -58,6 +84,9 @@
   let uiPrefsLoaded = $state(false);
   let accountSearchQuery = $state('');
   let accountTypeFilter = $state('all');
+  let usageAvailabilityFilter = $state('all');
+  let dashboardPageSize = $state(20);
+  let dashboardPage = $state(1);
   let mobileSidebarOpen = $state(false);
 
   const appMode = (import.meta.env.VITE_APP_MODE || 'web').toLowerCase();
@@ -69,6 +98,17 @@
     'gpt-5.3-codex',
     'gpt-5.4-mini',
     'gpt-5.4'
+  ];
+
+  const defaultZoModels = [
+    'openai:gpt-5.4-2026-03-05',
+    'openai:gpt-5.4-mini-2026-03-17',
+    'openai:gpt-5.3-codex',
+    'anthropic:claude-opus-4-6',
+    'vercel:moonshotai/kimi-k2.5',
+    'vercel:zai/glm-5',
+    'vercel:minimax/minimax-m2.5',
+    'vercel:minimax/minimax-m2.7'
   ];
 
   let showAddAccountModal = $state(false);
@@ -98,9 +138,11 @@
   let soundCache = {};
   let refreshAllInFlight = null;
   let lastRefreshAllAt = 0;
+  let suppressActiveSwitchToneUntil = 0;
 
   const jsonHeaders = { 'Content-Type': 'application/json' };
   const uiPrefsKey = 'codexsess.ui.preferences.v1';
+  const zoModelsCacheKey = 'codexsess.zo.models.v1';
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
 
   function setStatus(text, kind = 'info') {
@@ -183,9 +225,12 @@
   function filteredAccounts() {
     const q = String(accountSearchQuery || '').trim().toLowerCase();
     const type = String(accountTypeFilter || 'all').trim().toLowerCase();
-    return accounts.filter((account) => {
+    const usageFilter = String(usageAvailabilityFilter || 'all').trim().toLowerCase();
+    const filtered = accounts.filter((account) => {
       const accountType = String(account?.plan_type || '').trim().toLowerCase();
       if (type !== 'all' && accountType !== type) return false;
+      if (usageFilter === 'exhausted' && !accountHasExhaustedUsage(account)) return false;
+      if (usageFilter === 'available' && !accountHasAvailableUsage(account)) return false;
       if (!q) return true;
       const haystack = [
         account?.email,
@@ -197,7 +242,74 @@
         .join(' ');
       return haystack.includes(q);
     });
+    return filtered
+      .map((account, index) => ({
+        account,
+        index,
+        usageSortScore: accountUsageSortScore(account)
+      }))
+      .sort((a, b) => {
+        const aActiveCLI = a.account?.active_cli ? 1 : 0;
+        const bActiveCLI = b.account?.active_cli ? 1 : 0;
+        if (aActiveCLI !== bActiveCLI) return bActiveCLI - aActiveCLI;
+        if (a.usageSortScore !== b.usageSortScore) return b.usageSortScore - a.usageSortScore;
+        return a.index - b.index;
+      })
+      .map((item) => item.account);
   }
+
+  function accountUsageSortScore(account) {
+    const windows = parseUsageWindows(account?.usage || null);
+    if (!Array.isArray(windows) || windows.length === 0) return -1;
+    const scoreFromWindow = (window) => {
+      const raw = Number(window?.percent);
+      if (!Number.isFinite(raw)) return -1;
+      return clampPercent(raw);
+    };
+    const hourly = windows.find((window) => String(window?.name || '').trim().toLowerCase().startsWith('5h'));
+    const hourlyScore = hourly ? scoreFromWindow(hourly) : -1;
+    if (hourlyScore >= 0) return hourlyScore;
+    const weekly = windows.find((window) => String(window?.name || '').trim().toLowerCase().includes('weekly'));
+    const weeklyScore = weekly ? scoreFromWindow(weekly) : -1;
+    if (weeklyScore >= 0) return weeklyScore;
+    return -1;
+  }
+
+  function pageSizeOptions() {
+    return [20, 50, 100, 500, 1000];
+  }
+
+  function setDashboardPageSize(value) {
+    const raw = Number(value);
+    const next = pageSizeOptions().includes(raw) ? raw : 20;
+    dashboardPageSize = next;
+    dashboardPage = 1;
+  }
+
+  function setDashboardPage(value) {
+    const n = Number(value);
+    dashboardPage = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+  }
+
+  function paginatedAccounts() {
+    const filtered = filteredAccounts();
+    const perPage = dashboardPageSize > 0 ? dashboardPageSize : 20;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
+    const page = Math.min(Math.max(1, dashboardPage), totalPages);
+    const start = (page - 1) * perPage;
+    const end = start + perPage;
+    return {
+      items: filtered.slice(start, end),
+      totalFiltered: filtered.length,
+      totalPages,
+      page,
+      perPage,
+      startIndex: filtered.length === 0 ? 0 : start + 1,
+      endIndex: Math.min(end, filtered.length)
+    };
+  }
+
+  const dashboardPagination = $derived(paginatedAccounts());
 
   function activeAPIAccount() {
     return accounts.find((account) => account?.active_api) || null;
@@ -214,10 +326,46 @@
 
   function setAccountSearchQuery(value) {
     accountSearchQuery = value;
+    dashboardPage = 1;
   }
 
   function setAccountTypeFilter(value) {
     accountTypeFilter = value;
+    dashboardPage = 1;
+  }
+
+  function usageAvailabilityOptions() {
+    return [
+      { value: 'all', label: 'All Usage' },
+      { value: 'exhausted', label: 'Exhausted (Weekly or 5h)' },
+      { value: 'available', label: 'Has Remaining Usage' }
+    ];
+  }
+
+  function usageWindowsForFilter(account) {
+    const windows = parseUsageWindows(account?.usage || null);
+    const usageWindows = windows.filter((window) => {
+      const label = String(window?.name || '').trim().toLowerCase();
+      return label.includes('weekly') || label.startsWith('5h');
+    });
+    return usageWindows.length > 0 ? usageWindows : windows;
+  }
+
+  function accountHasExhaustedUsage(account) {
+    const usageWindows = usageWindowsForFilter(account);
+    if (usageWindows.length === 0) return false;
+    return usageWindows.some((window) => clampPercent(window?.percent) <= 0);
+  }
+
+  function accountHasAvailableUsage(account) {
+    const usageWindows = usageWindowsForFilter(account);
+    if (usageWindows.length === 0) return false;
+    return usageWindows.every((window) => clampPercent(window?.percent) > 0);
+  }
+
+  function setUsageAvailabilityFilter(value) {
+    usageAvailabilityFilter = value;
+    dashboardPage = 1;
   }
 
   function toggleMobileSidebar() {
@@ -228,12 +376,50 @@
     mobileSidebarOpen = false;
   }
 
+  function menuFromPath(path) {
+    const p = String(path || '').trim().toLowerCase();
+    if (p === '/settings') return 'settings';
+    if (p === '/apilogs') return 'logs';
+    if (p === '/api-endpoints') return 'api-endpoints';
+    if (p === '/systemlogs') return 'system-logs';
+    if (p === '/about') return 'about';
+    if (p === '/' || p === '/dashboard') return 'dashboard';
+    if (p === '/chat' || p.startsWith('/chat/')) return 'coding';
+    return 'dashboard';
+  }
+
+  function pathForMenu(menu) {
+    switch (String(menu || '').trim().toLowerCase()) {
+      case 'settings':
+        return '/settings';
+      case 'logs':
+        return '/apilogs';
+      case 'api-endpoints':
+        return '/api-endpoints';
+      case 'system-logs':
+        return '/systemlogs';
+      case 'about':
+        return '/about';
+      case 'coding':
+        return '/chat';
+      default:
+        return '/';
+    }
+  }
+
   function switchMenu(menu) {
     if (menu === 'coding' && typeof window !== 'undefined') {
       window.location.href = '/chat';
       return;
     }
+    if (typeof window !== 'undefined') {
+      const nextPath = pathForMenu(menu);
+      if (nextPath && window.location.pathname !== nextPath) {
+        window.history.pushState({}, '', nextPath);
+      }
+    }
     activeMenu = menu;
+    isChatRoute = menu === 'coding';
     closeMobileSidebar();
   }
 
@@ -244,11 +430,16 @@
   }
 
   function syncRouteMode() {
+    if (typeof window === 'undefined') return;
+    const path = String(window.location.pathname || '').trim().toLowerCase();
     isChatRoute = detectChatRoute();
     if (isChatRoute) {
       activeMenu = 'coding';
       closeMobileSidebar();
+      return;
     }
+    activeMenu = menuFromPath(path);
+    closeMobileSidebar();
   }
 
 
@@ -264,6 +455,8 @@
         return `API Workspace - ${base}`;
       case 'logs':
         return `API Logs - ${base}`;
+      case 'system-logs':
+        return `System Logs - ${base}`;
       case 'about':
         return `About - ${base}`;
       default:
@@ -646,6 +839,18 @@
     return `curl ${authJSONEndpoint || 'http://127.0.0.1:3061/v1/auth.json'} \\\n  -H "Authorization: Bearer ${apiKey || 'sk-...'}" \\\n  -o auth.json`;
   }
 
+  function usageStatusExample() {
+    return `curl "${usageStatusEndpoint || 'http://127.0.0.1:3061/v1/usage'}?refresh=1" \\\n  -H "Authorization: Bearer ${apiKey || 'sk-...'}"`;
+  }
+
+  function zoChatExample() {
+    return `curl ${zoChatEndpoint || 'http://127.0.0.1:3061/zo/v1/chat/completions'} \\\n  -H "Authorization: Bearer ${apiKey || 'sk-...'}" \\\n  -H "Content-Type: application/json" \\\n  -d '{
+    "model": "vercel:minimax/minimax-m2.7",
+    "messages": [{"role":"user","content":"Reply exactly with: OK"}],
+    "stream": false
+  }'`;
+  }
+
   function prettyJSONText(raw) {
     const text = String(raw ?? '').trim();
     if (!text) return '';
@@ -653,6 +858,44 @@
       return JSON.stringify(JSON.parse(text), null, 2);
     } catch {
       return text;
+    }
+  }
+
+  function normalizeUsageTokens(usage) {
+    if (!usage || typeof usage !== 'object') return null;
+    let requestTokens = Number(usage.prompt_tokens) || 0;
+    let responseTokens = Number(usage.completion_tokens) || 0;
+    if (!requestTokens) requestTokens = Number(usage.input_tokens) || 0;
+    if (!responseTokens) responseTokens = Number(usage.output_tokens) || 0;
+    let totalTokens = Number(usage.total_tokens) || 0;
+    if (!totalTokens && (requestTokens || responseTokens)) {
+      totalTokens = requestTokens + responseTokens;
+    }
+    if (!requestTokens && !responseTokens && !totalTokens) return null;
+    return { requestTokens, responseTokens, totalTokens };
+  }
+
+  function extractUsageTokensFromPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    if (payload.usage) {
+      return normalizeUsageTokens(payload.usage);
+    }
+    if (payload.response && payload.response.usage) {
+      return normalizeUsageTokens(payload.response.usage);
+    }
+    if (payload.message && payload.message.usage) {
+      return normalizeUsageTokens(payload.message.usage);
+    }
+    return null;
+  }
+
+  function extractUsageTokensFromResponseBody(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return null;
+    try {
+      return extractUsageTokensFromPayload(JSON.parse(text));
+    } catch {
+      return null;
     }
   }
 
@@ -671,6 +914,9 @@
       accountHint: '',
       accountID: '',
       accountEmail: '',
+      requestTokens: 0,
+      responseTokens: 0,
+      totalTokens: 0,
       requestBody: '',
       responseBody: '',
       invalid: true
@@ -688,6 +934,18 @@
       const accountHint = String(obj.account_hint || '').trim();
       const accountID = String(obj.account_id || '').trim();
       const accountEmail = String(obj.account_email || '').trim();
+      let requestTokens = Number(obj.request_tokens) || 0;
+      let responseTokens = Number(obj.response_tokens) || 0;
+      let totalTokens = Number(obj.total_tokens) || 0;
+      const fallbackTokens = extractUsageTokensFromResponseBody(obj.response_body);
+      if (fallbackTokens) {
+        if (!requestTokens) requestTokens = fallbackTokens.requestTokens;
+        if (!responseTokens) responseTokens = fallbackTokens.responseTokens;
+        if (!totalTokens) totalTokens = fallbackTokens.totalTokens;
+      }
+      if (!totalTokens && (requestTokens || responseTokens)) {
+        totalTokens = requestTokens + responseTokens;
+      }
       const requestBody = prettyJSONText(obj.request_body);
       const responseBody = prettyJSONText(obj.response_body);
       return {
@@ -703,6 +961,9 @@
         accountHint,
         accountID,
         accountEmail,
+        requestTokens,
+        responseTokens,
+        totalTokens,
         requestBody,
         responseBody,
         invalid: false
@@ -726,6 +987,16 @@
     if (n >= 300) return 'status-3xx';
     if (n >= 200) return 'status-2xx';
     return 'status-unknown';
+  }
+
+  function openSystemLogDetail(entry) {
+    systemLogDetail = entry;
+    showSystemLogDetail = true;
+  }
+
+  function closeSystemLogDetail() {
+    showSystemLogDetail = false;
+    systemLogDetail = null;
   }
 
   function openLogDetail(entry) {
@@ -776,17 +1047,61 @@
   }
 
   async function loadAccounts() {
+    const previousAccounts = Array.isArray(accounts) ? accounts : [];
+    const previousAPIActiveID = String(activeAPIAccount()?.id || '').trim();
+    const previousCLIActiveID = String(activeCLIAccount()?.id || '').trim();
     const data = await req('/api/accounts');
-    accounts = data.accounts || [];
+    const nextAccounts = Array.isArray(data.accounts) ? data.accounts : [];
+    accounts = nextAccounts;
+
+    const nextAPIActiveID = String(nextAccounts.find((account) => account?.active_api)?.id || '').trim();
+    const nextCLIActiveID = String(nextAccounts.find((account) => account?.active_cli)?.id || '').trim();
+    const apiSwitched = previousAPIActiveID !== '' && nextAPIActiveID !== '' && previousAPIActiveID !== nextAPIActiveID;
+    const cliSwitched = previousCLIActiveID !== '' && nextCLIActiveID !== '' && previousCLIActiveID !== nextCLIActiveID;
+    const toneSuppressed = Date.now() < suppressActiveSwitchToneUntil;
+    if (!toneSuppressed && (apiSwitched || cliSwitched)) {
+      playNotificationTone('switch');
+      const labelFor = (id, source) => {
+        const needle = String(id || '').trim();
+        if (!needle) return '-';
+        const list = source === 'previous' ? previousAccounts : nextAccounts;
+        const found = list.find((account) => String(account?.id || '').trim() === needle);
+        const email = String(found?.email || '').trim();
+        return email || needle;
+      };
+      const parts = [];
+      if (apiSwitched) {
+        parts.push(`API active switched: ${labelFor(previousAPIActiveID, 'previous')} -> ${labelFor(nextAPIActiveID, 'next')}`);
+      }
+      if (cliSwitched) {
+        parts.push(`CLI active switched: ${labelFor(previousCLIActiveID, 'previous')} -> ${labelFor(nextCLIActiveID, 'next')}`);
+      }
+      const detail = parts.join(' | ');
+      const message = `Backend auto-switch detected. ${detail}`;
+      setStatus(message, 'success');
+      sendClientEvent('backend-active-switch', message, {
+        previous_api_active: previousAPIActiveID || null,
+        next_api_active: nextAPIActiveID || null,
+        previous_cli_active: previousCLIActiveID || null,
+        next_cli_active: nextCLIActiveID || null
+      }, 'info');
+    }
   }
 
   async function loadSettings() {
     const data = await req('/api/settings');
     apiKey = data.api_key || '';
     apiMode = String(data.api_mode || 'codex_cli').trim().toLowerCase() === 'direct_api' ? 'direct_api' : 'codex_cli';
+    directAPIStrategy = String(data.direct_api_strategy || 'round_robin').trim().toLowerCase() === 'load_balance' ? 'load_balance' : 'round_robin';
+    codingCLIStrategy = String(data.coding_cli_strategy || 'manual').trim().toLowerCase() === 'round_robin' ? 'round_robin' : 'manual';
     openAIEndpoint = data.openai_endpoint || '';
+    openAIResponsesEndpoint = data.openai_responses_url || '';
     claudeEndpoint = data.claude_endpoint || '';
     authJSONEndpoint = data.auth_json_endpoint || '';
+    usageStatusEndpoint = data.usage_status_endpoint || '';
+    zoChatEndpoint = data.zo_chat_url || '';
+    zoModelsEndpoint = data.zo_models_url || '';
+    zoStrategy = String(data.zo_api_strategy || 'round_robin').trim().toLowerCase() === 'manual' ? 'manual' : 'round_robin';
     const fromAPI = Array.isArray(data.available_models) ? data.available_models : [];
     availableModels = fromAPI.length > 0 ? fromAPI : defaultCodexModels;
     modelMappings = (data.model_mappings && typeof data.model_mappings === 'object') ? data.model_mappings : {};
@@ -802,6 +1117,7 @@
       usageAutoSwitchThresholdInput = String(usageAutoSwitchThreshold);
       usageThresholdLastSavedSwitch = usageAutoSwitchThreshold;
     }
+    autoRefreshEnabled = data.usage_scheduler_enabled !== false;
     if (!availableModels.includes(mappingTargetModel) && availableModels.length > 0) {
       mappingTargetModel = availableModels[0];
     }
@@ -813,6 +1129,91 @@
     updateAvailable = Boolean(data.update_available);
     updateCheckedAt = String(data.update_checked_at || '').trim();
     updateCheckError = String(data.update_check_error || '').trim();
+    const cc = (data.claude_code && typeof data.claude_code === 'object') ? data.claude_code : {};
+    claudeCodeIntegration = {
+      connected: cc.connected === true,
+      base_url: String(cc.base_url || '').trim(),
+      env_file_path: String(cc.env_file_path || '').trim(),
+      profiles: Array.isArray(cc.profiles) ? cc.profiles : [],
+      model_preset: (cc.model_preset && typeof cc.model_preset === 'object') ? cc.model_preset : {},
+      activate_command: String(cc.activate_command || '').trim(),
+      provider: 'codex',
+      zo_model: ''
+    };
+  }
+
+  async function loadZoKeys() {
+    const data = await req('/api/zo/keys');
+    zoKeys = Array.isArray(data.keys) ? data.keys : [];
+    zoStrategy = String(data.strategy || 'round_robin').trim().toLowerCase() === 'manual' ? 'manual' : 'round_robin';
+  }
+
+  async function loadZoModels() {
+    zoAvailableModels = [...defaultZoModels];
+    if (!Array.isArray(zoKeys) || zoKeys.length === 0) return;
+    if (!String(apiKey || '').trim()) return;
+    const keySignature = zoKeys
+      .map((item) => String(item?.id || '').trim())
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b))
+      .join('|');
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem(zoModelsCacheKey);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const cachedSig = String(parsed?.key_signature || '').trim();
+          const cachedModels = Array.isArray(parsed?.models)
+            ? parsed.models.map((item) => String(item || '').trim()).filter(Boolean)
+            : [];
+          if (cachedSig && cachedSig === keySignature && cachedModels.length > 0) {
+            zoAvailableModels = cachedModels;
+            return;
+          }
+        }
+      } catch {
+        // ignore cache read issues
+      }
+    }
+    const endpoint = '/zo/v1/models';
+    if (!endpoint) return;
+    zoModelsLoading = true;
+    try {
+      const res = await fetch(toAPIURL(endpoint), {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${apiKey}`
+        },
+        credentials: 'same-origin'
+      });
+      if (!res.ok) {
+        throw new Error(`failed to load Zo models (${res.status})`);
+      }
+      const data = await res.json();
+      const parsed = Array.isArray(data?.data)
+        ? data.data.map((item) => String(item?.id || '').trim()).filter(Boolean)
+        : [];
+      if (parsed.length > 0) {
+        zoAvailableModels = parsed;
+        if (typeof window !== 'undefined') {
+          try {
+            localStorage.setItem(zoModelsCacheKey, JSON.stringify({
+              key_signature: keySignature,
+              models: parsed,
+              updated_at: Date.now()
+            }));
+          } catch {
+            // ignore cache write issues
+          }
+        }
+      }
+    } catch (error) {
+      sendClientEvent('zo-models-load-failed', String(error?.message || 'failed to load Zo models'), {
+        endpoint: toAPIURL(endpoint)
+      }, 'error');
+    } finally {
+      zoModelsLoading = false;
+    }
   }
 
   async function checkForUpdates() {
@@ -845,6 +1246,119 @@
     apiLogs = [...lines].reverse().map((line, idx) => parseAPILogLine(line, idx));
   }
 
+  async function loadSystemLogs() {
+    const data = await req('/api/system/logs?limit=400');
+    const entries = Array.isArray(data.logs) ? data.logs : [];
+    systemLogs = entries.map((entry) => ({
+      id: String(entry.id || ''),
+      kind: String(entry.kind || ''),
+      message: String(entry.message || ''),
+      metaJSON: String(entry.meta_json || ''),
+      createdAt: String(entry.created_at || '')
+    }));
+    systemLogsTotal = Number(data.total || 0);
+  }
+
+  async function clearSystemLogs() {
+    busy = true;
+    try {
+      await req('/api/system/logs', { method: 'DELETE' });
+      await loadSystemLogs();
+      setStatus('System logs cleared.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function addZoKey() {
+    if (!String(zoKeyValue || '').trim()) {
+      setStatus('Zo API key is required.', 'error');
+      return;
+    }
+    settingsBusy = true;
+    try {
+      await req('/api/zo/keys', {
+        method: 'POST',
+        body: JSON.stringify({ name: zoKeyName, api_key: zoKeyValue })
+      });
+      zoKeyName = '';
+      zoKeyValue = '';
+      await loadZoKeys();
+      setStatus('Zo API key saved.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  async function activateZoKey(id) {
+    settingsBusy = true;
+    try {
+      await req('/api/zo/keys/activate', {
+        method: 'POST',
+        body: JSON.stringify({ id })
+      });
+      await loadZoKeys();
+      setStatus('Zo API key activated.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  async function resetZoKeyUsage(id) {
+    settingsBusy = true;
+    try {
+      await req('/api/zo/keys/reset', {
+        method: 'POST',
+        body: JSON.stringify({ id })
+      });
+      await loadZoKeys();
+      setStatus('Zo API key usage reset.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  async function deleteZoKey(id) {
+    settingsBusy = true;
+    try {
+      await req('/api/zo/keys/delete', {
+        method: 'POST',
+        body: JSON.stringify({ id })
+      });
+      await loadZoKeys();
+      setStatus('Zo API key removed.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
+  async function setZoStrategy(strategy) {
+    const next = String(strategy || '').trim().toLowerCase() === 'manual' ? 'manual' : 'round_robin';
+    settingsBusy = true;
+    try {
+      await req('/api/zo/keys/strategy', {
+        method: 'POST',
+        body: JSON.stringify({ strategy: next })
+      });
+      zoStrategy = next;
+      setStatus(`Zo API strategy set to ${next}.`, 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
+    }
+  }
+
   async function refreshUsageForSelectors(selectors) {
     const uniqueSelectors = [...new Set((selectors || []).map((v) => String(v || '').trim()).filter(Boolean))];
     let refreshed = 0;
@@ -853,7 +1367,7 @@
         try {
           await req('/api/usage/refresh', {
             method: 'POST',
-            body: JSON.stringify({ selector })
+            body: JSON.stringify({ selector, source: 'auto' })
           });
           refreshed++;
         } catch {
@@ -879,9 +1393,10 @@
       await refreshAllInFlight;
       return;
     }
-    refreshAllInFlight = Promise.all([loadAccounts(), loadSettings()]);
+    refreshAllInFlight = Promise.all([loadAccounts(), loadSettings(), loadZoKeys()]);
     try {
       await refreshAllInFlight;
+      await loadZoModels();
       lastRefreshAllAt = Date.now();
     } finally {
       refreshAllInFlight = null;
@@ -906,6 +1421,7 @@
     try {
       const endpoint = mode === 'cli' ? '/api/account/use-cli' : '/api/account/use-api';
       const toneKind = source === 'auto' ? 'switch' : 'info';
+      suppressActiveSwitchToneUntil = Date.now() + 5000;
       if (!suppressTone && source !== 'auto') {
         await playNotificationTone(toneKind, { wait: true });
       }
@@ -942,7 +1458,7 @@
       await withUsageRefreshLock(async () => {
         await req('/api/usage/refresh', {
           method: 'POST',
-          body: JSON.stringify({ selector })
+          body: JSON.stringify({ selector, source: 'manual' })
         });
         await refreshAllData();
       });
@@ -956,25 +1472,41 @@
     }
   }
 
-  async function refreshAllUsage() {
-    if (usageRefreshBusy) {
-      setStatus('Usage refresh is still running.', 'info');
-      return;
-    }
+  async function backupAllAccounts() {
     busy = true;
     try {
-      await withUsageRefreshLock(async () => {
-        await req('/api/usage/refresh', {
-          method: 'POST',
-          body: JSON.stringify({ all: true })
-        });
-        await refreshAllData();
-      });
-      backgroundRefreshError = '';
-      backgroundRefreshLastAt = Date.now();
-      setStatus('Usage refreshed for all accounts.', 'success');
+      const payload = await req('/api/accounts/backup');
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = href;
+      anchor.download = `codexsess-accounts-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(href);
+      setStatus('Backup accounts berhasil diunduh.', 'success');
     } catch (error) {
       setStatus(error.message, 'error');
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function restoreAccounts(file) {
+    if (!file) return;
+    busy = true;
+    try {
+      const text = await file.text();
+      const payload = JSON.parse(text || '{}');
+      const data = await req('/api/accounts/restore', {
+        method: 'POST',
+        body: JSON.stringify(payload)
+      });
+      await refreshAllData({ statusMessage: false, force: true });
+      setStatus(`Restore selesai: ${Number(data?.restored || 0)} akun dipulihkan, ${Number(data?.skipped || 0)} dilewati.`, 'success');
+    } catch (error) {
+      setStatus(`Restore backup gagal: ${error.message}`, 'error');
     } finally {
       busy = false;
     }
@@ -1103,10 +1635,20 @@
     showAccountEmail = !showAccountEmail;
   }
 
-  function toggleAutoRefreshEnabled() {
-    autoRefreshEnabled = !autoRefreshEnabled;
-    if (autoRefreshEnabled) {
-      runBackgroundUsageRefresh({ silent: true, force: false });
+  async function toggleAutoRefreshEnabled() {
+    const nextEnabled = !autoRefreshEnabled;
+    autoRefreshBusy = true;
+    try {
+      const data = await req('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ usage_scheduler_enabled: nextEnabled })
+      });
+      autoRefreshEnabled = Boolean(data.usage_scheduler_enabled);
+      setStatus(`Background auto-switch scheduler ${autoRefreshEnabled ? 'enabled' : 'disabled'}.`, 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      autoRefreshBusy = false;
     }
   }
 
@@ -1138,25 +1680,76 @@
     }
   }
 
-  function setAutoRefreshMinutesInput(value) {
-    autoRefreshMinutesInput = String(value ?? '');
-    const trimmed = autoRefreshMinutesInput.trim();
-    if (!trimmed) return;
-    const n = Number(trimmed);
-    if (!Number.isFinite(n)) return;
-    autoRefreshMinutes = Math.max(1, Math.round(n));
+  async function setDirectAPIStrategy(nextStrategy) {
+    const normalized = String(nextStrategy || '').trim().toLowerCase() === 'load_balance' ? 'load_balance' : 'round_robin';
+    if (directAPIStrategy === normalized) return;
+    settingsBusy = true;
+    try {
+      const data = await req('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ direct_api_strategy: normalized })
+      });
+      directAPIStrategy = String(data.direct_api_strategy || normalized).trim().toLowerCase() === 'load_balance' ? 'load_balance' : 'round_robin';
+      setStatus(`Direct API strategy set to ${directAPIStrategy === 'load_balance' ? 'Load Balance' : 'Round Robin'}.`, 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
+    }
   }
 
-  function commitAutoRefreshMinutesInput() {
-    const trimmed = String(autoRefreshMinutesInput || '').trim();
-    const n = Number(trimmed);
-    if (!trimmed || !Number.isFinite(n)) {
-      autoRefreshMinutesInput = String(autoRefreshMinutes);
-      return;
+  async function setCodingCLIStrategy(nextStrategy) {
+    const normalized = String(nextStrategy || '').trim().toLowerCase() === 'round_robin' ? 'round_robin' : 'manual';
+    if (codingCLIStrategy === normalized) return;
+    settingsBusy = true;
+    try {
+      const data = await req('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ coding_cli_strategy: normalized })
+      });
+      codingCLIStrategy = String(data.coding_cli_strategy || normalized).trim().toLowerCase() === 'round_robin' ? 'round_robin' : 'manual';
+      setStatus(`Codex CLI strategy set to ${codingCLIStrategy === 'round_robin' ? 'Round Robin (5 min scheduler)' : 'Manual (threshold auto-switch)'}.`, 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      settingsBusy = false;
     }
-    const normalized = Math.max(1, Math.round(n));
-    autoRefreshMinutes = normalized;
-    autoRefreshMinutesInput = String(normalized);
+  }
+
+  function openClaudeCodeIntegrationModal() {
+    showClaudeEnableModal = true;
+  }
+
+  function closeClaudeCodeIntegrationModal() {
+    if (settingsBusy) return;
+    showClaudeEnableModal = false;
+  }
+
+  async function enableClaudeCodeIntegration() {
+    settingsBusy = true;
+    try {
+      const data = await req('/api/settings/claude-code', {
+        method: 'POST',
+        body: JSON.stringify({})
+      });
+      const cc = (data.claude_code && typeof data.claude_code === 'object') ? data.claude_code : {};
+      claudeCodeIntegration = {
+        connected: cc.connected === true,
+        base_url: String(cc.base_url || '').trim(),
+        env_file_path: String(cc.env_file_path || '').trim(),
+        profiles: Array.isArray(cc.profiles) ? cc.profiles : [],
+        model_preset: (cc.model_preset && typeof cc.model_preset === 'object') ? cc.model_preset : {},
+        activate_command: String(cc.activate_command || '').trim(),
+        provider: 'codex',
+        zo_model: ''
+      };
+      showClaudeEnableModal = false;
+      setStatus('Claude Code integration enabled. Run the activation command shown below in your current terminal.', 'success');
+    } catch (error) {
+      setStatus(`Failed to enable Claude Code integration: ${error.message}`, 'error');
+    } finally {
+      settingsBusy = false;
+    }
   }
 
   function setUsageAlertThresholdInput(value) {
@@ -1280,50 +1873,6 @@
       return true;
     } finally {
       usageRefreshBusy = false;
-    }
-  }
-
-  async function runBackgroundUsageRefresh({ silent = true, force = false } = {}) {
-    if (autoRefreshBusy) return;
-    const intervalMS = Math.max(1, Number(autoRefreshMinutes) || 30) * 60 * 1000;
-    if (!force && backgroundRefreshLastAt > 0 && Date.now() - backgroundRefreshLastAt < intervalMS) {
-      return;
-    }
-    autoRefreshBusy = true;
-    sendClientEvent('background-refresh-start', 'Background usage refresh started.', {
-      force,
-      minutes: Math.max(1, Number(autoRefreshMinutes) || 30)
-    });
-    try {
-      const ran = await withUsageRefreshLock(async () => {
-        await req('/api/usage/refresh', {
-          method: 'POST',
-          body: JSON.stringify({ all: true })
-        });
-        await Promise.all([loadAccounts(), loadSettings()]);
-      });
-      if (!ran) return;
-      backgroundRefreshLastAt = Date.now();
-      sendClientEvent('background-refresh-success', 'Background usage refresh completed.', {
-        accounts: Array.isArray(accounts) ? accounts.length : 0
-      }, 'success');
-      await evaluateActiveAccountUsage({ allowAutoSwitch: true, source: 'background-refresh' });
-      if (backgroundRefreshError && !silent) {
-        setStatus('Background usage refresh recovered.', 'success');
-      }
-      backgroundRefreshError = '';
-    } catch (error) {
-      const message = String(error?.message || 'unknown error');
-      const isNewError = backgroundRefreshError !== message;
-      backgroundRefreshError = message;
-      sendClientEvent('background-refresh-failed', `Background refresh failed: ${message}`, {
-        force
-      }, 'error');
-      if (isNewError && !silent) {
-        setStatus(`Background auto refresh failed: ${message}`, 'error');
-      }
-    } finally {
-      autoRefreshBusy = false;
     }
   }
 
@@ -1650,31 +2199,11 @@
       if (raw) {
         const parsed = JSON.parse(raw);
         showAccountEmail = parsed?.showAccountEmail !== false;
-        autoRefreshEnabled = parsed?.autoRefreshEnabled === true;
-        const mins = Number(parsed?.autoRefreshMinutes);
-        autoRefreshMinutes = Number.isFinite(mins) ? Math.max(1, Math.round(mins)) : 30;
-        autoRefreshMinutesInput = String(autoRefreshMinutes);
-        const alertThreshold = Number(parsed?.usageAlertThreshold);
-        usageAlertThreshold = Number.isFinite(alertThreshold) ? parsePercentInput(alertThreshold, 5) : 5;
-        usageAlertThresholdInput = String(usageAlertThreshold);
-        const autoSwitchThreshold = Number(parsed?.usageAutoSwitchThreshold);
-        usageAutoSwitchThreshold = Number.isFinite(autoSwitchThreshold) ? parsePercentInput(autoSwitchThreshold, 2) : 2;
-        usageAutoSwitchThresholdInput = String(usageAutoSwitchThreshold);
         usageSoundEnabled = parsed?.usageSoundEnabled !== false;
-        const lastAt = Number(parsed?.backgroundRefreshLastAt || 0);
-        backgroundRefreshLastAt = Number.isFinite(lastAt) ? Math.max(0, Math.round(lastAt)) : 0;
       }
     } catch {
       showAccountEmail = true;
-      autoRefreshEnabled = false;
-      autoRefreshMinutes = 30;
-      autoRefreshMinutesInput = '30';
-      usageAlertThreshold = 5;
-      usageAlertThresholdInput = '5';
-      usageAutoSwitchThreshold = 2;
-      usageAutoSwitchThresholdInput = '2';
       usageSoundEnabled = true;
-      backgroundRefreshLastAt = 0;
     }
     uiPrefsLoaded = true;
   }
@@ -1683,12 +2212,7 @@
     try {
       const payload = {
         showAccountEmail,
-        autoRefreshEnabled,
-        autoRefreshMinutes: Math.max(1, Number(autoRefreshMinutes) || 30),
-        usageAlertThreshold: parsePercentInput(usageAlertThreshold, 5),
-        usageAutoSwitchThreshold: parsePercentInput(usageAutoSwitchThreshold, 2),
-        usageSoundEnabled,
-        backgroundRefreshLastAt
+        usageSoundEnabled
       };
       localStorage.setItem(uiPrefsKey, JSON.stringify(payload));
     } catch {
@@ -1707,7 +2231,11 @@
     window.addEventListener('popstate', onPopstate);
     loadUIPreferences();
 
-    if (!isChatRoute) {
+    if (isChatRoute) {
+      loadSettings().catch((error) => {
+        setStatus(error.message, 'error');
+      });
+    } else {
       refreshAllData().catch((error) => {
         setStatus(error.message, 'error');
       });
@@ -1758,30 +2286,21 @@
   });
 
   $effect(() => {
-    if (!autoRefreshEnabled) return;
-    const minutes = Math.max(1, Number(autoRefreshMinutes) || 30);
+    if (activeMenu !== 'system-logs') return;
+    loadSystemLogs().catch((error) => setStatus(error.message, 'error'));
     const timer = setInterval(() => {
-      runBackgroundUsageRefresh({ silent: true, force: true });
-    }, minutes * 60 * 1000);
+      loadSystemLogs().catch(() => {});
+    }, 8000);
     return () => clearInterval(timer);
   });
 
   $effect(() => {
-    const onVisible = () => {
-      if (!autoRefreshEnabled) return;
-      if (document.visibilityState !== 'visible') return;
-      runBackgroundUsageRefresh({ silent: true, force: false });
-    };
-    const onFocus = () => {
-      if (!autoRefreshEnabled) return;
-      runBackgroundUsageRefresh({ silent: true, force: false });
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    window.addEventListener('focus', onFocus);
-    return () => {
-      document.removeEventListener('visibilitychange', onVisible);
-      window.removeEventListener('focus', onFocus);
-    };
+    if (isChatRoute) return;
+    if (!autoRefreshEnabled) return;
+    const timer = setInterval(() => {
+      refreshAllData({ statusMessage: false, force: true }).catch(() => {});
+    }, 60000);
+    return () => clearInterval(timer);
   });
 
   $effect(() => {
@@ -1813,8 +2332,15 @@
   <aside class="sidebar {mobileSidebarOpen ? 'is-open' : ''}">
     <div class="brand">
       <strong>CodexSess</strong>
-      <span>Codex Account Management</span>
-      <small class="brand-meta">Codex CLI: {codexVersion}</small>
+      <span class="brand-meta brand-meta-count">[{accounts.length} Accounts]</span>
+      <span class="brand-title">Codex Account Management</span>
+      <span class="brand-meta brand-meta-cli">
+        {#if String(codexVersion || '').trim().toLowerCase().includes('codex-cli')}
+          {codexVersion}
+        {:else}
+          codex-cli {codexVersion}
+        {/if}
+      </span>
     </div>
 
     <nav class="nav" aria-label="Main menu">
@@ -1842,6 +2368,12 @@
         </span>
         <span>API Logs</span>
       </button>
+      <button class={activeMenu === 'system-logs' ? 'is-active' : ''} onclick={() => switchMenu('system-logs')}>
+        <span class="nav-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 5h16v4H4V5zm0 5h16v4H4v-4zm0 5h10v4H4v-4z"></path></svg>
+        </span>
+        <span>System Logs</span>
+      </button>
       <button class={activeMenu === 'settings' ? 'is-active' : ''} onclick={() => switchMenu('settings')}>
         <span class="nav-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.96 7.96 0 000-1.88l2.03-1.58-1.92-3.32-2.39.96a8.1 8.1 0 00-1.62-.94L14.9 3h-3.8l-.34 2.18c-.56.22-1.1.52-1.6.9l-2.42-.98-1.9 3.32 2.02 1.6a8.2 8.2 0 000 1.86l-2.03 1.58 1.92 3.34 2.41-.98c.5.38 1.03.7 1.6.92L11.1 21h3.8l.34-2.2c.58-.22 1.12-.52 1.62-.9l2.4.96 1.9-3.32-2.02-1.6zM13 15a3 3 0 110-6 3 3 0 010 6z"></path></svg>
@@ -1864,7 +2396,7 @@
   </aside>
   {/if}
 
-  <main class="content {activeMenu === 'logs' ? 'content-logs' : ''}">
+  <main class="content {activeMenu === 'logs' || activeMenu === 'system-logs' ? 'content-logs' : ''}">
     {#if !isChatRoute}
       <div class="mobile-topbar">
         <button class="mobile-burger" type="button" aria-label="Toggle menu" onclick={toggleMobileSidebar}>
@@ -1896,17 +2428,31 @@
 
     {#if !isChatRoute && activeMenu === 'dashboard'}
       <DashboardView
-        accounts={filteredAccounts()}
+        {apiMode}
+        accounts={dashboardPagination.items}
         totalAccounts={accounts.length}
+        filteredCount={dashboardPagination.totalFiltered}
+        page={dashboardPagination.page}
+        totalPages={dashboardPagination.totalPages}
+        perPage={dashboardPagination.perPage}
+        pageStart={dashboardPagination.startIndex}
+        pageEnd={dashboardPagination.endIndex}
+        pageSizeOptions={pageSizeOptions()}
+        onSetPage={setDashboardPage}
+        onSetPageSize={setDashboardPageSize}
         {showAccountEmail}
         {busy}
         {accountSearchQuery}
         {accountTypeFilter}
+        {usageAvailabilityFilter}
         accountTypeOptions={accountTypeOptions()}
+        usageAvailabilityOptions={usageAvailabilityOptions()}
         onSetAccountSearchQuery={setAccountSearchQuery}
         onSetAccountTypeFilter={setAccountTypeFilter}
+        onSetUsageAvailabilityFilter={setUsageAvailabilityFilter}
         onOpenAddAccountModal={openAddAccountModal}
-        onRefreshAllUsage={refreshAllUsage}
+        onBackupAccounts={backupAllAccounts}
+        onRestoreAccounts={restoreAccounts}
         onUseApiAccount={useAccount}
         onUseCliAccount={useCLIAccount}
         onRefreshUsage={refreshUsage}
@@ -1923,20 +2469,20 @@
       <SettingsView
         busy={settingsBusy}
         {apiMode}
+        {directAPIStrategy}
+        {codingCLIStrategy}
         onSetAPIMode={setAPIMode}
+        onSetDirectAPIStrategy={setDirectAPIStrategy}
+        onSetCodingCLIStrategy={setCodingCLIStrategy}
         {showAccountEmail}
         onToggleShowAccountEmail={toggleShowAccountEmail}
         {autoRefreshEnabled}
-        {autoRefreshMinutes}
-        {autoRefreshMinutesInput}
         {usageAlertThreshold}
         {usageAlertThresholdInput}
         {usageAutoSwitchThreshold}
         {usageAutoSwitchThresholdInput}
         {usageSoundEnabled}
         onToggleAutoRefreshEnabled={toggleAutoRefreshEnabled}
-        onSetAutoRefreshMinutesInput={setAutoRefreshMinutesInput}
-        onCommitAutoRefreshMinutesInput={commitAutoRefreshMinutesInput}
         onSetUsageAlertThresholdInput={setUsageAlertThresholdInput}
         onCommitUsageAlertThresholdInput={commitUsageAlertThresholdInput}
         onSetUsageAutoSwitchThresholdInput={setUsageAutoSwitchThresholdInput}
@@ -1955,8 +2501,19 @@
         busy={settingsBusy}
         {apiKey}
         {openAIEndpoint}
+        openAIResponsesEndpoint={openAIResponsesEndpoint}
         {claudeEndpoint}
         authJSONEndpoint={authJSONEndpoint}
+        usageStatusEndpoint={usageStatusEndpoint}
+        {zoChatEndpoint}
+        {zoModelsEndpoint}
+        {zoKeys}
+        {zoKeyName}
+        {zoKeyValue}
+        {zoStrategy}
+        {zoAvailableModels}
+        {zoModelsLoading}
+        {claudeCodeIntegration}
         {availableModels}
         {modelMappings}
         {mappingAlias}
@@ -1969,11 +2526,21 @@
         onStartEditMapping={startEditMapping}
         onDeleteModelMapping={deleteModelMapping}
         onRegenerateAPIKey={regenerateAPIKey}
+        onEnableClaudeCodeIntegration={openClaudeCodeIntegrationModal}
+        onSetZoKeyName={(value) => (zoKeyName = value)}
+        onSetZoKeyValue={(value) => (zoKeyValue = value)}
+        onAddZoKey={addZoKey}
+        onActivateZoKey={activateZoKey}
+        onResetZoKeyUsage={resetZoKeyUsage}
+        onDeleteZoKey={deleteZoKey}
+        onSetZoStrategy={setZoStrategy}
         onCopyText={copyText}
         {isCopied}
         {openAIExample}
         {claudeExample}
         {authJSONExample}
+        {usageStatusExample}
+        {zoChatExample}
       />
     {/if}
 
@@ -1985,6 +2552,18 @@
         onOpenLogDetail={openLogDetail}
         {formatLogTimestamp}
         {logStatusClass}
+      />
+    {/if}
+
+    {#if !isChatRoute && activeMenu === 'system-logs'}
+      <SystemLogsView
+        {busy}
+        {systemLogs}
+        {systemLogsTotal}
+        onLoadSystemLogs={loadSystemLogs}
+        onClearSystemLogs={clearSystemLogs}
+        onOpenSystemLogDetail={openSystemLogDetail}
+        formatLogTimestamp={formatLogTimestamp}
       />
     {/if}
 
@@ -2164,6 +2743,10 @@
               <span class="mono">{logDetailEntry.path}</span>
               <span> · </span>
               <span class="mono">{logDetailEntry.status || '-'}</span>
+              <span> · </span>
+              <span class="mono">
+                tok req:{logDetailEntry.requestTokens || 0} resp:{logDetailEntry.responseTokens || 0} total:{logDetailEntry.totalTokens || 0}
+              </span>
               {#if logDetailEntry.accountEmail || logDetailEntry.accountID || logDetailEntry.accountHint}
                 <span> · </span>
                 <span class="mono">{logDetailEntry.accountEmail || logDetailEntry.accountID || logDetailEntry.accountHint}</span>
@@ -2180,6 +2763,52 @@
           <div class="log-payload">
             <p>Response Body</p>
             <pre>{logDetailEntry.responseBody || '-'}</pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showClaudeEnableModal}
+    <div class="modal-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && closeClaudeCodeIntegrationModal()}>
+      <div class="modal-card" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeClaudeCodeIntegrationModal()}>
+        <div class="modal-head">
+          <div>
+            <h3>Enable Claude Code</h3>
+            <p class="modal-subtitle">Choose provider for Claude Code integration.</p>
+          </div>
+          <button class="btn btn-secondary btn-small" onclick={closeClaudeCodeIntegrationModal} disabled={settingsBusy}>Close</button>
+        </div>
+        <div class="modal-body">
+          <p class="setting-title">Claude Code integration now uses CodexSess endpoint only.</p>
+          <div class="panel-actions">
+            <button class="btn btn-primary" onclick={enableClaudeCodeIntegration} disabled={settingsBusy}>
+              Enable Now
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if showSystemLogDetail && systemLogDetail}
+    <div class="modal-backdrop" role="presentation" onclick={(event) => event.target === event.currentTarget && closeSystemLogDetail()}>
+      <div class="modal-card log-detail-card" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeSystemLogDetail()}>
+        <div class="modal-head">
+          <div>
+            <h3>System Log Detail</h3>
+            <p class="modal-subtitle">Entry metadata snapshot.</p>
+          </div>
+          <button class="btn btn-secondary btn-small" onclick={closeSystemLogDetail}>Close</button>
+        </div>
+        <div class="log-detail-grid">
+          <div class="log-payload">
+            <p>Message</p>
+            <pre>{systemLogDetail.message || '-'}</pre>
+          </div>
+          <div class="log-payload">
+            <p>Meta JSON</p>
+            <pre>{systemLogDetail.metaJSON || '-'}</pre>
           </div>
         </div>
       </div>

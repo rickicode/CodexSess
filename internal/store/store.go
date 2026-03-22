@@ -15,6 +15,8 @@ type Store struct {
 	db *sql.DB
 }
 
+const accountSelectColumns = `id,email,alias,plan_type,account_id,organization_id,token_id,token_access,token_refresh,codex_home,active_api,active_cli,active,usage_hourly_pct,usage_weekly_pct,usage_hourly_reset_at,usage_weekly_reset_at,usage_raw_json,usage_fetched_at,usage_last_error,usage_window_primary,usage_window_secondary,usage_last_checked_at,usage_next_check_at,usage_fail_count,created_at,updated_at,last_used_at`
+
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -44,7 +46,21 @@ func (s *Store) migrate(ctx context.Context) error {
 			token_access TEXT NOT NULL,
 			token_refresh TEXT NOT NULL,
 			codex_home TEXT NOT NULL,
+			active_api INTEGER NOT NULL DEFAULT 0,
+			active_cli INTEGER NOT NULL DEFAULT 0,
 			active INTEGER NOT NULL DEFAULT 0,
+			usage_hourly_pct INTEGER NOT NULL DEFAULT 0,
+			usage_weekly_pct INTEGER NOT NULL DEFAULT 0,
+			usage_hourly_reset_at TEXT,
+			usage_weekly_reset_at TEXT,
+			usage_raw_json TEXT NOT NULL DEFAULT '{}',
+			usage_fetched_at TEXT NOT NULL DEFAULT '',
+			usage_last_error TEXT NOT NULL DEFAULT '',
+			usage_window_primary TEXT NOT NULL DEFAULT '',
+			usage_window_secondary TEXT NOT NULL DEFAULT '',
+			usage_last_checked_at TEXT,
+			usage_next_check_at TEXT,
+			usage_fail_count INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			last_used_at TEXT NOT NULL
@@ -90,8 +106,46 @@ func (s *Store) migrate(ctx context.Context) error {
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			created_at TEXT NOT NULL
 		);`,
+		`CREATE TABLE IF NOT EXISTS system_logs (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			message TEXT NOT NULL,
+			meta_json TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS zo_api_keys (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			key_secret TEXT NOT NULL,
+			active INTEGER NOT NULL DEFAULT 1,
+			conversation_id TEXT NOT NULL DEFAULT '',
+			conversation_updated_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_used_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS zo_api_key_usage (
+			key_id TEXT PRIMARY KEY,
+			usage_count INTEGER NOT NULL,
+			last_request_at TEXT NOT NULL,
+			last_reset_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE IF NOT EXISTS app_settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_coding_messages_session_created
 			ON coding_messages(session_id, created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_system_logs_created
+			ON system_logs(created_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_zo_api_keys_updated
+			ON zo_api_keys(updated_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_zo_api_key_usage_updated
+			ON zo_api_key_usage(updated_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_app_settings_updated
+			ON app_settings(updated_at);`,
 	}
 	for _, stmt := range stmts {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -122,11 +176,95 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE zo_api_key_usage ADD COLUMN last_request_at TEXT NOT NULL DEFAULT ''`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") && !strings.Contains(msg, "no such table") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE zo_api_keys ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") && !strings.Contains(msg, "no such table") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE zo_api_keys ADD COLUMN conversation_updated_at TEXT NOT NULL DEFAULT ''`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") && !strings.Contains(msg, "no such table") {
+			return err
+		}
+	}
+	alterAccountsColumns := []string{
+		`ALTER TABLE accounts ADD COLUMN active_api INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN active_cli INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN usage_hourly_pct INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN usage_weekly_pct INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE accounts ADD COLUMN usage_hourly_reset_at TEXT`,
+		`ALTER TABLE accounts ADD COLUMN usage_weekly_reset_at TEXT`,
+		`ALTER TABLE accounts ADD COLUMN usage_raw_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE accounts ADD COLUMN usage_fetched_at TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN usage_last_error TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN usage_window_primary TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN usage_window_secondary TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN usage_last_checked_at TEXT`,
+		`ALTER TABLE accounts ADD COLUMN usage_next_check_at TEXT`,
+		`ALTER TABLE accounts ADD COLUMN usage_fail_count INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, stmt := range alterAccountsColumns {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			msg := strings.ToLower(err.Error())
+			if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+				return err
+			}
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE accounts SET active_api=active WHERE active_api=0 AND active=1`); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE accounts
+		SET
+			usage_hourly_pct=COALESCE((SELECT u.hourly_pct FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_hourly_pct),
+			usage_weekly_pct=COALESCE((SELECT u.weekly_pct FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_weekly_pct),
+			usage_hourly_reset_at=COALESCE((SELECT u.hourly_reset_at FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_hourly_reset_at),
+			usage_weekly_reset_at=COALESCE((SELECT u.weekly_reset_at FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_weekly_reset_at),
+			usage_raw_json=CASE
+				WHEN TRIM(COALESCE(usage_raw_json,''))='' THEN COALESCE((SELECT u.raw_json FROM usage_snapshots u WHERE u.account_id=accounts.id), '{}')
+				WHEN usage_raw_json='{}' THEN COALESCE((SELECT u.raw_json FROM usage_snapshots u WHERE u.account_id=accounts.id), '{}')
+				ELSE usage_raw_json
+			END,
+			usage_fetched_at=CASE
+				WHEN TRIM(COALESCE(usage_fetched_at,''))='' THEN COALESCE((SELECT u.fetched_at FROM usage_snapshots u WHERE u.account_id=accounts.id), '')
+				ELSE usage_fetched_at
+			END,
+			usage_last_error=COALESCE((SELECT u.last_error FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_last_error),
+			usage_window_primary=COALESCE((SELECT u.window_primary FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_window_primary),
+			usage_window_secondary=COALESCE((SELECT u.window_secondary FROM usage_snapshots u WHERE u.account_id=accounts.id), usage_window_secondary)
+	`); err != nil {
+		return err
+	}
+	accountIndexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_accounts_active_api
+			ON accounts(active_api);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_active_cli
+			ON accounts(active_cli);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_usage_next_check
+			ON accounts(usage_next_check_at);`,
+	}
+	for _, stmt := range accountIndexes {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func (s *Store) UpsertAccount(ctx context.Context, a Account) error {
 	now := time.Now().UTC().Format(time.RFC3339)
+	activeAPI := a.ActiveAPI
+	if !activeAPI && a.Active {
+		activeAPI = true
+	}
 	if a.CreatedAt.IsZero() {
 		a.CreatedAt = time.Now().UTC()
 	}
@@ -137,8 +275,8 @@ func (s *Store) UpsertAccount(ctx context.Context, a Account) error {
 		a.UpdatedAt = time.Now().UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO accounts(id,email,alias,plan_type,account_id,organization_id,token_id,token_access,token_refresh,codex_home,active,created_at,updated_at,last_used_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO accounts(id,email,alias,plan_type,account_id,organization_id,token_id,token_access,token_refresh,codex_home,active_api,active_cli,active,created_at,updated_at,last_used_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET
 			email=excluded.email,
 			alias=excluded.alias,
@@ -149,12 +287,14 @@ func (s *Store) UpsertAccount(ctx context.Context, a Account) error {
 			token_access=excluded.token_access,
 			token_refresh=excluded.token_refresh,
 			codex_home=excluded.codex_home,
+			active_api=excluded.active_api,
+			active_cli=excluded.active_cli,
 			active=excluded.active,
 			updated_at=excluded.updated_at,
 			last_used_at=excluded.last_used_at
 	`,
 		a.ID, a.Email, a.Alias, a.PlanType, a.AccountID, a.OrganizationID,
-		a.TokenID, a.TokenAccess, a.TokenRefresh, a.CodexHome, boolToInt(a.Active),
+		a.TokenID, a.TokenAccess, a.TokenRefresh, a.CodexHome, boolToInt(activeAPI), boolToInt(a.ActiveCLI), boolToInt(a.Active),
 		a.CreatedAt.UTC().Format(time.RFC3339), now, a.LastUsedAt.UTC().Format(time.RFC3339),
 	)
 	return err
@@ -166,10 +306,30 @@ func (s *Store) SetActiveAccount(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET active=0`); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET active=0,active_api=0`); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE accounts SET active=1,last_used_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), id)
+	res, err := tx.ExecContext(ctx, `UPDATE accounts SET active=1,active_api=1,last_used_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	return tx.Commit()
+}
+
+func (s *Store) SetActiveCLIAccount(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE accounts SET active_cli=0`); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE accounts SET active_cli=1,last_used_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339), id)
 	if err != nil {
 		return err
 	}
@@ -186,35 +346,34 @@ func (s *Store) DeleteAccount(ctx context.Context, id string) error {
 }
 
 func (s *Store) ListAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,email,alias,plan_type,account_id,organization_id,token_id,token_access,token_refresh,codex_home,active,created_at,updated_at,last_used_at FROM accounts ORDER BY updated_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+accountSelectColumns+` FROM accounts ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Account
 	for rows.Next() {
-		var a Account
-		var active int
-		var createdAt, updatedAt, lastUsedAt string
-		if err := rows.Scan(&a.ID, &a.Email, &a.Alias, &a.PlanType, &a.AccountID, &a.OrganizationID, &a.TokenID, &a.TokenAccess, &a.TokenRefresh, &a.CodexHome, &active, &createdAt, &updatedAt, &lastUsedAt); err != nil {
+		a, err := scanAccountRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		a.Active = active == 1
-		a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
-		a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
-		a.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsedAt)
 		out = append(out, a)
 	}
 	return out, rows.Err()
 }
 
 func (s *Store) FindAccountBySelector(ctx context.Context, selector string) (Account, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,email,alias,plan_type,account_id,organization_id,token_id,token_access,token_refresh,codex_home,active,created_at,updated_at,last_used_at FROM accounts WHERE id=? OR email=? OR alias=? LIMIT 1`, selector, selector, selector)
+	row := s.db.QueryRowContext(ctx, `SELECT `+accountSelectColumns+` FROM accounts WHERE id=? OR email=? OR alias=? LIMIT 1`, selector, selector, selector)
 	return scanAccount(row)
 }
 
 func (s *Store) ActiveAccount(ctx context.Context) (Account, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id,email,alias,plan_type,account_id,organization_id,token_id,token_access,token_refresh,codex_home,active,created_at,updated_at,last_used_at FROM accounts WHERE active=1 LIMIT 1`)
+	row := s.db.QueryRowContext(ctx, `SELECT `+accountSelectColumns+` FROM accounts WHERE active_api=1 LIMIT 1`)
+	return scanAccount(row)
+}
+
+func (s *Store) ActiveCLIAccount(ctx context.Context) (Account, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+accountSelectColumns+` FROM accounts WHERE active_cli=1 LIMIT 1`)
 	return scanAccount(row)
 }
 
@@ -227,24 +386,32 @@ func (s *Store) SaveUsage(ctx context.Context, u UsageSnapshot) error {
 		wr = u.WeeklyResetAt.UTC().Format(time.RFC3339)
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO usage_snapshots(account_id,hourly_pct,weekly_pct,hourly_reset_at,weekly_reset_at,raw_json,fetched_at,last_error,window_primary,window_secondary)
-		VALUES(?,?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(account_id) DO UPDATE SET
-			hourly_pct=excluded.hourly_pct,
-			weekly_pct=excluded.weekly_pct,
-			hourly_reset_at=excluded.hourly_reset_at,
-			weekly_reset_at=excluded.weekly_reset_at,
-			raw_json=excluded.raw_json,
-			fetched_at=excluded.fetched_at,
-			last_error=excluded.last_error,
-			window_primary=excluded.window_primary,
-			window_secondary=excluded.window_secondary
-	`, u.AccountID, u.HourlyPct, u.WeeklyPct, hr, wr, u.RawJSON, u.FetchedAt.UTC().Format(time.RFC3339), u.LastError, u.WindowPrimary, u.WindowSecondary)
+		UPDATE accounts SET
+			usage_hourly_pct=?,
+			usage_weekly_pct=?,
+			usage_hourly_reset_at=?,
+			usage_weekly_reset_at=?,
+			usage_raw_json=?,
+			usage_fetched_at=?,
+			usage_last_error=?,
+			usage_window_primary=?,
+			usage_window_secondary=?,
+			usage_last_checked_at=?,
+			usage_fail_count=?,
+			usage_next_check_at=?
+		WHERE id=?
+	`,
+		u.HourlyPct, u.WeeklyPct, hr, wr, u.RawJSON, u.FetchedAt.UTC().Format(time.RFC3339), u.LastError, u.WindowPrimary, u.WindowSecondary,
+		u.FetchedAt.UTC().Format(time.RFC3339),
+		intBool(strings.TrimSpace(u.LastError) != ""),
+		nextUsageCheckAt(u).UTC().Format(time.RFC3339),
+		u.AccountID,
+	)
 	return err
 }
 
 func (s *Store) GetUsage(ctx context.Context, accountID string) (UsageSnapshot, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT account_id,hourly_pct,weekly_pct,hourly_reset_at,weekly_reset_at,raw_json,fetched_at,last_error,window_primary,window_secondary FROM usage_snapshots WHERE account_id=?`, accountID)
+	row := s.db.QueryRowContext(ctx, `SELECT id,usage_hourly_pct,usage_weekly_pct,usage_hourly_reset_at,usage_weekly_reset_at,usage_raw_json,usage_fetched_at,usage_last_error,usage_window_primary,usage_window_secondary FROM accounts WHERE id=?`, accountID)
 	var u UsageSnapshot
 	var hr, wr sql.NullString
 	var fetched string
@@ -264,7 +431,7 @@ func (s *Store) GetUsage(ctx context.Context, accountID string) (UsageSnapshot, 
 }
 
 func (s *Store) ListUsageSnapshots(ctx context.Context) (map[string]UsageSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT account_id,hourly_pct,weekly_pct,hourly_reset_at,weekly_reset_at,raw_json,fetched_at,last_error,window_primary,window_secondary FROM usage_snapshots`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,usage_hourly_pct,usage_weekly_pct,usage_hourly_reset_at,usage_weekly_reset_at,usage_raw_json,usage_fetched_at,usage_last_error,usage_window_primary,usage_window_secondary FROM accounts`)
 	if err != nil {
 		return nil, err
 	}
@@ -477,18 +644,94 @@ func (s *Store) ListCodingMessages(ctx context.Context, sessionID string) ([]Cod
 
 func scanAccount(row *sql.Row) (Account, error) {
 	var a Account
-	var active int
+	var active, activeAPI, activeCLI int
 	var createdAt, updatedAt, lastUsedAt string
-	if err := row.Scan(&a.ID, &a.Email, &a.Alias, &a.PlanType, &a.AccountID, &a.OrganizationID, &a.TokenID, &a.TokenAccess, &a.TokenRefresh, &a.CodexHome, &active, &createdAt, &updatedAt, &lastUsedAt); err != nil {
+	var usageFetched string
+	var usageHourlyResetAt, usageWeeklyResetAt sql.NullString
+	var usageLastCheckedAt, usageNextCheckAt sql.NullString
+	if err := row.Scan(
+		&a.ID, &a.Email, &a.Alias, &a.PlanType, &a.AccountID, &a.OrganizationID, &a.TokenID, &a.TokenAccess, &a.TokenRefresh, &a.CodexHome,
+		&activeAPI, &activeCLI, &active,
+		&a.UsageHourlyPct, &a.UsageWeeklyPct, &usageHourlyResetAt, &usageWeeklyResetAt, &a.UsageRawJSON, &usageFetched, &a.UsageLastError, &a.UsageWindowPrimary, &a.UsageWindowSecondary,
+		&usageLastCheckedAt, &usageNextCheckAt, &a.UsageFailCount,
+		&createdAt, &updatedAt, &lastUsedAt,
+	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return a, fmt.Errorf("account not found")
 		}
 		return a, err
 	}
 	a.Active = active == 1
+	a.ActiveAPI = activeAPI == 1
+	a.ActiveCLI = activeCLI == 1
+	if a.ActiveAPI {
+		a.Active = true
+	}
 	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	a.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsedAt)
+	if usageHourlyResetAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageHourlyResetAt.String)
+		a.UsageHourlyResetAt = &t
+	}
+	if usageWeeklyResetAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageWeeklyResetAt.String)
+		a.UsageWeeklyResetAt = &t
+	}
+	a.UsageFetchedAt, _ = time.Parse(time.RFC3339, usageFetched)
+	if usageLastCheckedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageLastCheckedAt.String)
+		a.UsageLastCheckedAt = &t
+	}
+	if usageNextCheckAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageNextCheckAt.String)
+		a.UsageNextCheckAt = &t
+	}
+	return a, nil
+}
+
+func scanAccountRows(rows *sql.Rows) (Account, error) {
+	var a Account
+	var active, activeAPI, activeCLI int
+	var createdAt, updatedAt, lastUsedAt string
+	var usageFetched string
+	var usageHourlyResetAt, usageWeeklyResetAt sql.NullString
+	var usageLastCheckedAt, usageNextCheckAt sql.NullString
+	if err := rows.Scan(
+		&a.ID, &a.Email, &a.Alias, &a.PlanType, &a.AccountID, &a.OrganizationID, &a.TokenID, &a.TokenAccess, &a.TokenRefresh, &a.CodexHome,
+		&activeAPI, &activeCLI, &active,
+		&a.UsageHourlyPct, &a.UsageWeeklyPct, &usageHourlyResetAt, &usageWeeklyResetAt, &a.UsageRawJSON, &usageFetched, &a.UsageLastError, &a.UsageWindowPrimary, &a.UsageWindowSecondary,
+		&usageLastCheckedAt, &usageNextCheckAt, &a.UsageFailCount,
+		&createdAt, &updatedAt, &lastUsedAt,
+	); err != nil {
+		return a, err
+	}
+	a.Active = active == 1
+	a.ActiveAPI = activeAPI == 1
+	a.ActiveCLI = activeCLI == 1
+	if a.ActiveAPI {
+		a.Active = true
+	}
+	a.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+	a.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	a.LastUsedAt, _ = time.Parse(time.RFC3339, lastUsedAt)
+	if usageHourlyResetAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageHourlyResetAt.String)
+		a.UsageHourlyResetAt = &t
+	}
+	if usageWeeklyResetAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageWeeklyResetAt.String)
+		a.UsageWeeklyResetAt = &t
+	}
+	a.UsageFetchedAt, _ = time.Parse(time.RFC3339, usageFetched)
+	if usageLastCheckedAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageLastCheckedAt.String)
+		a.UsageLastCheckedAt = &t
+	}
+	if usageNextCheckAt.Valid {
+		t, _ := time.Parse(time.RFC3339, usageNextCheckAt.String)
+		a.UsageNextCheckAt = &t
+	}
 	return a, nil
 }
 
@@ -497,4 +740,19 @@ func boolToInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func intBool(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+func nextUsageCheckAt(u UsageSnapshot) time.Time {
+	now := time.Now().UTC()
+	if strings.TrimSpace(u.LastError) != "" {
+		return now.Add(30 * time.Minute)
+	}
+	return now.Add(15 * time.Minute)
 }

@@ -12,63 +12,15 @@ import (
 	"github.com/ricki/codexsess/internal/util"
 )
 
-func TestEnsureCodingCLIAccountForCoding_SwitchesToBetterCandidate(t *testing.T) {
+func TestEnsureCodingCLIAccountForCoding_KeepCurrentCLIWhenAlreadySet(t *testing.T) {
 	svc, st, cry, cfg := newCodingTestService(t)
 
 	current := seedCodingTestAccount(t, st, cry, cfg, "acc_current", "current@example.com", true)
-	better := seedCodingTestAccount(t, st, cry, cfg, "acc_better", "better@example.com", false)
+	_ = seedCodingTestAccount(t, st, cry, cfg, "acc_other", "other@example.com", false)
 
 	if _, err := svc.UseAccountCLI(t.Context(), current.ID); err != nil {
 		t.Fatalf("set cli active current: %v", err)
 	}
-	now := time.Now().UTC()
-	if err := st.SaveUsage(t.Context(), store.UsageSnapshot{
-		AccountID: current.ID, HourlyPct: 10, WeeklyPct: 10, RawJSON: `{}`, FetchedAt: now,
-	}); err != nil {
-		t.Fatalf("save current usage: %v", err)
-	}
-	if err := st.SaveUsage(t.Context(), store.UsageSnapshot{
-		AccountID: better.ID, HourlyPct: 75, WeeklyPct: 70, RawJSON: `{}`, FetchedAt: now,
-	}); err != nil {
-		t.Fatalf("save better usage: %v", err)
-	}
-	svc.Cfg.UsageAutoSwitchThreshold = 20
-
-	if err := svc.ensureCodingCLIAccountForCoding(t.Context()); err != nil {
-		t.Fatalf("ensureCodingCLIAccountForCoding: %v", err)
-	}
-
-	activeID, err := svc.ActiveCLIAccountID(t.Context())
-	if err != nil {
-		t.Fatalf("ActiveCLIAccountID: %v", err)
-	}
-	if activeID != better.ID {
-		t.Fatalf("expected active cli %s, got %s", better.ID, activeID)
-	}
-}
-
-func TestEnsureCodingCLIAccountForCoding_DoesNotDowngradeWhenFallbackOnlyWorse(t *testing.T) {
-	svc, st, cry, cfg := newCodingTestService(t)
-
-	current := seedCodingTestAccount(t, st, cry, cfg, "acc_current", "current@example.com", true)
-	worse := seedCodingTestAccount(t, st, cry, cfg, "acc_worse", "worse@example.com", false)
-
-	if _, err := svc.UseAccountCLI(t.Context(), current.ID); err != nil {
-		t.Fatalf("set cli active current: %v", err)
-	}
-	now := time.Now().UTC()
-	if err := st.SaveUsage(t.Context(), store.UsageSnapshot{
-		AccountID: current.ID, HourlyPct: 19, WeeklyPct: 19, RawJSON: `{}`, FetchedAt: now,
-	}); err != nil {
-		t.Fatalf("save current usage: %v", err)
-	}
-	if err := st.SaveUsage(t.Context(), store.UsageSnapshot{
-		AccountID: worse.ID, HourlyPct: 5, WeeklyPct: 5, RawJSON: `{}`, FetchedAt: now,
-	}); err != nil {
-		t.Fatalf("save worse usage: %v", err)
-	}
-	svc.Cfg.UsageAutoSwitchThreshold = 20
-
 	if err := svc.ensureCodingCLIAccountForCoding(t.Context()); err != nil {
 		t.Fatalf("ensureCodingCLIAccountForCoding: %v", err)
 	}
@@ -78,7 +30,26 @@ func TestEnsureCodingCLIAccountForCoding_DoesNotDowngradeWhenFallbackOnlyWorse(t
 		t.Fatalf("ActiveCLIAccountID: %v", err)
 	}
 	if activeID != current.ID {
-		t.Fatalf("expected active cli tetap %s, got %s", current.ID, activeID)
+		t.Fatalf("expected active cli %s, got %s", current.ID, activeID)
+	}
+}
+
+func TestEnsureCodingCLIAccountForCoding_SelectsFirstWhenCLIEmpty(t *testing.T) {
+	svc, st, cry, cfg := newCodingTestService(t)
+
+	first := seedCodingTestAccount(t, st, cry, cfg, "acc_first", "first@example.com", false)
+	_ = seedCodingTestAccount(t, st, cry, cfg, "acc_second", "second@example.com", false)
+
+	if err := svc.ensureCodingCLIAccountForCoding(t.Context()); err != nil {
+		t.Fatalf("ensureCodingCLIAccountForCoding: %v", err)
+	}
+
+	activeID, err := svc.ActiveCLIAccountID(t.Context())
+	if err != nil {
+		t.Fatalf("ActiveCLIAccountID: %v", err)
+	}
+	if activeID != first.ID {
+		t.Fatalf("expected active cli %s, got %s", first.ID, activeID)
 	}
 }
 

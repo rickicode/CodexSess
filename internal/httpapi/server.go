@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -26,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/google/uuid"
 	"github.com/ricki/codexsess/internal/config"
 	"github.com/ricki/codexsess/internal/provider"
@@ -125,8 +127,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/coding/messages", s.handleWebCodingMessages)
 	mux.HandleFunc("/api/coding/status", s.handleWebCodingStatus)
 	mux.HandleFunc("/api/coding/stop", s.handleWebCodingStop)
+	mux.HandleFunc("/api/coding/ws", s.handleWebCodingWS)
 	mux.HandleFunc("/api/coding/chat", s.handleWebCodingChat)
-	mux.HandleFunc("/api/coding/chat/stream", s.handleWebCodingChatStream)
 	mux.HandleFunc("/api/coding/path-suggestions", s.handleWebCodingPathSuggestions)
 	mux.HandleFunc("/api/coding/skills", s.handleWebCodingSkills)
 	mux.HandleFunc("/api/auth/browser/start", s.handleWebBrowserStart)
@@ -1102,6 +1104,37 @@ func maxInt(a, b int) int {
 func (s *Server) withAccessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		path := strings.TrimSpace(r.URL.Path)
+		if path == "" {
+			path = "/"
+		}
+
+		// WebSocket upgrade paths should bypass response writer wrapping to avoid
+		// hijack/upgrade incompatibilities in middleware wrappers.
+		if path == "/api/coding/ws" {
+			next.ServeHTTP(w, r)
+			remote := strings.TrimSpace(r.RemoteAddr)
+			if host, _, err := net.SplitHostPort(remote); err == nil && host != "" {
+				remote = host
+			}
+			accountHint := firstNonEmpty(strings.TrimSpace(r.Header.Get("X-Codex-Account")), "-")
+			apiAuth := classifyAuthSource(r)
+			ua := firstNonEmpty(truncateForLog(strings.TrimSpace(r.UserAgent()), 72), "-")
+			log.Printf(
+				"[ACCESS] %-7s %-38s status=%3s latency=%4dms from=%s kind=%s auth=%s account=%s ua=%s",
+				strings.ToUpper(strings.TrimSpace(r.Method)),
+				path,
+				"WS",
+				time.Since(start).Milliseconds(),
+				firstNonEmpty(remote, "-"),
+				requestKind(path),
+				apiAuth,
+				accountHint,
+				ua,
+			)
+			return
+		}
+
 		rec := &accessLogRecorder{
 			ResponseWriter: w,
 			status:         http.StatusOK,
@@ -1111,10 +1144,6 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 		remote := strings.TrimSpace(r.RemoteAddr)
 		if host, _, err := net.SplitHostPort(remote); err == nil && host != "" {
 			remote = host
-		}
-		path := strings.TrimSpace(r.URL.Path)
-		if path == "" {
-			path = "/"
 		}
 		accountHint := firstNonEmpty(strings.TrimSpace(r.Header.Get("X-Codex-Account")), "-")
 		apiAuth := classifyAuthSource(r)
@@ -1340,6 +1369,14 @@ func (r *accessLogRecorder) Flush() {
 	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+func (r *accessLogRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("hijacker unsupported")
+	}
+	return hj.Hijack()
 }
 
 func withCORS(next http.Handler) http.Handler {
@@ -6741,6 +6778,151 @@ func (s *Server) handleWebCodingStop(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(req *http.Request) bool {
+			return wsOriginAllowed(req)
+		},
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	connClosed := atomic.Bool{}
+	var writeMu sync.Mutex
+	writeJSON := func(payload map[string]any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if connClosed.Load() {
+			return websocket.ErrCloseSent
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		err := conn.WriteJSON(payload)
+		if err != nil {
+			connClosed.Store(true)
+		}
+		return err
+	}
+
+	type codingWSRequest struct {
+		Type        string `json:"type"`
+		SessionID   string `json:"session_id"`
+		Content     string `json:"content"`
+		Model       string `json:"model"`
+		WorkDir     string `json:"work_dir"`
+		SandboxMode string `json:"sandbox_mode"`
+		Command     string `json:"command"`
+	}
+
+	inFlight := atomic.Bool{}
+	for {
+		var req codingWSRequest
+		if err := conn.ReadJSON(&req); err != nil {
+			connClosed.Store(true)
+			return
+		}
+		reqType := strings.ToLower(strings.TrimSpace(req.Type))
+		switch reqType {
+		case "ping":
+			_ = writeJSON(map[string]any{"event": "pong"})
+		case "stop":
+			sessionID := strings.TrimSpace(req.SessionID)
+			if sessionID == "" {
+				_ = writeJSON(map[string]any{"event": "error", "message": "session_id is required", "code": "bad_request"})
+				continue
+			}
+			stopped := s.svc.StopCodingRun(sessionID)
+			if !stopped {
+				_ = writeJSON(map[string]any{"event": "error", "message": "session not running", "code": "not_running"})
+				continue
+			}
+			_ = writeJSON(map[string]any{"event": "activity", "text": "stop requested", "session_id": sessionID})
+		case "send":
+			if inFlight.Load() {
+				_ = writeJSON(map[string]any{"event": "error", "message": service.ErrCodingSessionBusy.Error(), "code": "session_busy"})
+				continue
+			}
+			sessionID := strings.TrimSpace(req.SessionID)
+			if sessionID == "" {
+				_ = writeJSON(map[string]any{"event": "error", "message": "session_id is required", "code": "bad_request"})
+				continue
+			}
+			inFlight.Store(true)
+			_ = writeJSON(map[string]any{"event": "started", "session_id": sessionID})
+			go func(payload codingWSRequest) {
+				defer inFlight.Store(false)
+				bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+				defer cancel()
+				result, runErr := s.svc.SendCodingMessageStream(
+					bgCtx,
+					payload.SessionID,
+					payload.Content,
+					payload.Model,
+					payload.WorkDir,
+					payload.SandboxMode,
+					payload.Command,
+					func(evt provider.ChatEvent) error {
+						eventType := strings.TrimSpace(strings.ToLower(evt.Type))
+						switch eventType {
+						case "assistant_message", "activity", "raw_event", "stderr", "delta":
+							if !connClosed.Load() {
+								_ = writeJSON(map[string]any{
+									"event": eventType,
+									"text":  evt.Text,
+								})
+							}
+						}
+						return nil
+					},
+				)
+				if runErr != nil {
+					_ = writeJSON(map[string]any{"event": "error", "message": runErr.Error()})
+					return
+				}
+				if connClosed.Load() {
+					return
+				}
+				_ = writeJSON(map[string]any{
+					"event":              "done",
+					"session":            mapCodingSession(result.Session),
+					"user":               mapCodingMessage(result.User),
+					"assistant":          mapCodingMessage(result.Assistant),
+					"event_messages":     mapCodingMessages(result.EventMessages),
+					"assistant_messages": mapCodingMessages(result.Assistants),
+				})
+			}(req)
+		default:
+			_ = writeJSON(map[string]any{"event": "error", "message": "unsupported request type", "code": "bad_request"})
+		}
+	}
+}
+
+func wsOriginAllowed(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	originURL, err := url.Parse(origin)
+	if err != nil || strings.TrimSpace(originURL.Host) == "" {
+		return false
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		return false
+	}
+	host = strings.TrimSpace(strings.Split(host, ",")[0])
+	return strings.EqualFold(originURL.Host, host)
+}
+
 func (s *Server) handleWebCodingChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
@@ -6769,124 +6951,6 @@ func (s *Server) handleWebCodingChat(w http.ResponseWriter, r *http.Request) {
 	}
 	respondJSON(w, 200, map[string]any{
 		"ok":                 true,
-		"session":            mapCodingSession(result.Session),
-		"user":               mapCodingMessage(result.User),
-		"assistant":          mapCodingMessage(result.Assistant),
-		"event_messages":     mapCodingMessages(result.EventMessages),
-		"assistant_messages": mapCodingMessages(result.Assistants),
-	})
-}
-
-func (s *Server) handleWebCodingChatStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondErr(w, 405, "method_not_allowed", "method not allowed")
-		return
-	}
-	var req struct {
-		SessionID   string `json:"session_id"`
-		Content     string `json:"content"`
-		Model       string `json:"model"`
-		WorkDir     string `json:"work_dir"`
-		SandboxMode string `json:"sandbox_mode"`
-		Command     string `json:"command"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondErr(w, 400, "bad_request", "invalid JSON")
-		return
-	}
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		respondErr(w, 500, "internal_error", "streaming unsupported by server")
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	writeEvent := func(payload map[string]any) error {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write([]byte("data: " + string(b) + "\n\n")); err != nil {
-			return err
-		}
-		flusher.Flush()
-		return nil
-	}
-	clientGone := atomic.Bool{}
-	go func() {
-		<-r.Context().Done()
-		clientGone.Store(true)
-	}()
-
-	writeIfConnected := func(payload map[string]any) error {
-		if clientGone.Load() {
-			return nil
-		}
-		if err := writeEvent(payload); err != nil {
-			clientGone.Store(true)
-		}
-		return nil
-	}
-
-	_ = writeIfConnected(map[string]any{"event": "started"})
-	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
-	defer cancel()
-
-	result, err := s.svc.SendCodingMessageStream(bgCtx, req.SessionID, req.Content, req.Model, req.WorkDir, req.SandboxMode, req.Command, func(evt provider.ChatEvent) error {
-		eventType := strings.TrimSpace(strings.ToLower(evt.Type))
-		switch eventType {
-		case "assistant_message":
-			return writeIfConnected(map[string]any{
-				"event": "assistant_message",
-				"text":  evt.Text,
-			})
-		case "activity":
-			return writeIfConnected(map[string]any{
-				"event": "activity",
-				"text":  evt.Text,
-			})
-		case "raw_event":
-			return writeIfConnected(map[string]any{
-				"event": "raw_event",
-				"text":  evt.Text,
-			})
-		case "stderr":
-			return writeIfConnected(map[string]any{
-				"event": "stderr",
-				"text":  evt.Text,
-			})
-		case "delta":
-			return writeIfConnected(map[string]any{
-				"event": "delta",
-				"text":  evt.Text,
-			})
-		default:
-			return nil
-		}
-	})
-	if err != nil {
-		if errors.Is(err, service.ErrCodingSessionBusy) {
-			_ = writeIfConnected(map[string]any{
-				"event":   "error",
-				"message": err.Error(),
-				"code":    "session_busy",
-			})
-			return
-		}
-		_ = writeIfConnected(map[string]any{
-			"event":   "error",
-			"message": err.Error(),
-		})
-		return
-	}
-	_ = writeIfConnected(map[string]any{
-		"event":              "done",
 		"session":            mapCodingSession(result.Session),
 		"user":               mapCodingMessage(result.User),
 		"assistant":          mapCodingMessage(result.Assistant),

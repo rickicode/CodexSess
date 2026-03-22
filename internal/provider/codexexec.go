@@ -208,6 +208,7 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 	var lastExecErr string
 	var emittedDelta bool
 	assistantMessages := make([]string, 0, 4)
+	var streamedDelta strings.Builder
 	toolCalls := make([]ToolCall, 0, 4)
 	seenToolCalls := map[string]struct{}{}
 	sc := bufio.NewScanner(stdout)
@@ -244,6 +245,7 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 			}
 		}
 		if delta, ok := codexEventDeltaText(evt); ok {
+			streamedDelta.WriteString(delta)
 			if err := onEvent(ChatEvent{Type: "delta", Text: delta}); err != nil {
 				_ = cmd.Process.Kill()
 				_ = cmd.Wait()
@@ -291,6 +293,14 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 	if len(assistantMessages) > 0 {
 		out.Messages = assistantMessages
 		out.Text = strings.Join(assistantMessages, "\n\n")
+	}
+	if strings.TrimSpace(out.Text) == "" {
+		if merged := strings.TrimSpace(streamedDelta.String()); merged != "" {
+			out.Text = merged
+			if len(out.Messages) == 0 {
+				out.Messages = []string{merged}
+			}
+		}
 	}
 	if len(toolCalls) > 0 {
 		out.ToolCalls = toolCalls

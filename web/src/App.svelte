@@ -149,11 +149,32 @@
     status = { text, kind };
   }
 
+  function isLoopbackHost(hostname) {
+    const host = String(hostname || '').trim().toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  }
+
+  function resolvedAPIBase() {
+    if (!apiBase) return '';
+    if (typeof window === 'undefined') return apiBase;
+    try {
+      const parsed = new URL(apiBase, window.location.origin);
+      if (isLoopbackHost(parsed.hostname) && !isLoopbackHost(window.location.hostname)) {
+        return '';
+      }
+      return `${parsed.origin}`.replace(/\/+$/, '');
+    } catch {
+      return apiBase;
+    }
+  }
+
   function toAPIURL(url) {
     const raw = String(url || '').trim();
-    if (!apiBase || /^https?:\/\//i.test(raw)) return raw;
-    if (raw.startsWith('/')) return `${apiBase}${raw}`;
-    return `${apiBase}/${raw}`;
+    if (/^https?:\/\//i.test(raw)) return raw;
+    const base = resolvedAPIBase();
+    if (!base) return raw;
+    if (raw.startsWith('/')) return `${base}${raw}`;
+    return `${base}/${raw}`;
   }
 
   function sendClientEvent(type, message, data = {}, level = 'info') {

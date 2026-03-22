@@ -1451,6 +1451,11 @@ input[type='range'].threshold-slider:focus-visible {
   padding: 7px 12px;
   border-top: 1px solid var(--border);
   background: #121212;
+  display: grid;
+  gap: 4px;
+}
+
+.coding-status-main {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -1460,6 +1465,14 @@ input[type='range'].threshold-slider:focus-visible {
 .coding-status-saving {
   color: #9beede;
   font-size: 11px;
+}
+
+.coding-status-command {
+  color: #9beede;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .modal-backdrop-coding {

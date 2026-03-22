@@ -12,14 +12,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/ricki/codexsess/internal/config"
 	"github.com/ricki/codexsess/internal/provider"
 	"github.com/ricki/codexsess/internal/store"
 )
 
 const (
-	codingCLIUsageMinPercent   = 20
-	codingUsageFreshnessTTL    = 5 * time.Minute
 	codingEventPersistMax      = 240
 	codingEventContentMaxRunes = 6000
 )
@@ -132,8 +129,13 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 		}
 		prompt = buildContextHygienePrompt(buildSessionPromptWithIncoming(history, promptInput))
 	}
-	s.codingExecMu.Lock()
-	_ = s.ensureCodingCLIAccountForCoding(ctx)
+	unlockExec, err := s.acquireCodingExecLock(runCtx)
+	if err != nil {
+		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
+		return CodingChatResult{}, err
+	}
+	defer unlockExec()
+	_ = s.ensureCodingCLIAccountForCoding(runCtx)
 	codexHome := strings.TrimSpace(s.Cfg.CodexHome)
 
 	reply, err := s.Codex.ChatWithOptions(runCtx, provider.ExecOptions{
@@ -157,8 +159,8 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 			CommandMode: commandMode,
 		})
 	}
-	s.codingExecMu.Unlock()
 	if err != nil {
+		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
 		return CodingChatResult{}, err
 	}
 
@@ -174,7 +176,9 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	}
 	assistantParts := normalizedAssistantParts(reply.Messages, reply.Text)
 	if len(assistantParts) == 0 {
-		return CodingChatResult{}, fmt.Errorf("empty response from codex")
+		emptyErr := fmt.Errorf("empty response from codex")
+		_ = s.appendCodingRunFailureMessage(runCtx, sid, emptyErr)
+		return CodingChatResult{}, emptyErr
 	}
 	assistants := make([]store.CodingMessage, 0, len(assistantParts))
 	for idx, part := range assistantParts {
@@ -291,11 +295,17 @@ func (s *Service) SendCodingMessageStream(
 		}
 		prompt = buildContextHygienePrompt(buildSessionPromptWithIncoming(history, promptInput))
 	}
-	s.codingExecMu.Lock()
-	_ = s.ensureCodingCLIAccountForCoding(ctx)
+	unlockExec, err := s.acquireCodingExecLock(runCtx)
+	if err != nil {
+		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
+		return CodingChatResult{}, err
+	}
+	defer unlockExec()
+	_ = s.ensureCodingCLIAccountForCoding(runCtx)
 	codexHome := strings.TrimSpace(s.Cfg.CodexHome)
 
 	streamedParts := make([]string, 0, 4)
+	var streamedText strings.Builder
 	persistedEvents := make([]store.CodingMessage, 0, codingEventPersistMax+1)
 	droppedEvents := 0
 	reply, err := s.Codex.StreamChatWithOptions(runCtx, provider.ExecOptions{
@@ -322,6 +332,10 @@ func (s *Service) SendCodingMessageStream(
 		}
 		if eventType == "assistant_message" {
 			streamedParts = append(streamedParts, delta)
+			streamedText.WriteString(delta)
+		}
+		if eventType == "delta" {
+			streamedText.WriteString(delta)
 		}
 			if role := roleFromCodingStreamEvent(eventType); role != "" {
 				item := store.CodingMessage{
@@ -362,17 +376,24 @@ func (s *Service) SendCodingMessageStream(
 			return onEvent(evt)
 		})
 	}
-	s.codingExecMu.Unlock()
 	if err != nil {
+		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
 		return CodingChatResult{}, err
 	}
 
 	assistantParts := normalizedAssistantParts(reply.Messages, reply.Text)
+	if len(assistantParts) == 0 {
+		if merged := strings.TrimSpace(streamedText.String()); merged != "" {
+			assistantParts = []string{merged}
+		}
+	}
 	if len(assistantParts) == 0 && len(streamedParts) > 0 {
 		assistantParts = normalizedAssistantParts(streamedParts, "")
 	}
 	if len(assistantParts) == 0 {
-		return CodingChatResult{}, fmt.Errorf("empty response from codex")
+		emptyErr := fmt.Errorf("empty response from codex")
+		_ = s.appendCodingRunFailureMessage(runCtx, sid, emptyErr)
+		return CodingChatResult{}, emptyErr
 	}
 
 	if droppedEvents > 0 {
@@ -434,6 +455,23 @@ func (s *Service) SendCodingMessageStream(
 		Assistants:    assistants,
 		EventMessages: persistedEvents,
 	}, nil
+}
+
+func (s *Service) acquireCodingExecLock(ctx context.Context) (func(), error) {
+	for {
+		if s.codingExecMu.TryLock() {
+			return func() { s.codingExecMu.Unlock() }, nil
+		}
+		select {
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err == nil {
+				err = fmt.Errorf("coding execution canceled")
+			}
+			return nil, err
+		case <-time.After(40 * time.Millisecond):
+		}
+	}
 }
 
 func (s *Service) beginCodingRun(sessionID string) (func(), error) {
@@ -518,6 +556,31 @@ func roleFromCodingStreamEvent(eventType string) string {
 	default:
 		return ""
 	}
+}
+
+func (s *Service) appendCodingRunFailureMessage(ctx context.Context, sessionID string, runErr error) error {
+	sid := strings.TrimSpace(sessionID)
+	if sid == "" || runErr == nil {
+		return nil
+	}
+	_, err := s.Store.AppendCodingMessage(ctx, store.CodingMessage{
+		ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		SessionID: sid,
+		Role:      "stderr",
+		Content:   truncateRunes(fmt.Sprintf("Run failed: %s", strings.TrimSpace(runErr.Error())), codingEventContentMaxRunes),
+		CreatedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		return err
+	}
+	session, getErr := s.Store.GetCodingSession(ctx, sid)
+	if getErr != nil {
+		return nil
+	}
+	session.UpdatedAt = time.Now().UTC()
+	session.LastMessageAt = session.UpdatedAt
+	_ = s.Store.UpdateCodingSession(ctx, session)
+	return nil
 }
 
 func compactCodingEventMessages(items []store.CodingMessage) []store.CodingMessage {
@@ -985,7 +1048,7 @@ func deriveSessionTitle(firstUserMessage string) string {
 func (s *Service) ensureCodingCLIAccountForCoding(ctx context.Context) error {
 	currentID, _ := s.ActiveCLIAccountID(ctx)
 	currentID = strings.TrimSpace(currentID)
-	if currentID == "" {
+	if currentID != "" {
 		return nil
 	}
 
@@ -993,114 +1056,29 @@ func (s *Service) ensureCodingCLIAccountForCoding(ctx context.Context) error {
 	if err != nil || len(accounts) == 0 {
 		return err
 	}
-	usageMap, _ := s.Store.ListUsageSnapshots(ctx)
-	now := time.Now().UTC()
-
-	type candidate struct {
-		account store.Account
-		score   int
-	}
-	candidates := make([]candidate, 0, len(accounts))
+	targetID := ""
 	for _, account := range accounts {
 		id := strings.TrimSpace(account.ID)
-		if id == "" {
-			continue
-		}
-		usage, ok := usageMap[id]
-		needsRefresh := !ok || strings.TrimSpace(usage.LastError) != "" || usage.FetchedAt.IsZero() || now.Sub(usage.FetchedAt) > codingUsageFreshnessTTL
-		if needsRefresh {
-			refreshed, refreshErr := s.RefreshUsage(ctx, id)
-			if refreshErr != nil {
-				continue
-			}
-			usage = refreshed
-			ok = true
-		}
-		if !ok {
-			continue
-		}
-		score := codingUsageScore(usage)
-		if score <= 0 {
-			continue
-		}
-		candidates = append(candidates, candidate{
-			account: account,
-			score:   score,
-		})
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-
-	currentScore := -1
-	for _, item := range candidates {
-		if strings.TrimSpace(item.account.ID) == currentID {
-			currentScore = item.score
+		if account.ActiveCLI && id != "" {
+			targetID = id
 			break
 		}
 	}
-	strategy := config.NormalizeCodingCLIStrategy(s.Cfg.CodingCLIStrategy)
-	if strategy == "round_robin" {
-		// Round-robin rotation is driven by scheduler (~5 minutes), not per-chat request.
-		return nil
-	}
-	threshold := s.Cfg.UsageAutoSwitchThreshold
-	if threshold < 0 {
-		threshold = 0
-	}
-	if threshold > 100 {
-		threshold = 100
-	}
-	if currentScore >= threshold {
-		return nil
-	}
-
-	selectCandidate := func(minScore int, requireBetterThanCurrent bool) (store.Account, bool) {
-		start := -1
-		for idx, item := range candidates {
-			if strings.TrimSpace(item.account.ID) == currentID {
-				start = idx
-				break
+	if targetID == "" {
+		for _, account := range accounts {
+			id := strings.TrimSpace(account.ID)
+			if id == "" {
+				continue
 			}
+			targetID = id
+			break
 		}
-		for step := 1; step <= len(candidates); step++ {
-			idx := (start + step + len(candidates)) % len(candidates)
-			item := candidates[idx]
-			if strings.TrimSpace(item.account.ID) == currentID {
-				continue
-			}
-			if item.score < minScore {
-				continue
-			}
-			if requireBetterThanCurrent && currentScore > 0 && item.score <= currentScore {
-				continue
-			}
-			return item.account, true
-		}
-		return store.Account{}, false
 	}
-
-	target, ok := selectCandidate(threshold, true)
-	if !ok {
-		target, ok = selectCandidate(1, true)
-	}
-	if !ok || strings.TrimSpace(target.ID) == "" {
+	if targetID == "" {
 		return nil
 	}
-	if strings.TrimSpace(target.ID) == currentID {
-		return nil
-	}
-	_, err = s.UseAccountCLI(WithCLISwitchReason(ctx, "coding"), target.ID)
+	_, err = s.UseAccountCLI(WithCLISwitchReason(ctx, "coding"), targetID)
 	return err
-}
-
-func codingUsageScore(usage store.UsageSnapshot) int {
-	hourly := usage.HourlyPct
-	weekly := usage.WeeklyPct
-	if hourly < weekly {
-		return hourly
-	}
-	return weekly
 }
 
 func buildSessionPrompt(messages []store.CodingMessage) string {

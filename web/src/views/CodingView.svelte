@@ -29,13 +29,13 @@
   let loadingSkills = $state(false);
   let showSessionDrawer = $state(false);
   let codexCLIEmail = $state('');
-  let codexIdentityTimer = null;
   let backgroundMonitorTimer = null;
   let expandedMessageMap = $state({});
   let logViewMode = $state('compact');
-  let streamAbortController = $state(null);
   let backgroundProcessing = $state(false);
   let stopRequested = $state(false);
+  let activeExecCommand = $state('');
+  let wsStreamSocket = $state(null);
 
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
   const draftStoragePrefix = 'codexsess.coding.draft.v1:';
@@ -47,11 +47,64 @@
   const models = ['gpt-5.2-codex', 'gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.4'];
   const slashCommands = ['/status', '/review [optional focus]'];
 
+  function isLoopbackHost(hostname) {
+    const host = String(hostname || '').trim().toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  }
+
+  function resolvedAPIBase() {
+    if (!apiBase) return '';
+    if (typeof window === 'undefined') return apiBase;
+    try {
+      const parsed = new URL(apiBase, window.location.origin);
+      if (isLoopbackHost(parsed.hostname) && !isLoopbackHost(window.location.hostname)) {
+        return '';
+      }
+      return `${parsed.origin}`.replace(/\/+$/, '');
+    } catch {
+      return apiBase;
+    }
+  }
+
   function toAPIURL(url) {
     const raw = String(url || '').trim();
-    if (!apiBase || /^https?:\/\//i.test(raw)) return raw;
-    if (raw.startsWith('/')) return `${apiBase}${raw}`;
-    return `${apiBase}/${raw}`;
+    if (/^https?:\/\//i.test(raw)) return raw;
+    const base = resolvedAPIBase();
+    if (!base) return raw;
+    if (raw.startsWith('/')) return `${base}${raw}`;
+    return `${base}/${raw}`;
+  }
+
+  function toWSURL(path) {
+    const raw = String(path || '').trim();
+    const base = toAPIURL(raw);
+    try {
+      const u = new URL(base, (typeof window !== 'undefined' ? window.location.origin : undefined));
+      if (u.protocol === 'https:') u.protocol = 'wss:';
+      else if (u.protocol === 'http:') u.protocol = 'ws:';
+      return u.toString();
+    } catch {
+      if (typeof window !== 'undefined') {
+        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${proto}//${window.location.host}${raw.startsWith('/') ? raw : `/${raw}`}`;
+      }
+      return raw;
+    }
+  }
+
+  function buildWSURLCandidates(path) {
+    const raw = String(path || '').trim();
+    const out = [];
+    if (typeof window !== 'undefined') {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const sameOrigin = `${proto}//${window.location.host}${raw.startsWith('/') ? raw : `/${raw}`}`;
+      out.push(sameOrigin);
+    }
+    const fromBase = toWSURL(raw);
+    if (fromBase && !out.includes(fromBase)) {
+      out.push(fromBase);
+    }
+    return out.filter(Boolean);
   }
 
   async function req(url, options = {}) {
@@ -168,6 +221,14 @@
   function appendActivityMessage(rawText) {
     const text = String(rawText || '').trim();
     if (!text) return '';
+    const parsed = parseActivityText(text);
+    if (parsed.kind === 'running' && parsed.command) {
+      activeExecCommand = parsed.command;
+    } else if ((parsed.kind === 'done' || parsed.kind === 'failed') && parsed.command) {
+      if (normalizeActivityCommandKey(parsed.command) === normalizeActivityCommandKey(activeExecCommand)) {
+        activeExecCommand = '';
+      }
+    }
     const next = {
       id: `activity-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       role: 'activity',
@@ -451,20 +512,25 @@
     }, 220);
   }
 
-  async function loadMessages(sessionID) {
+  async function loadMessages(sessionID, { silent = false } = {}) {
     const sid = String(sessionID || '').trim();
     if (!sid) {
       messages = [];
       return;
     }
-    loadingMessages = true;
+    const showLoading = !silent;
+    if (showLoading) {
+      loadingMessages = true;
+    }
     try {
       const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}`);
       messages = compactActivityMessages(Array.isArray(data.messages) ? data.messages : []);
       await tick();
       scrollMessagesToBottom();
     } finally {
-      loadingMessages = false;
+      if (showLoading) {
+        loadingMessages = false;
+      }
     }
   }
 
@@ -480,18 +546,19 @@
     backgroundProcessing = inFlight;
     if (inFlight) {
       if (!sending) {
-        viewStatus = 'Session is still processing in background...';
+        viewStatus = 'Streaming...';
       }
-      if (syncMessages && !loadingMessages) {
-        await loadMessages(sid);
+      // Avoid replacing live WS-rendered messages while actively streaming in this tab.
+      if (syncMessages && !loadingMessages && !sending) {
+        await loadMessages(sid, { silent: true });
       }
       return true;
     }
     if (syncMessages && !loadingMessages) {
-      await loadMessages(sid);
+      await loadMessages(sid, { silent: true });
     }
     if (becameDone) {
-      await loadMessages(sid);
+      await loadMessages(sid, { silent: true });
       viewStatus = 'Background processing finished.';
     }
     return false;
@@ -511,15 +578,25 @@
       backgroundProcessing = false;
       return;
     }
-    refreshBackgroundStatus(sid, { syncMessages: true }).catch(() => {});
-    backgroundMonitorTimer = setInterval(() => {
-      const activeID = String(activeSessionID || '').trim();
-      if (!activeID || activeID !== sid) {
-        stopBackgroundMonitor();
-        return;
-      }
-      refreshBackgroundStatus(activeID, { syncMessages: true }).catch(() => {});
-    }, 3000);
+    refreshBackgroundStatus(sid, { syncMessages: !sending })
+      .then((inFlight) => {
+        if (!inFlight) return;
+        backgroundMonitorTimer = setInterval(() => {
+          const activeID = String(activeSessionID || '').trim();
+          if (!activeID || activeID !== sid) {
+            stopBackgroundMonitor();
+            return;
+          }
+          refreshBackgroundStatus(activeID, { syncMessages: !sending })
+            .then((stillInFlight) => {
+              if (!stillInFlight) {
+                stopBackgroundMonitor();
+              }
+            })
+            .catch(() => {});
+        }, 3000);
+      })
+      .catch(() => {});
   }
 
   function scrollMessagesToBottom() {
@@ -740,52 +817,18 @@
     let streamedAssistantIDs = [];
     let streamedMetaIDs = [];
     streamingPending = true;
-    streamAbortController = new AbortController();
     draftMessage = '';
     viewStatus = 'Streaming...';
     try {
-      const response = await fetch(toAPIURL('/api/coding/chat/stream'), {
-        method: 'POST',
-        headers: jsonHeaders,
-        credentials: 'same-origin',
-        signal: streamAbortController?.signal,
-        body: JSON.stringify({
-          session_id: session.id,
-          content: slashMeta.contentOverride ?? prepared,
-          model: selectedModel,
-          work_dir: selectedWorkDir || '~/',
-          sandbox_mode: selectedSandboxMode || 'write',
-          command: slashMeta.commandMode || 'chat'
-        })
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        let errMsg = text || `HTTP ${response.status}`;
-        try {
-          const body = JSON.parse(text || '{}');
-          errMsg = body?.error?.message || body?.message || errMsg;
-        } catch {
-        }
-        throw new Error(errMsg);
-      }
-      if (!response.body) {
-        throw new Error('Streaming response body unavailable.');
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder('utf-8');
-      let sseBuffer = '';
       let donePayload = null;
-      let streamError = '';
-
-      const handleStreamFrame = (frameText) => {
-        let evt = {};
-        try {
-          evt = JSON.parse(frameText || '{}');
-        } catch {
-          return;
-        }
+      donePayload = await streamChatViaWebSocket({
+        session_id: session.id,
+        content: slashMeta.contentOverride ?? prepared,
+        model: selectedModel,
+        work_dir: selectedWorkDir || '~/',
+        sandbox_mode: selectedSandboxMode || 'write',
+        command: slashMeta.commandMode || 'chat'
+      }, (evt) => {
         const eventType = String(evt?.event || '').trim().toLowerCase();
         if (eventType === 'assistant_message') {
           const text = String(evt?.text || '').trim();
@@ -801,6 +844,7 @@
               created_at: new Date().toISOString(),
               pending: false
             }]);
+          scrollMessagesToBottom();
           return;
         }
         if (eventType === 'activity') {
@@ -808,6 +852,7 @@
           if (!text) return;
           const id = appendActivityMessage(text);
           if (id) streamedMetaIDs = [...streamedMetaIDs, id];
+          scrollMessagesToBottom();
           return;
         }
         if (eventType === 'raw_event') {
@@ -815,6 +860,7 @@
           if (!text) return;
           const id = appendStreamMetaMessage('event', text);
           if (id) streamedMetaIDs = [...streamedMetaIDs, id];
+          scrollMessagesToBottom();
           return;
         }
         if (eventType === 'stderr') {
@@ -822,6 +868,7 @@
           if (!text) return;
           const id = appendStreamMetaMessage('stderr', text);
           if (id) streamedMetaIDs = [...streamedMetaIDs, id];
+          scrollMessagesToBottom();
           return;
         }
         if (eventType === 'delta') {
@@ -844,32 +891,9 @@
               ? { ...item, content: `${item.content || ''}${deltaText}` }
               : item
           );
-          return;
+          scrollMessagesToBottom();
         }
-        if (eventType === 'error') {
-          streamError = String(evt?.message || 'Streaming failed.');
-          return;
-        }
-        if (eventType === 'done') {
-          donePayload = evt;
-        }
-      };
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          sseBuffer += decoder.decode();
-          sseBuffer = parseSSEFrames(sseBuffer, handleStreamFrame, true);
-          break;
-        }
-        sseBuffer += decoder.decode(value, { stream: true });
-        sseBuffer = parseSSEFrames(sseBuffer, handleStreamFrame);
-        if (streamError) throw new Error(streamError);
-        await tick();
-        scrollMessagesToBottom();
-      }
-
-      if (streamError) throw new Error(streamError);
+      });
 
       if (!donePayload) {
         throw new Error('Streaming ended before completion.');
@@ -911,33 +935,48 @@
       await tick();
       scrollMessagesToBottom();
       viewStatus = 'Response received.';
+      activeExecCommand = '';
       composerError = '';
     } catch (error) {
       const busy = String(error?.message || '').toLowerCase().includes('already processing');
-      messages = messages.filter(
-        (item) =>
-          item?.id !== pendingID &&
-          !streamedAssistantIDs.includes(item?.id) &&
-          !streamedMetaIDs.includes(item?.id)
-      );
-      draftMessage = workingDraft;
-      saveDraftForSession(session.id, workingDraft);
+      const failReason = String(error?.message || 'Failed to send message.');
+      const detachedBackground = failReason.toLowerCase().includes('websocket_detached_background');
+      if (!busy && !detachedBackground) {
+        messages = messages.filter(
+          (item) =>
+            item?.id !== pendingID &&
+            !streamedAssistantIDs.includes(item?.id) &&
+            !streamedMetaIDs.includes(item?.id)
+        );
+        draftMessage = workingDraft;
+        saveDraftForSession(session.id, workingDraft);
+      }
       const aborted =
         String(error?.name || '').trim() === 'AbortError' ||
         String(error?.message || '').toLowerCase().includes('aborted');
-      const failReason = String(error?.message || 'Failed to send message.');
-      if (busy) {
+      if (busy || detachedBackground) {
         composerError = '';
-        viewStatus = 'Session is already processing in background.';
-        startBackgroundMonitor(session.id);
+        const inFlight = await refreshBackgroundStatus(session.id, { syncMessages: true }).catch(() => false);
+        if (inFlight) {
+          viewStatus = 'Streaming...';
+          startBackgroundMonitor(session.id);
+        } else {
+          composerError = aborted ? '' : failReason;
+          viewStatus = aborted ? (stopRequested ? 'Stopped.' : 'Streaming canceled.') : failReason;
+        }
+      } else if (stopRequested) {
+        composerError = '';
+        viewStatus = 'Stopped.';
       } else {
         composerError = aborted ? '' : failReason;
         viewStatus = aborted ? (stopRequested ? 'Stopped.' : 'Streaming canceled.') : failReason;
       }
       streamingPending = false;
+      if (!sending) {
+        activeExecCommand = '';
+      }
     } finally {
       sending = false;
-      streamAbortController = null;
       if (streamingPending) streamingPending = false;
       if (!stopRequested) {
         startBackgroundMonitor(session.id);
@@ -949,7 +988,7 @@
   }
 
   async function cancelStreaming() {
-    if (!sending) return;
+    if (!sending && !backgroundProcessing) return;
     stopRequested = true;
     viewStatus = 'Stopping...';
     const session = activeSession();
@@ -962,9 +1001,10 @@
       } catch {
       }
     }
-    if (!streamAbortController) return;
     try {
-      streamAbortController.abort();
+      if (wsStreamSocket) {
+        wsStreamSocket.close();
+      }
     } catch {
     }
   }
@@ -1027,30 +1067,108 @@
     return `Skill hints requested: ${skills.join(', ')}.\n\nUser request (unaltered):\n${original}`;
   }
 
-  function parseSSEFrames(buffer, onFrame, flush = false) {
-    let rest = String(buffer || '').replace(/\r\n/g, '\n');
-    let boundary = rest.indexOf('\n\n');
-    while (boundary !== -1) {
-      const rawFrame = rest.slice(0, boundary);
-      rest = rest.slice(boundary + 2);
-      const lines = rawFrame.split('\n');
-      const dataLines = lines
-        .map((line) => String(line || ''))
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart());
-      if (dataLines.length > 0) onFrame(dataLines.join('\n'));
-      boundary = rest.indexOf('\n\n');
-    }
-    if (flush) {
-      const lines = rest.split('\n');
-      const dataLines = lines
-        .map((line) => String(line || ''))
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart());
-      if (dataLines.length > 0) onFrame(dataLines.join('\n'));
-      return '';
-    }
-    return rest;
+  function streamChatViaWebSocket(payload, onEvent) {
+    return new Promise((resolve, reject) => {
+      const candidates = buildWSURLCandidates('/api/coding/ws');
+      if (candidates.length === 0) {
+        reject(new Error('WebSocket endpoint unavailable.'));
+        return;
+      }
+
+      let settled = false;
+      let attemptIndex = 0;
+      let ws = null;
+      let startedAck = false;
+
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        if (wsStreamSocket === ws) {
+          wsStreamSocket = null;
+        }
+        try {
+          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            ws.close();
+          }
+        } catch {
+        }
+        fn(value);
+      };
+
+      const connectAttempt = () => {
+        if (settled) return;
+        if (attemptIndex >= candidates.length) {
+          finish(reject, new Error('WebSocket stream error.'));
+          return;
+        }
+        const wsURL = candidates[attemptIndex];
+        attemptIndex += 1;
+        ws = new WebSocket(wsURL);
+        wsStreamSocket = ws;
+        let didOpen = false;
+
+        ws.onopen = () => {
+          didOpen = true;
+          try {
+            ws.send(JSON.stringify({
+              type: 'send',
+              session_id: payload.session_id,
+              content: payload.content,
+              model: payload.model,
+              work_dir: payload.work_dir,
+              sandbox_mode: payload.sandbox_mode,
+              command: payload.command
+            }));
+          } catch (err) {
+            finish(reject, err instanceof Error ? err : new Error('Failed to send websocket payload.'));
+          }
+        };
+
+        ws.onmessage = (event) => {
+          let evt = {};
+          try {
+            evt = JSON.parse(String(event?.data || '{}'));
+          } catch {
+            return;
+          }
+          if (onEvent) onEvent(evt);
+          const eventType = String(evt?.event || '').trim().toLowerCase();
+          if (eventType === 'started') {
+            startedAck = true;
+            return;
+          }
+          if (eventType === 'done') {
+            finish(resolve, evt);
+            return;
+          }
+          if (eventType === 'error') {
+            finish(reject, new Error(String(evt?.message || 'Streaming failed.')));
+          }
+        };
+
+        ws.onerror = () => {
+          try {
+            ws.close();
+          } catch {
+          }
+        };
+
+        ws.onclose = (event) => {
+          if (settled) return;
+          if (!didOpen) {
+            connectAttempt();
+            return;
+          }
+          if (startedAck) {
+            finish(reject, new Error('websocket_detached_background'));
+            return;
+          }
+          finish(reject, new Error('WebSocket connection failed before run start.'));
+        };
+      };
+
+      connectAttempt();
+    });
   }
 
   onMount(() => {
@@ -1067,9 +1185,6 @@
       viewStatus = String(error?.message || 'Failed to initialize coding sessions.');
     });
     refreshCodexIdentity().catch(() => {});
-    codexIdentityTimer = setInterval(() => {
-      refreshCodexIdentity().catch(() => {});
-    }, 15000);
   });
 
   $effect(() => {
@@ -1087,17 +1202,13 @@
       clearTimeout(sessionPrefsTimer);
       sessionPrefsTimer = null;
     }
-    if (codexIdentityTimer) {
-      clearInterval(codexIdentityTimer);
-      codexIdentityTimer = null;
-    }
     stopBackgroundMonitor();
-    if (streamAbortController) {
+    if (wsStreamSocket) {
       try {
-        streamAbortController.abort();
+        wsStreamSocket.close();
       } catch {
       }
-      streamAbortController = null;
+      wsStreamSocket = null;
     }
   });
 </script>
@@ -1143,7 +1254,7 @@
         <div class="empty-state">Session not selected.</div>
       {:else}
         <div class="coding-messages" bind:this={messagesViewport}>
-          {#if loadingMessages}
+          {#if loadingMessages && messages.length === 0}
             <p class="empty-note">Loading messages...</p>
           {:else}
             {@const renderedMessages = renderedMessagesForView()}
@@ -1198,7 +1309,7 @@
           {#if backgroundProcessing && !sending}
             <div class="coding-streaming-note" role="status" aria-live="polite">
               <span class="streaming-pulse" aria-hidden="true"></span>
-              <span class="streaming-label">Processing in background</span>
+              <span class="streaming-label">Streaming...</span>
             </div>
           {/if}
         </div>
@@ -1228,11 +1339,11 @@
               {selectedSandboxMode === 'full-access' ? 'Full Access' : 'Write'}
             </button>
             <button
-              class="btn {sending ? 'btn-danger' : 'btn-primary'} btn-send"
-              onclick={sending ? cancelStreaming : sendMessage}
-              disabled={(!sending && backgroundProcessing) || (!sending && !draftMessage.trim())}
+              class="btn {(sending || backgroundProcessing) ? 'btn-danger' : 'btn-primary'} btn-send"
+              onclick={(sending || backgroundProcessing) ? cancelStreaming : sendMessage}
+              disabled={(!(sending || backgroundProcessing) && !draftMessage.trim())}
             >
-              <span>{sending ? 'Stop' : (backgroundProcessing ? 'Processing...' : 'Send')}</span>
+              <span>{(sending || backgroundProcessing) ? 'Stop' : 'Send'}</span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12l18-9-6 9 6 9-18-9z"></path></svg>
             </button>
           </div>
@@ -1241,9 +1352,16 @@
     </section>
   </div>
   <div class="coding-status-line" aria-live="polite">
-    {viewStatus}
-    {#if persistingSessionPrefs}
-      <span class="coding-status-saving">Saving session settings...</span>
+    <div class="coding-status-main">
+      <span>{viewStatus}</span>
+      {#if persistingSessionPrefs}
+        <span class="coding-status-saving">Saving session settings...</span>
+      {/if}
+    </div>
+    {#if activeExecCommand}
+      <div class="coding-status-command mono" title={activeExecCommand}>
+        Running: {activeExecCommand}
+      </div>
     {/if}
   </div>
 </section>

@@ -12,9 +12,19 @@ export default defineConfig({
       'Cache-Control': 'no-store'
     },
     proxy: {
-      '/api/': 'http://127.0.0.1:3052',
-      '/auth/': 'http://127.0.0.1:3052',
-      '/zo/': 'http://127.0.0.1:3052'
+      '/api/': {
+        target: 'http://127.0.0.1:3052',
+        changeOrigin: true,
+        ws: true
+      },
+      '/auth/': {
+        target: 'http://127.0.0.1:3052',
+        changeOrigin: true
+      },
+      '/zo/': {
+        target: 'http://127.0.0.1:3052',
+        changeOrigin: true
+      }
     }
   },
   build: {

@@ -28,6 +28,7 @@ type Config struct {
 	UsageAlertThreshold      int               `yaml:"usage_alert_threshold"`
 	UsageAutoSwitchThreshold int               `yaml:"usage_auto_switch_threshold"`
 	UsageSchedulerEnabled    bool              `yaml:"usage_scheduler_enabled"`
+	UsageSchedulerInterval   int               `yaml:"usage_scheduler_interval_minutes"`
 	DirectAPIStrategy        string            `yaml:"direct_api_strategy"`
 	CodingCLIStrategy        string            `yaml:"-"`
 	ZoAPIStrategy            string            `yaml:"zo_api_strategy"`
@@ -81,6 +82,7 @@ func Default() Config {
 		UsageAlertThreshold:      5,
 		UsageAutoSwitchThreshold: 15,
 		UsageSchedulerEnabled:    true,
+		UsageSchedulerInterval:   30,
 		DirectAPIStrategy:        "round_robin",
 		CodingCLIStrategy:        "manual",
 		ZoAPIStrategy:            "round_robin",
@@ -181,6 +183,7 @@ func LoadOrInit() (Config, error) {
 	if cfg.UsageAutoSwitchThreshold < 0 || cfg.UsageAutoSwitchThreshold > 100 {
 		cfg.UsageAutoSwitchThreshold = def.UsageAutoSwitchThreshold
 	}
+	cfg.UsageSchedulerInterval = NormalizeUsageSchedulerIntervalMinutes(cfg.UsageSchedulerInterval)
 	if _, ok := raw["system_log_max_rows"]; !ok {
 		cfg.SystemLogMaxRows = def.SystemLogMaxRows
 	}
@@ -192,6 +195,9 @@ func LoadOrInit() (Config, error) {
 	}
 	if _, ok := raw["usage_scheduler_enabled"]; !ok {
 		cfg.UsageSchedulerEnabled = def.UsageSchedulerEnabled
+	}
+	if _, ok := raw["usage_scheduler_interval_minutes"]; !ok {
+		cfg.UsageSchedulerInterval = def.UsageSchedulerInterval
 	}
 	if _, ok := raw["direct_api_inject_prompt"]; !ok {
 		cfg.DirectAPIInjectPrompt = def.DirectAPIInjectPrompt
@@ -308,6 +314,16 @@ func NormalizeZoAPIStrategy(v string) string {
 	default:
 		return "round_robin"
 	}
+}
+
+func NormalizeUsageSchedulerIntervalMinutes(v int) int {
+	if v < 10 {
+		return 10
+	}
+	if v > 120 {
+		return 120
+	}
+	return v
 }
 
 func resolveCLISwitchNotifyCmd(v string) string {

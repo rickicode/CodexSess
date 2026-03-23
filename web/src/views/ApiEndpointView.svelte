@@ -48,7 +48,7 @@
 
 <section class="panel">
   <div class="panel-header">
-    <h2>API Workspace</h2>
+    <h2>Workspaces</h2>
   </div>
 
   <div class="settings-list">

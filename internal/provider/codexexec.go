@@ -914,7 +914,10 @@ func (c *CodexExec) buildExecArgs(opts ExecOptions, clean bool) []string {
 	commandMode := normalizeCommandMode(opts.CommandMode)
 	args := []string{"exec"}
 	if commandMode == "review" {
-		args = append(args, "review", "--json", "--skip-git-repo-check", "--uncommitted")
+		args = append(args, "review", "--json", "--skip-git-repo-check")
+		if prompt == "" {
+			args = append(args, "--uncommitted")
+		}
 		if sandboxMode == "full-access" {
 			args = append(args, "--dangerously-bypass-approvals-and-sandbox")
 		} else {

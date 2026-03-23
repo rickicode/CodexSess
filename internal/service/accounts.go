@@ -211,6 +211,14 @@ func (s *Service) ListAccounts(ctx context.Context) ([]store.Account, error) {
 	return accounts, nil
 }
 
+func (s *Service) CountAccounts(ctx context.Context) (int, error) {
+	return s.Store.CountAccounts(ctx)
+}
+
+func (s *Service) ListAccountsPaginated(ctx context.Context, page, limit int, filter store.AccountFilter) ([]store.Account, int, error) {
+	return s.Store.ListAccountsPaginated(ctx, page, limit, filter)
+}
+
 func (s *Service) UseAccount(ctx context.Context, selector string) (store.Account, error) {
 	a, err := s.UseAccountAPI(ctx, selector)
 	if err != nil {
@@ -323,6 +331,10 @@ func (s *Service) RemoveAccount(ctx context.Context, selector string) error {
 	return nil
 }
 
+func (s *Service) DeleteRevokedAccounts(ctx context.Context) (int, error) {
+	return s.Store.DeleteRevokedAccounts(ctx)
+}
+
 func (s *Service) ResolveForRequest(ctx context.Context, selector string) (store.Account, TokenSet, error) {
 	return s.resolveForRequest(ctx, selector, false)
 }
@@ -396,10 +408,21 @@ func usageErrorLooksRevoked(raw string) bool {
 	if msg == "" {
 		return false
 	}
-	if strings.Contains(msg, "token_revoked") || strings.Contains(msg, "invalidated oauth token") {
+	if strings.Contains(msg, "token_revoked") || 
+	   strings.Contains(msg, "invalidated oauth token") ||
+	   strings.Contains(msg, "token_invalidated") {
 		return true
 	}
-	return strings.Contains(msg, "status=401") && strings.Contains(msg, "oauth")
+	if strings.Contains(msg, "account_suspended") || strings.Contains(msg, "account_deactivated") || strings.Contains(msg, "suspended") {
+		return true
+	}
+	if strings.Contains(msg, "status=401") && strings.Contains(msg, "oauth") {
+		return true
+	}
+	if (strings.Contains(msg, `"status":401`) || strings.Contains(msg, `"status": 401`)) && strings.Contains(msg, "token") {
+		return true
+	}
+	return false
 }
 
 func (s *Service) RefreshUsage(ctx context.Context, selector string) (store.UsageSnapshot, error) {
@@ -417,6 +440,9 @@ func (s *Service) RefreshUsage(ctx context.Context, selector string) (store.Usag
 			RawJSON:   "{}",
 		}
 		_ = s.Store.SaveUsage(ctx, u)
+		if usageErrorLooksRevoked(err.Error()) {
+			_ = s.Store.SetAccountRevoked(ctx, a.ID, true)
+		}
 		return u, err
 	}
 	u := store.UsageSnapshot{
@@ -434,6 +460,7 @@ func (s *Service) RefreshUsage(ctx context.Context, selector string) (store.Usag
 	if err := s.Store.SaveUsage(ctx, u); err != nil {
 		return store.UsageSnapshot{}, err
 	}
+	_ = s.Store.SetAccountRevoked(ctx, a.ID, false)
 	return u, nil
 }
 

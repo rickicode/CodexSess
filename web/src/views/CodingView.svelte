@@ -10,12 +10,18 @@
   let selectedSandboxMode = $state('write');
   let loadingSessions = $state(false);
   let loadingMessages = $state(false);
+  let loadingOlderMessages = $state(false);
+  let hasMoreMessages = $state(false);
+  let oldestLoadedMessageID = $state('');
+  let newestLoadedMessageID = $state('');
   let sending = $state(false);
   let deleting = $state(false);
   let viewStatus = $state('Ready.');
   let composerError = $state('');
   let streamingPending = $state(false);
   let messagesViewport = $state(null);
+  let autoFollowBottom = $state(true);
+  let showScrollBottomButton = $state(false);
   let showNewSessionModal = $state(false);
   let newSessionPath = $state('~/');
   let pathSuggestions = $state(['~/']);
@@ -40,10 +46,16 @@
   let wsHealthStatus = $state('disconnected');
   let wsHealthReconnectTimer = null;
   let wsHealthKeepAlive = false;
+  let wsHealthReady = false;
   let showExecOutputModal = $state(false);
   let selectedExecEntry = $state(null);
+  let showExecBatchModal = $state(false);
+  let selectedExecBatchEntry = $state(null);
   let showSubagentDetailModal = $state(false);
   let selectedSubagentEntry = $state(null);
+  const initialMessagesPageSize = 50;
+  const olderMessagesPageSize = 40;
+  const nearBottomThresholdPx = 120;
 
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
   const draftStoragePrefix = 'codexsess.coding.draft.v1:';
@@ -586,7 +598,7 @@
       return value.map((item) => extractExecOutputText(item)).filter(Boolean).join('\n');
     }
     if (typeof value === 'object') {
-      const direct = ['stdout', 'stderr', 'output_text', 'text', 'message', 'result', 'output'];
+      const direct = ['aggregated_output', 'stdout', 'stderr', 'output_text', 'text', 'message', 'result', 'output'];
       for (const key of direct) {
         const v = extractExecOutputText(value?.[key]);
         if (v) return v;
@@ -748,10 +760,23 @@
 
     const fn = item?.function && typeof item.function === 'object' ? item.function : {};
     const toolName = String(item?.tool || item?.tool_name || item?.name || fn?.name || '').trim().toLowerCase();
-    const toolArgs = parseToolArguments(item?.arguments || item?.input || item?.params || item?.payload || fn?.arguments || fn?.input);
+    const toolArgs = parseToolArguments(
+      item?.arguments ||
+      item?.input ||
+      item?.params ||
+      item?.payload ||
+      fn?.arguments ||
+      fn?.input ||
+      evt?.arguments ||
+      evt?.input ||
+      evt?.params ||
+      evt?.payload
+    );
     const command = String(
       item?.command ||
       item?.cmd ||
+      evt?.command ||
+      evt?.cmd ||
       toolArgs?.command ||
       toolArgs?.cmd ||
       toolArgs?.shell_command ||
@@ -772,7 +797,16 @@
       exitCode = Number(item?.exit_code ?? evt?.exit_code ?? 0) || 0;
       status = exitCode !== 0 ? 'failed' : 'done';
     }
-    const output = extractExecOutputText(item?.output || item?.result || item?.text || item?.output_text || '');
+    const output = extractExecOutputText(
+      item?.aggregated_output ||
+      item?.output ||
+      item?.result ||
+      evt?.aggregated_output ||
+      evt?.output ||
+      item?.text ||
+      item?.output_text ||
+      ''
+    );
     return {
       command,
       status: normalizeExecStatus(status || 'running'),
@@ -948,11 +982,16 @@
   }
 
   function mergeExecOutput(startText, endText) {
-    const first = String(startText || '').trim();
-    const second = String(endText || '').trim();
+    const normalize = (value) => {
+      const text = String(value || '').trim();
+      return text === 'No output captured.' ? '' : text;
+    };
+    const first = normalize(startText);
+    const second = normalize(endText);
     if (!first) return second;
     if (!second) return first;
     if (first.includes(second)) return first;
+    if (second.includes(first)) return second;
     return `${first}\n${second}`;
   }
 
@@ -1485,6 +1524,7 @@
   function messageRoleClass(message) {
     const role = String(message?.role || '').trim().toLowerCase();
     if (role === 'assistant') return 'assistant';
+    if (role === 'exec_group') return 'exec-group';
     if (role === 'exec') return 'exec';
     if (role === 'subagent') return 'subagent';
     if (role === 'activity') return 'activity';
@@ -1496,10 +1536,142 @@
   function renderedMessagesForView() {
     let rendered = buildExecAwareMessages(messages, true);
     rendered = dedupeAdjacentSpawnSubagentMessages(rendered);
+    rendered = rendered.filter((item) => {
+      const role = String(item?.role || '').trim().toLowerCase();
+      if (role !== 'activity') return true;
+      const parsed = parseActivityText(item?.content || '');
+      if (!parsed?.command) return true;
+      return parsed.kind === 'other';
+    });
     if (String(logViewMode || '').trim().toLowerCase() !== 'raw') {
       rendered = rendered.filter((item) => String(item?.role || '').trim().toLowerCase() !== 'event');
     }
-    return rendered;
+    return groupTerminalMessages(rendered, 3);
+  }
+
+  function toExecBatchEntry(message) {
+    const command = String(message?.exec_command || message?.content || '-').trim() || '-';
+    const normalizeOutput = (value) => {
+      const text = sanitizeSensitiveLogText(String(value || '').trim());
+      if (!text) return 'No output captured.';
+      if (text === 'No output captured.') return text;
+      const stripped = text.replace(/^No output captured\.\s*/i, '').trim();
+      return stripped || text;
+    };
+    return {
+      id: String(message?.id || '').trim(),
+      command,
+      status: normalizeExecStatus(message?.exec_status || 'running'),
+      exitCode: Number(message?.exec_exit_code || 0) || 0,
+      output: normalizeOutput(message?.exec_output || ''),
+      source: String(message?.exec_output_source || 'live').trim().toLowerCase(),
+      when: String(message?.updated_at || message?.created_at || '')
+    };
+  }
+
+  function compareExecStatusPriority(a, b) {
+    const weight = (value) => {
+      const v = normalizeExecStatus(value);
+      if (v === 'failed') return 3;
+      if (v === 'done') return 2;
+      return 1;
+    };
+    return weight(a) - weight(b);
+  }
+
+  function compressExecBatchEntries(entries) {
+    const src = Array.isArray(entries) ? entries : [];
+    if (src.length <= 1) return src;
+    const out = [];
+    for (const entry of src) {
+      const command = String(entry?.command || '').trim();
+      if (!command) continue;
+      const prevIdx = out.length - 1;
+      const prev = prevIdx >= 0 ? out[prevIdx] : null;
+      if (prev && String(prev.command || '').trim() === command) {
+        const nextStatus = compareExecStatusPriority(prev.status, entry?.status) >= 0 ? prev.status : normalizeExecStatus(entry?.status || prev.status);
+        out[prevIdx] = {
+          ...prev,
+          status: nextStatus,
+          exitCode: Number(entry?.exitCode ?? prev.exitCode ?? 0) || 0,
+          output: sanitizeSensitiveLogText(
+            mergeExecOutput(String(prev.output || '').trim(), String(entry?.output || '').trim()) || 'No output captured.'
+          ),
+          when: String(entry?.when || prev.when || '')
+        };
+        continue;
+      }
+      out.push({
+        ...entry,
+        status: normalizeExecStatus(entry?.status || 'running'),
+        output: sanitizeSensitiveLogText(String(entry?.output || '').trim() || 'No output captured.')
+      });
+    }
+    return out;
+  }
+
+  function groupTerminalMessages(input, threshold = 3) {
+    const src = Array.isArray(input) ? input : [];
+    const out = [];
+    let buffer = [];
+    let deferredMeta = [];
+    const canKeepExecBufferOnRole = (role) => {
+      const v = String(role || '').trim().toLowerCase();
+      return v === 'activity' || v === 'event' || v === 'stderr';
+    };
+
+    const flush = () => {
+      if (buffer.length === 0) return;
+      if (buffer.length <= threshold) {
+        out.push(...buffer);
+        if (deferredMeta.length > 0) {
+          out.push(...deferredMeta);
+        }
+        buffer = [];
+        deferredMeta = [];
+        return;
+      }
+      const entries = compressExecBatchEntries(buffer.map((item) => toExecBatchEntry(item)));
+      const latest = entries[entries.length - 1] || null;
+      out.push({
+        id: `exec-group-${String(buffer[0]?.id || Date.now())}`,
+        role: 'exec_group',
+        content: `${entries.length} terminal commands`,
+        created_at: String(buffer[0]?.created_at || new Date().toISOString()),
+        updated_at: String(latest?.when || buffer[buffer.length - 1]?.updated_at || new Date().toISOString()),
+        pending: false,
+        exec_group_entries: entries,
+        exec_group_count: entries.length,
+        exec_group_meta: deferredMeta.map((item) => ({
+          id: String(item?.id || '').trim(),
+          role: String(item?.role || '').trim().toLowerCase(),
+          content: sanitizeSensitiveLogText(String(item?.content || '').trim()),
+          when: String(item?.updated_at || item?.created_at || '')
+        })).filter((item) => item.content)
+      });
+      buffer = [];
+      deferredMeta = [];
+    };
+
+    for (const item of src) {
+      const role = String(item?.role || '').trim().toLowerCase();
+      if (role === 'exec') {
+        buffer.push(item);
+        continue;
+      }
+      if (canKeepExecBufferOnRole(role)) {
+        if (buffer.length > 0) {
+          deferredMeta.push(item);
+          continue;
+        }
+        out.push(item);
+        continue;
+      }
+      flush();
+      out.push(item);
+    }
+    flush();
+    return out;
   }
 
   function execStatusLabel(status, exitCode) {
@@ -1682,6 +1854,23 @@
     selectedExecEntry = null;
   }
 
+  function openExecBatchModal(message) {
+    const entries = Array.isArray(message?.exec_group_entries) ? message.exec_group_entries : [];
+    if (entries.length === 0) return;
+    selectedExecBatchEntry = {
+      count: entries.length,
+      entries,
+      meta: Array.isArray(message?.exec_group_meta) ? message.exec_group_meta : [],
+      when: String(message?.updated_at || message?.created_at || '')
+    };
+    showExecBatchModal = true;
+  }
+
+  function closeExecBatchModal() {
+    showExecBatchModal = false;
+    selectedExecBatchEntry = null;
+  }
+
   function openSubagentDetailModal(message) {
     if (!message) return;
     const raw = message?.subagent_raw || {};
@@ -1729,6 +1918,10 @@
       } catch {
       }
     }
+  }
+
+  function toggleLogViewMode() {
+    setLogViewMode(logViewMode === 'raw' ? 'compact' : 'raw');
   }
 
   function shouldCollapseContent(content) {
@@ -1884,7 +2077,17 @@
     }, 220);
   }
 
-  async function loadMessages(sessionID, { silent = false } = {}) {
+  function isMessagesViewportNearBottom() {
+    if (!messagesViewport) return true;
+    const remaining = messagesViewport.scrollHeight - (messagesViewport.scrollTop + messagesViewport.clientHeight);
+    return remaining <= nearBottomThresholdPx;
+  }
+
+  function refreshScrollAffordance() {
+    showScrollBottomButton = Boolean(messagesViewport && !isMessagesViewportNearBottom());
+  }
+
+  async function loadMessages(sessionID, { silent = false, preserveViewport = false } = {}) {
     const sid = String(sessionID || '').trim();
     if (!sid) {
       messages = [];
@@ -1894,16 +2097,95 @@
     if (showLoading) {
       loadingMessages = true;
     }
+    let previousDistanceFromBottom = 0;
+    if (preserveViewport && messagesViewport) {
+      previousDistanceFromBottom = Math.max(
+        0,
+        messagesViewport.scrollHeight - (messagesViewport.scrollTop + messagesViewport.clientHeight)
+      );
+    }
     try {
-      const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}`);
-      messages = Array.isArray(data.messages) ? data.messages : [];
+      const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}&limit=${initialMessagesPageSize}`);
+      if (String(activeSessionID || '').trim() !== sid) {
+        return;
+      }
+      const incomingMessages = Array.isArray(data?.messages) ? data.messages : [];
+      const preserveLoadedHistory = preserveViewport && !autoFollowBottom && messages.length > 0;
+      if (preserveLoadedHistory) {
+        const existingIDs = new Set(messages.map((item) => String(item?.id || '').trim()).filter(Boolean));
+        const missingFromTail = incomingMessages.filter((item) => !existingIDs.has(String(item?.id || '').trim()));
+        if (missingFromTail.length > 0) {
+          messages = [...messages, ...missingFromTail];
+        }
+        hasMoreMessages = hasMoreMessages || Boolean(data?.has_more);
+        oldestLoadedMessageID = String(messages?.[0]?.id || oldestLoadedMessageID || '').trim();
+        newestLoadedMessageID = String(data?.newest_id || messages?.[messages.length - 1]?.id || newestLoadedMessageID || '').trim();
+      } else {
+        messages = incomingMessages;
+        hasMoreMessages = Boolean(data?.has_more);
+        oldestLoadedMessageID = String(data?.oldest_id || messages?.[0]?.id || '').trim();
+        newestLoadedMessageID = String(data?.newest_id || messages?.[messages.length - 1]?.id || '').trim();
+      }
       refreshActiveExecCommandFromMessages();
       await tick();
-      scrollMessagesToBottom();
+      if (preserveViewport && messagesViewport && !autoFollowBottom) {
+        messagesViewport.scrollTop = Math.max(
+          0,
+          messagesViewport.scrollHeight - messagesViewport.clientHeight - previousDistanceFromBottom
+        );
+      } else {
+        autoFollowBottom = true;
+        scrollMessagesToBottom(true);
+      }
+      refreshScrollAffordance();
     } finally {
       if (showLoading) {
         loadingMessages = false;
       }
+    }
+  }
+
+  async function loadOlderMessages() {
+    const sid = String(activeSessionID || '').trim();
+    const beforeID = String(oldestLoadedMessageID || '').trim();
+    if (!sid || !beforeID || loadingOlderMessages || loadingMessages || sending || !hasMoreMessages) return;
+    if (!messagesViewport) return;
+    loadingOlderMessages = true;
+    const prevScrollHeight = messagesViewport.scrollHeight;
+    const prevScrollTop = messagesViewport.scrollTop;
+    try {
+      const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}&limit=${olderMessagesPageSize}&before_id=${encodeURIComponent(beforeID)}`);
+      if (String(activeSessionID || '').trim() !== sid) {
+        return;
+      }
+      const older = Array.isArray(data?.messages) ? data.messages : [];
+      if (older.length > 0) {
+        const existingIDs = new Set(messages.map((item) => String(item?.id || '').trim()).filter(Boolean));
+        const dedupedOlder = older.filter((item) => !existingIDs.has(String(item?.id || '').trim()));
+        if (dedupedOlder.length > 0) {
+          messages = [...dedupedOlder, ...messages];
+        }
+      }
+      hasMoreMessages = Boolean(data?.has_more);
+      oldestLoadedMessageID = String(data?.oldest_id || messages?.[0]?.id || '').trim();
+      newestLoadedMessageID = String(data?.newest_id || messages?.[messages.length - 1]?.id || '').trim();
+      await tick();
+      if (messagesViewport) {
+        const nextScrollHeight = messagesViewport.scrollHeight;
+        messagesViewport.scrollTop = Math.max(0, nextScrollHeight - prevScrollHeight + prevScrollTop);
+      }
+      refreshScrollAffordance();
+    } finally {
+      loadingOlderMessages = false;
+    }
+  }
+
+  function onMessagesScroll() {
+    if (!messagesViewport) return;
+    autoFollowBottom = isMessagesViewportNearBottom();
+    refreshScrollAffordance();
+    if (messagesViewport.scrollTop <= 80 && hasMoreMessages && !loadingOlderMessages && !loadingMessages) {
+      loadOlderMessages().catch(() => {});
     }
   }
 
@@ -1923,15 +2205,15 @@
       }
       // Avoid replacing live WS-rendered messages while actively streaming in this tab.
       if (syncMessages && !loadingMessages && !sending) {
-        await loadMessages(sid, { silent: true });
+        await loadMessages(sid, { silent: true, preserveViewport: true });
       }
       return true;
     }
     if (syncMessages && !loadingMessages) {
-      await loadMessages(sid, { silent: true });
+      await loadMessages(sid, { silent: true, preserveViewport: true });
     }
     if (becameDone) {
-      await loadMessages(sid, { silent: true });
+      await loadMessages(sid, { silent: true, preserveViewport: true });
       viewStatus = 'Background processing finished.';
     }
     return false;
@@ -1972,19 +2254,30 @@
       .catch(() => {});
   }
 
-  function scrollMessagesToBottom() {
+  function scrollMessagesToBottom(force = false) {
     if (!messagesViewport) return;
+    if (!force && !autoFollowBottom) return;
     messagesViewport.scrollTop = messagesViewport.scrollHeight;
     if (typeof window !== 'undefined') {
       window.requestAnimationFrame(() => {
         if (!messagesViewport) return;
+        if (!force && !autoFollowBottom) return;
         messagesViewport.scrollTop = messagesViewport.scrollHeight;
+        refreshScrollAffordance();
       });
       setTimeout(() => {
         if (!messagesViewport) return;
+        if (!force && !autoFollowBottom) return;
         messagesViewport.scrollTop = messagesViewport.scrollHeight;
+        refreshScrollAffordance();
       }, 60);
     }
+    refreshScrollAffordance();
+  }
+
+  function jumpToLatestMessages() {
+    autoFollowBottom = true;
+    scrollMessagesToBottom(true);
   }
 
   async function loadPathSuggestions(prefix = '~/') {
@@ -2132,31 +2425,50 @@
     }
   }
 
-  async function deleteActiveSession() {
-    const session = activeSession();
-    if (!session?.id || deleting) return;
+  async function deleteSessionByID(sessionID, { fromDrawer = false } = {}) {
+    const sid = String(sessionID || '').trim();
+    if (!sid || deleting) return;
+    const target = sessions.find((item) => item?.id === sid) || null;
     if (typeof window !== 'undefined') {
-      const ok = window.confirm(`Delete session "${session.title || session.id}"?`);
+      const ok = window.confirm(`Delete session "${target?.title || sid}"?`);
       if (!ok) return;
     }
+    const deletingActive = sid === String(activeSessionID || '').trim();
     deleting = true;
     try {
-      closeExecOutputModal();
-      closeSubagentDetailModal();
-      await req(`/api/coding/sessions?id=${encodeURIComponent(session.id)}`, { method: 'DELETE' });
+      if (deletingActive) {
+        closeExecOutputModal();
+        closeSubagentDetailModal();
+      }
+      await req(`/api/coding/sessions?id=${encodeURIComponent(sid)}`, { method: 'DELETE' });
+      clearDraftForSession(sid);
       viewStatus = 'Session deleted.';
-      await loadSessions({ autoSelect: true });
+      await loadSessions({ autoSelect: deletingActive });
       if (sessions.length === 0) {
         await createSession({ autoOpen: true, workDir: '~/' });
+        if (fromDrawer) {
+          showSessionDrawer = false;
+        }
       } else {
+        if (!sessions.find((item) => item?.id === activeSessionID)) {
+          activeSessionID = String(sessions?.[0]?.id || '').trim();
+        }
         syncSessionIDToURL(activeSessionID);
-        await loadMessages(activeSessionID);
-        draftMessage = loadDraftForSession(activeSessionID);
-        startBackgroundMonitor(activeSessionID);
+        if (deletingActive) {
+          await loadMessages(activeSessionID);
+          draftMessage = loadDraftForSession(activeSessionID);
+          startBackgroundMonitor(activeSessionID);
+        }
       }
     } finally {
       deleting = false;
     }
+  }
+
+  async function deleteActiveSession() {
+    const session = activeSession();
+    if (!session?.id) return;
+    await deleteSessionByID(session.id);
   }
 
   async function sendMessage() {
@@ -2183,11 +2495,12 @@
       pending: true
     };
     messages = [...messages, pendingMessage];
+    autoFollowBottom = true;
     sending = true;
     stopRequested = false;
     backgroundProcessing = false;
     await tick();
-    scrollMessagesToBottom();
+    scrollMessagesToBottom(true);
 
     const workingDraft = content;
     let liveAssistantID = '';
@@ -2595,7 +2908,7 @@
   }
 
   function scheduleWSHealthReconnect(delayMs = 1200) {
-    if (!wsHealthKeepAlive) return;
+    if (!wsHealthKeepAlive || !wsHealthReady) return;
     if (wsHealthReconnectTimer) return;
     wsHealthReconnectTimer = setTimeout(() => {
       wsHealthReconnectTimer = null;
@@ -2604,34 +2917,47 @@
   }
 
   function connectWSHealthSocket() {
-    if (!wsHealthKeepAlive) return;
+    if (!wsHealthKeepAlive || !wsHealthReady) return;
     if (wsHealthSocket && (wsHealthSocket.readyState === WebSocket.OPEN || wsHealthSocket.readyState === WebSocket.CONNECTING)) {
       return;
     }
-    const candidates = buildWSURLCandidates('/api/coding/ws');
+    const candidates = [
+      ...new Set(buildWSURLCandidates('/api/coding/ws').map((candidate) => String(candidate || '').trim()).filter(Boolean))
+    ];
     if (candidates.length === 0) {
       wsHealthStatus = 'disconnected';
-      scheduleWSHealthReconnect();
+      scheduleWSHealthReconnect(2500);
       return;
     }
-    wsHealthStatus = 'connecting';
     let attemptIndex = 0;
 
-    const tryConnect = () => {
-      if (!wsHealthKeepAlive) return;
+    const connectAttempt = () => {
+      if (!wsHealthKeepAlive || !wsHealthReady) return;
       if (attemptIndex >= candidates.length) {
         wsHealthStatus = 'disconnected';
-        scheduleWSHealthReconnect();
+        scheduleWSHealthReconnect(2800);
         return;
       }
-      const socket = new WebSocket(candidates[attemptIndex]);
+
+      const wsURL = candidates[attemptIndex];
       attemptIndex += 1;
+      wsHealthStatus = 'connecting';
+
+      const socket = new WebSocket(wsURL);
       wsHealthSocket = socket;
       let opened = false;
+      const connectTimeout = setTimeout(() => {
+        if (opened) return;
+        try {
+          socket.close();
+        } catch {
+        }
+      }, 3500);
 
       socket.onopen = () => {
         if (wsHealthSocket !== socket) return;
         opened = true;
+        clearTimeout(connectTimeout);
         wsHealthStatus = 'connected';
       };
 
@@ -2645,23 +2971,31 @@
       };
 
       socket.onclose = () => {
-        if (wsHealthSocket === socket) {
+        clearTimeout(connectTimeout);
+        const isActiveSocket = wsHealthSocket === socket;
+        if (isActiveSocket) {
           wsHealthSocket = null;
         }
+        if (!isActiveSocket) return;
         if (!wsHealthKeepAlive) {
           wsHealthStatus = 'disconnected';
           return;
         }
-        if (!opened) {
-          tryConnect();
+        if (opened) {
+          wsHealthStatus = 'disconnected';
+          scheduleWSHealthReconnect(1800);
+          return;
+        }
+        if (attemptIndex < candidates.length) {
+          connectAttempt();
           return;
         }
         wsHealthStatus = 'disconnected';
-        scheduleWSHealthReconnect();
+        scheduleWSHealthReconnect(2800);
       };
     };
 
-    tryConnect();
+    connectAttempt();
   }
 
   onMount(() => {
@@ -2674,12 +3008,16 @@
       } catch {
       }
     }
-    ensureSessionOnFirstOpen().catch((error) => {
-      viewStatus = String(error?.message || 'Failed to initialize coding sessions.');
-    });
+    ensureSessionOnFirstOpen()
+      .catch((error) => {
+        viewStatus = String(error?.message || 'Failed to initialize coding sessions.');
+      })
+      .finally(() => {
+        wsHealthReady = true;
+        wsHealthKeepAlive = true;
+        connectWSHealthSocket();
+      });
     refreshCodexIdentity().catch(() => {});
-    wsHealthKeepAlive = true;
-    connectWSHealthSocket();
   });
 
   $effect(() => {
@@ -2690,10 +3028,8 @@
 
   $effect(() => {
     const sid = String(activeSessionID || '').trim();
-    if (!sid) {
-      closeWSHealthSocket();
-      return;
-    }
+    if (!sid) return;
+    if (!wsHealthReady) return;
     wsHealthKeepAlive = true;
     connectWSHealthSocket();
   });
@@ -2722,8 +3058,18 @@
 <section class="panel coding-panel">
   <header class="coding-topbar">
     <div class="coding-topbar-left">
-      <button class="btn btn-secondary" type="button" onclick={backToDashboard}>Dashboard</button>
-      <button class="btn btn-secondary" type="button" onclick={() => (showSessionDrawer = true)}>Sessions</button>
+      <button class="btn btn-secondary topbar-icon-btn" type="button" onclick={backToDashboard} aria-label="Dashboard">
+        <span class="topbar-btn-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M3 11.5 12 4l9 7.5v8.5a1 1 0 0 1-1 1h-5.5v-6h-5v6H4a1 1 0 0 1-1-1z"></path></svg>
+        </span>
+        <span class="topbar-btn-label">Dashboard</span>
+      </button>
+      <button class="btn btn-secondary topbar-icon-btn" type="button" onclick={() => (showSessionDrawer = true)} aria-label="Sessions">
+        <span class="topbar-btn-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 5h16v4H4zm0 5.5h16v4H4zM4 16h16v3H4z"></path></svg>
+        </span>
+        <span class="topbar-btn-label">Sessions</span>
+      </button>
       <div class="coding-topbar-title">
         <strong>CodexSess Chat</strong>
         <span title={selectedWorkDir || '~/'}>
@@ -2738,18 +3084,33 @@
         {/each}
       </select>
       <div class="coding-view-mode-toggle" role="group" aria-label="coding output mode">
-        <button class="btn btn-secondary {logViewMode === 'compact' ? 'is-active' : ''}" type="button" onclick={() => setLogViewMode('compact')}>
-          Compact
-        </button>
-        <button class="btn btn-secondary {logViewMode === 'raw' ? 'is-active' : ''}" type="button" onclick={() => setLogViewMode('raw')}>
-          Raw CLI
+        <button
+          class="btn topbar-icon-btn coding-view-toggle-btn {logViewMode === 'raw' ? 'mode-raw' : 'mode-compact'}"
+          type="button"
+          onclick={toggleLogViewMode}
+          aria-label={logViewMode === 'raw' ? 'Switch to Compact View' : 'Switch to Raw CLI View'}
+        >
+          <span class="topbar-btn-icon" aria-hidden="true">
+            {#if logViewMode === 'raw'}
+              <svg viewBox="0 0 24 24"><path d="M4 7h10v3H4zm0 7h10v3H4zm12-3.5 2.5-2.5L20 9.5 17.5 12 20 14.5 18.5 16 16 13.5 13.5 16 12 14.5 14.5 12 12 9.5 13.5 8z"></path></svg>
+            {:else}
+              <svg viewBox="0 0 24 24"><path d="M4 6h16v3H4zm0 5h12v3H4zm0 5h9v3H4z"></path></svg>
+            {/if}
+          </span>
+          <span class="topbar-btn-label">{logViewMode === 'raw' ? 'Raw CLI' : 'Compact'}</span>
         </button>
       </div>
-      <button class="btn btn-secondary" onclick={openNewSessionModal} disabled={loadingSessions || sending}>
-        New Session
+      <button class="btn btn-secondary topbar-icon-btn" onclick={openNewSessionModal} disabled={loadingSessions || sending} aria-label="New Session">
+        <span class="topbar-btn-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14m-7-7h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"></path></svg>
+        </span>
+        <span class="topbar-btn-label">New Session</span>
       </button>
-      <button class="btn btn-danger" onclick={deleteActiveSession} disabled={!activeSessionID || deleting || sending}>
-        Delete
+      <button class="btn btn-danger topbar-icon-btn" onclick={deleteActiveSession} disabled={!activeSessionID || deleting || sending} aria-label="Delete Session">
+        <span class="topbar-btn-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M6 7h12l-1 13H7zm3-3h6l1 2H8z"></path></svg>
+        </span>
+        <span class="topbar-btn-label">Delete</span>
       </button>
     </div>
   </header>
@@ -2759,7 +3120,11 @@
       {#if !activeSessionID}
         <div class="empty-state">Session not selected.</div>
       {:else}
-        <div class="coding-messages" bind:this={messagesViewport}>
+        <div class="coding-messages-wrap">
+        <div class="coding-messages" bind:this={messagesViewport} onscroll={onMessagesScroll}>
+          {#if loadingOlderMessages}
+            <p class="empty-note coding-loading-older">Loading older messages...</p>
+          {/if}
           {#if loadingMessages && messages.length === 0}
             <p class="empty-note">Loading messages...</p>
           {:else}
@@ -2774,6 +3139,8 @@
                     <strong>
                       {#if message.role === 'assistant'}
                         {assistantDisplayName()}
+                      {:else if message.role === 'exec_group'}
+                        Terminal
                       {:else if message.role === 'exec'}
                         Terminal
                       {:else if message.role === 'subagent'}
@@ -2789,7 +3156,9 @@
                       {/if}
                     </strong>
                     <span>
-                      {#if message.role === 'exec'}
+                      {#if message.role === 'exec_group'}
+                        {message.exec_group_count || (Array.isArray(message.exec_group_entries) ? message.exec_group_entries.length : 0)} commands
+                      {:else if message.role === 'exec'}
                         {execStatusLabel(message.exec_status, message.exec_exit_code)}
                       {:else if message.role === 'subagent'}
                         {subagentStatusLabel(message.subagent_status)}
@@ -2800,7 +3169,15 @@
                       {/if}
                     </span>
                   </div>
-                  {#if message.role === 'exec'}
+                  {#if message.role === 'exec_group'}
+                    <div class="coding-exec-summary">
+                      <code class="mono">{message.exec_group_count || (Array.isArray(message.exec_group_entries) ? message.exec_group_entries.length : 0)} terminal commands captured</code>
+                      <pre>{Array.isArray(message.exec_group_entries) ? message.exec_group_entries.slice(0, 3).map((entry) => `${execStatusLabel(entry.status, entry.exitCode)} · ${entry.command}`).join('\n') : '-'}</pre>
+                    </div>
+                    <button class="btn btn-secondary btn-small coding-exec-open" type="button" onclick={() => openExecBatchModal(message)}>
+                      View All Output
+                    </button>
+                  {:else if message.role === 'exec'}
                     <div class="coding-exec-summary">
                       <code class="mono" title={message.exec_command || message.content || '-'}>
                         {message.exec_command || message.content || '-'}
@@ -2852,6 +3229,12 @@
               <span class="streaming-label">Streaming...</span>
             </div>
           {/if}
+        </div>
+        {#if showScrollBottomButton}
+          <button class="btn btn-secondary btn-small coding-scroll-bottom-btn" type="button" onclick={jumpToLatestMessages}>
+            Jump to latest
+          </button>
+        {/if}
         </div>
 
         <div class="coding-composer">
@@ -2927,6 +3310,36 @@
         <pre class="coding-exec-modal-output mono">{selectedExecEntry.output}</pre>
         {#if selectedExecEntry.when}
           <p class="setting-title">{formatWhen(selectedExecEntry.when)}</p>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showExecBatchModal && selectedExecBatchEntry}
+  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
+    <div class="modal-card modal-card-coding modal-card-exec-batch-output" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeExecBatchModal()}>
+      <div class="modal-head">
+        <div>
+          <h3>Terminal Output</h3>
+          <p class="modal-subtitle">{selectedExecBatchEntry.count} commands</p>
+        </div>
+        <button class="btn btn-secondary btn-small" onclick={closeExecBatchModal}>Close</button>
+      </div>
+      <div class="modal-body">
+        {#each selectedExecBatchEntry.entries as entry}
+          <div class="coding-exec-batch-item">
+            <p class="setting-title">{execStatusLabel(entry.status, entry.exitCode)}</p>
+            <pre class="coding-exec-modal-command mono">{entry.command}</pre>
+            <pre class="coding-exec-modal-output mono">{entry.output}</pre>
+          </div>
+        {/each}
+        {#if Array.isArray(selectedExecBatchEntry.meta) && selectedExecBatchEntry.meta.length > 0}
+          <p class="setting-title">Metadata Logs</p>
+          <pre class="coding-exec-batch-meta mono">{selectedExecBatchEntry.meta.map((item) => `[${item.role}] ${item.content}`).join('\n\n')}</pre>
+        {/if}
+        {#if selectedExecBatchEntry.when}
+          <p class="setting-title">{formatWhen(selectedExecBatchEntry.when)}</p>
         {/if}
       </div>
     </div>
@@ -3029,15 +3442,30 @@
           <p class="empty-note">No session yet.</p>
         {:else}
           {#each sessions as session (session.id)}
-            <button
-              class="coding-session-item {activeSessionID === session.id ? 'is-active' : ''}"
-              onclick={() => selectSession(session.id)}
-            >
-              <strong>{session.title || 'New Session'}</strong>
-              <span class="mono">{sessionDisplayID(session)}</span>
-              <span>{formatWhen(session.last_message_at)}</span>
-              <span class="mono">{session.work_dir || '~/'}</span>
-            </button>
+            <div class="coding-session-item-row">
+              <button
+                class="coding-session-item {activeSessionID === session.id ? 'is-active' : ''}"
+                onclick={() => selectSession(session.id)}
+              >
+                <strong>{session.title || 'New Session'}</strong>
+                <span class="mono">{sessionDisplayID(session)}</span>
+                <span>{formatWhen(session.last_message_at)}</span>
+                <span class="mono">{session.work_dir || '~/'}</span>
+              </button>
+              <button
+                class="btn btn-danger btn-small coding-session-delete"
+                type="button"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  deleteSessionByID(session.id, { fromDrawer: true }).catch(() => {});
+                }}
+                disabled={deleting || sending}
+                aria-label={`Delete session ${session.title || session.id}`}
+                title="Delete session"
+              >
+                Delete
+              </button>
+            </div>
           {/each}
         {/if}
       </div>

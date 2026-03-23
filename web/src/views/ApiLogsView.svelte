@@ -11,7 +11,7 @@
 
 <section class="logs-panel">
   <div class="panel-header panel-header-inline logs-header">
-    <h2>API Logs</h2>
+    <h2>API Activity</h2>
     <button class="btn btn-secondary" onclick={onLoadAPILogs} disabled={busy}>Refresh</button>
   </div>
   <p class="panel-note logs-note">Only proxy API traffic is logged (OpenAI/Claude). Dashboard requests are excluded.</p>

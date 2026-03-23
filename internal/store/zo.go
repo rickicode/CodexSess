@@ -32,7 +32,7 @@ func (s *Store) CreateZoAPIKey(ctx context.Context, key ZoAPIKey) (ZoAPIKey, err
 	if key.ConversationUpdatedAt != nil {
 		convUpdated = key.ConversationUpdatedAt.UTC().Format(time.RFC3339)
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execWithRetry(ctx, `
 		INSERT INTO zo_api_keys(id, name, key_secret, active, conversation_id, conversation_updated_at, created_at, updated_at, last_used_at)
 		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, key.ID, key.Name, key.Token, boolToInt(key.Active), strings.TrimSpace(key.ConversationID), convUpdated, key.CreatedAt.Format(time.RFC3339), key.UpdatedAt.Format(time.RFC3339), key.LastUsedAt.Format(time.RFC3339))
@@ -62,7 +62,7 @@ func (s *Store) UpdateZoAPIKey(ctx context.Context, key ZoAPIKey) (ZoAPIKey, err
 		}
 		key.LastUsedAt = existing.LastUsedAt
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execWithRetry(ctx, `
 		UPDATE zo_api_keys
 		SET name=?, key_secret=?, active=?, updated_at=?, last_used_at=?
 		WHERE id=?
@@ -78,15 +78,15 @@ func (s *Store) DeleteZoAPIKey(ctx context.Context, id string) error {
 	if keyID == "" {
 		return fmt.Errorf("zo api key id is required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginTxWithRetry(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM zo_api_key_usage WHERE key_id=?`, keyID); err != nil {
+	if _, err := txExecWithRetry(ctx, tx, `DELETE FROM zo_api_key_usage WHERE key_id=?`, keyID); err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM zo_api_keys WHERE id=?`, keyID)
+	res, err := txExecWithRetry(ctx, tx, `DELETE FROM zo_api_keys WHERE id=?`, keyID)
 	if err != nil {
 		return err
 	}
@@ -211,16 +211,16 @@ func (s *Store) SetActiveZoAPIKey(ctx context.Context, id string) error {
 	if keyID == "" {
 		return fmt.Errorf("zo api key id is required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginTxWithRetry(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE zo_api_keys SET active=0`); err != nil {
+	if _, err := txExecWithRetry(ctx, tx, `UPDATE zo_api_keys SET active=0`); err != nil {
 		return err
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := tx.ExecContext(ctx, `
+	res, err := txExecWithRetry(ctx, tx, `
 		UPDATE zo_api_keys
 		SET active=1, updated_at=?, last_used_at=?
 		WHERE id=?
@@ -241,7 +241,7 @@ func (s *Store) TouchZoAPIKeyLastUsed(ctx context.Context, id string) error {
 		return fmt.Errorf("zo api key id is required")
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.execWithRetry(ctx, `
 		UPDATE zo_api_keys
 		SET updated_at=?, last_used_at=?
 		WHERE id=?
@@ -271,7 +271,7 @@ func (s *Store) UpdateZoAPIKeyConversation(ctx context.Context, keyID string, co
 		return fmt.Errorf("zo api key id is required")
 	}
 	now := updatedAt.UTC().Format(time.RFC3339)
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.execWithRetry(ctx, `
 		UPDATE zo_api_keys
 		SET conversation_id=?, conversation_updated_at=?, updated_at=?
 		WHERE id=?
@@ -295,12 +295,12 @@ func (s *Store) IncrementZoAPIKeyUsage(ctx context.Context, keyID string, delta 
 		delta = 1
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginTxWithRetry(ctx)
 	if err != nil {
 		return ZoAPIKeyUsage{}, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `
+	res, err := txExecWithRetry(ctx, tx, `
 		UPDATE zo_api_keys
 		SET last_used_at=?, updated_at=?
 		WHERE id=?
@@ -312,7 +312,7 @@ func (s *Store) IncrementZoAPIKeyUsage(ctx context.Context, keyID string, delta 
 	if n == 0 {
 		return ZoAPIKeyUsage{}, fmt.Errorf("zo api key not found")
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err = txExecWithRetry(ctx, tx, `
 		INSERT INTO zo_api_key_usage(key_id, usage_count, last_request_at, last_reset_at, updated_at)
 		VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT(key_id) DO UPDATE SET
@@ -335,12 +335,12 @@ func (s *Store) ResetZoAPIKeyUsage(ctx context.Context, keyID string) (ZoAPIKeyU
 		return ZoAPIKeyUsage{}, fmt.Errorf("zo api key id is required")
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginTxWithRetry(ctx)
 	if err != nil {
 		return ZoAPIKeyUsage{}, err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE zo_api_keys SET updated_at=? WHERE id=?`, now, keyID)
+	res, err := txExecWithRetry(ctx, tx, `UPDATE zo_api_keys SET updated_at=? WHERE id=?`, now, keyID)
 	if err != nil {
 		return ZoAPIKeyUsage{}, err
 	}
@@ -348,7 +348,7 @@ func (s *Store) ResetZoAPIKeyUsage(ctx context.Context, keyID string) (ZoAPIKeyU
 	if n == 0 {
 		return ZoAPIKeyUsage{}, fmt.Errorf("zo api key not found")
 	}
-	_, err = tx.ExecContext(ctx, `
+	_, err = txExecWithRetry(ctx, tx, `
 		INSERT INTO zo_api_key_usage(key_id, usage_count, last_request_at, last_reset_at, updated_at)
 		VALUES(?, 0, '', ?, ?)
 		ON CONFLICT(key_id) DO UPDATE SET

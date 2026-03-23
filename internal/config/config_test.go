@@ -21,6 +21,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.SystemLogMaxRows <= 0 {
 		t.Fatalf("SystemLogMaxRows unexpected: %d", cfg.SystemLogMaxRows)
 	}
+	if cfg.UsageSchedulerInterval != 30 {
+		t.Fatalf("UsageSchedulerInterval default mismatch: got %d want 30", cfg.UsageSchedulerInterval)
+	}
 }
 
 func TestResolveBindAddr_DefaultIsLocalhost(t *testing.T) {
@@ -85,6 +88,18 @@ func TestNormalizeCodingCLIStrategy(t *testing.T) {
 	}
 	if got := NormalizeCodingCLIStrategy("unknown"); got != "manual" {
 		t.Fatalf("expected manual default, got %q", got)
+	}
+}
+
+func TestNormalizeUsageSchedulerIntervalMinutes(t *testing.T) {
+	if got := NormalizeUsageSchedulerIntervalMinutes(5); got != 10 {
+		t.Fatalf("expected min 10, got %d", got)
+	}
+	if got := NormalizeUsageSchedulerIntervalMinutes(30); got != 30 {
+		t.Fatalf("expected 30, got %d", got)
+	}
+	if got := NormalizeUsageSchedulerIntervalMinutes(180); got != 120 {
+		t.Fatalf("expected max 120, got %d", got)
 	}
 }
 

@@ -338,6 +338,20 @@ func (s *Service) GetCodingMessages(ctx context.Context, sessionID string) ([]st
 	return s.Store.ListCodingMessages(ctx, sessionID)
 }
 
+func (s *Service) GetCodingMessagesPage(ctx context.Context, sessionID string, limit int, beforeID string) ([]store.CodingMessage, bool, error) {
+	sid := strings.TrimSpace(sessionID)
+	if sid == "" {
+		return nil, false, fmt.Errorf("session_id is required")
+	}
+	if limit < 1 {
+		return nil, false, fmt.Errorf("limit must be at least 1")
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	return s.Store.ListCodingMessagesPage(ctx, sid, limit, strings.TrimSpace(beforeID))
+}
+
 func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, model, workDirOverride, sandboxModeOverride, command string) (CodingChatResult, error) {
 	sid := strings.TrimSpace(sessionID)
 	if sid == "" {
@@ -871,34 +885,7 @@ func (s *Service) appendCodingRunFailureMessage(ctx context.Context, sessionID s
 	return nil
 }
 
-func compactCodingEventMessages(items []store.CodingMessage) []store.CodingMessage {
-	if len(items) == 0 {
-		return nil
-	}
-	out := make([]store.CodingMessage, 0, minInt(len(items), codingEventPersistMax))
-	for _, item := range items {
-		content := strings.TrimSpace(item.Content)
-		if content == "" {
-			continue
-		}
-		item.Content = truncateRunes(content, codingEventContentMaxRunes)
-		out = append(out, item)
-		if len(out) >= codingEventPersistMax {
-			break
-		}
-	}
-	dropped := len(items) - len(out)
-	if dropped > 0 {
-		out = append(out, store.CodingMessage{
-			ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
-			SessionID: firstSessionID(out),
-			Role:      "activity",
-			Content:   fmt.Sprintf("Event log truncated: %d additional entries omitted.", dropped),
-			CreatedAt: time.Now().UTC(),
-		})
-	}
-	return out
-}
+
 
 func firstSessionID(items []store.CodingMessage) string {
 	for _, item := range items {

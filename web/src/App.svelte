@@ -46,11 +46,12 @@
   let zoKeyValue = $state('');
   let zoStrategy = $state('round_robin');
   let showAccountEmail = $state(true);
-  let autoRefreshEnabled = $state(false);
   let usageAlertThreshold = $state(5);
   let usageAlertThresholdInput = $state('5');
   let usageAutoSwitchThreshold = $state(2);
   let usageAutoSwitchThresholdInput = $state('2');
+  let usageSchedulerIntervalMinutes = $state(30);
+  let usageSchedulerIntervalMinutesInput = $state('30');
   let usageSoundEnabled = $state(true);
   let claudeCodeIntegration = $state({
     connected: false,
@@ -72,7 +73,6 @@
   let updateCheckedAt = $state('');
   let updateCheckError = $state('');
   let updateCheckBusy = $state(false);
-  let autoRefreshBusy = $state(false);
   let usageRefreshBusy = $state(false);
   let usageAutomationBusy = $state(false);
   let autoSwitchInProgress = $state(false);
@@ -86,6 +86,8 @@
   let accountTypeFilter = $state('all');
   let usageAvailabilityFilter = $state('all');
   let accountStatusFilter = $state('all');
+  let totalAccountsFromServer = $state(0);
+  let totalFilteredAccounts = $state(0);
   let dashboardPageSize = $state(20);
   let dashboardPage = $state(1);
   let mobileSidebarOpen = $state(false);
@@ -136,6 +138,7 @@
   let usageThresholdPersistQueued = null;
   let usageThresholdLastSavedAlert = null;
   let usageThresholdLastSavedSwitch = null;
+  let usageThresholdLastSavedInterval = null;
   let soundCache = {};
   let refreshAllInFlight = null;
   let lastRefreshAllAt = 0;
@@ -245,43 +248,7 @@
   }
 
   function filteredAccounts() {
-    const q = String(accountSearchQuery || '').trim().toLowerCase();
-    const type = String(accountTypeFilter || 'all').trim().toLowerCase();
-    const usageFilter = String(usageAvailabilityFilter || 'all').trim().toLowerCase();
-    const statusFilter = String(accountStatusFilter || 'all').trim().toLowerCase();
-    const filtered = accounts.filter((account) => {
-      const accountType = String(account?.plan_type || '').trim().toLowerCase();
-      const revoked = account?.revoked === true;
-      if (type !== 'all' && accountType !== type) return false;
-      if (statusFilter === 'revoked' && !revoked) return false;
-      if (statusFilter === 'not_revoked' && revoked) return false;
-      if (usageFilter === 'exhausted' && !accountHasExhaustedUsage(account)) return false;
-      if (usageFilter === 'available' && !accountHasAvailableUsage(account)) return false;
-      if (!q) return true;
-      const haystack = [
-        account?.email,
-        account?.alias,
-        account?.id,
-        account?.plan_type
-      ]
-        .map((item) => String(item || '').toLowerCase())
-        .join(' ');
-      return haystack.includes(q);
-    });
-    return filtered
-      .map((account, index) => ({
-        account,
-        index,
-        usageSortScore: accountUsageSortScore(account)
-      }))
-      .sort((a, b) => {
-        const aActiveCLI = a.account?.active_cli ? 1 : 0;
-        const bActiveCLI = b.account?.active_cli ? 1 : 0;
-        if (aActiveCLI !== bActiveCLI) return bActiveCLI - aActiveCLI;
-        if (a.usageSortScore !== b.usageSortScore) return b.usageSortScore - a.usageSortScore;
-        return a.index - b.index;
-      })
-      .map((item) => item.account);
+    return accounts;
   }
 
   function accountUsageSortScore(account) {
@@ -308,30 +275,40 @@
   function setDashboardPageSize(value) {
     const raw = Number(value);
     const next = pageSizeOptions().includes(raw) ? raw : 20;
-    dashboardPageSize = next;
-    dashboardPage = 1;
+    if (dashboardPageSize !== next) {
+      dashboardPageSize = next;
+      dashboardPage = 1;
+      loadAccounts();
+    }
   }
 
   function setDashboardPage(value) {
     const n = Number(value);
-    dashboardPage = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+    const next = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+    if (dashboardPage !== next) {
+      dashboardPage = next;
+      loadAccounts();
+    }
   }
 
   function paginatedAccounts() {
-    const filtered = filteredAccounts();
+    const totalPages = Math.max(1, Math.ceil(totalFilteredAccounts / (dashboardPageSize > 0 ? dashboardPageSize : 20)));
+    let page = dashboardPage;
+    if (page > totalPages) page = totalPages;
+    if (page < 1) page = 1;
+
     const perPage = dashboardPageSize > 0 ? dashboardPageSize : 20;
-    const totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
-    const page = Math.min(Math.max(1, dashboardPage), totalPages);
     const start = (page - 1) * perPage;
-    const end = start + perPage;
+    const end = Math.min(start + accounts.length, totalFilteredAccounts);
+
     return {
-      items: filtered.slice(start, end),
-      totalFiltered: filtered.length,
+      items: accounts,
+      totalFiltered: totalFilteredAccounts,
       totalPages,
       page,
       perPage,
-      startIndex: filtered.length === 0 ? 0 : start + 1,
-      endIndex: Math.min(end, filtered.length)
+      startIndex: accounts.length === 0 ? 0 : start + 1,
+      endIndex: end
     };
   }
 
@@ -353,11 +330,13 @@
   function setAccountSearchQuery(value) {
     accountSearchQuery = value;
     dashboardPage = 1;
+    loadAccounts();
   }
 
   function setAccountTypeFilter(value) {
     accountTypeFilter = value;
     dashboardPage = 1;
+    loadAccounts();
   }
 
   function accountStatusOptions() {
@@ -376,35 +355,17 @@
     ];
   }
 
-  function usageWindowsForFilter(account) {
-    const windows = parseUsageWindows(account?.usage || null);
-    const usageWindows = windows.filter((window) => {
-      const label = String(window?.name || '').trim().toLowerCase();
-      return label.includes('weekly') || label.startsWith('5h');
-    });
-    return usageWindows.length > 0 ? usageWindows : windows;
-  }
-
-  function accountHasExhaustedUsage(account) {
-    const usageWindows = usageWindowsForFilter(account);
-    if (usageWindows.length === 0) return false;
-    return usageWindows.some((window) => clampPercent(window?.percent) <= 0);
-  }
-
-  function accountHasAvailableUsage(account) {
-    const usageWindows = usageWindowsForFilter(account);
-    if (usageWindows.length === 0) return false;
-    return usageWindows.every((window) => clampPercent(window?.percent) > 0);
-  }
 
   function setUsageAvailabilityFilter(value) {
     usageAvailabilityFilter = value;
     dashboardPage = 1;
+    loadAccounts();
   }
 
   function setAccountStatusFilter(value) {
     accountStatusFilter = value;
     dashboardPage = 1;
+    loadAccounts();
   }
 
   function toggleMobileSidebar() {
@@ -418,8 +379,8 @@
   function menuFromPath(path) {
     const p = String(path || '').trim().toLowerCase();
     if (p === '/settings') return 'settings';
-    if (p === '/apilogs') return 'logs';
-    if (p === '/api-endpoints') return 'api-endpoints';
+    if (p === '/api-activity') return 'logs';
+    if (p === '/workspaces') return 'api-endpoints';
     if (p === '/systemlogs') return 'system-logs';
     if (p === '/about') return 'about';
     if (p === '/' || p === '/dashboard') return 'dashboard';
@@ -432,9 +393,9 @@
       case 'settings':
         return '/settings';
       case 'logs':
-        return '/apilogs';
+        return '/api-activity';
       case 'api-endpoints':
-        return '/api-endpoints';
+        return '/workspaces';
       case 'system-logs':
         return '/systemlogs';
       case 'about':
@@ -491,9 +452,9 @@
       case 'settings':
         return `Settings - ${base}`;
       case 'api-endpoints':
-        return `API Workspace - ${base}`;
+        return `Workspaces - ${base}`;
       case 'logs':
-        return `API Logs - ${base}`;
+        return `API Activity - ${base}`;
       case 'system-logs':
         return `System Logs - ${base}`;
       case 'about':
@@ -642,6 +603,12 @@
     const n = Number(value);
     if (!Number.isFinite(n)) return fallbackValue;
     return Math.max(0, Math.min(100, Math.round(n)));
+  }
+
+  function parseSchedulerIntervalInput(value, fallbackValue) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallbackValue;
+    return Math.max(10, Math.min(120, Math.round(n)));
   }
 
   function playNotificationTone(kind = 'info', { wait = false } = {}) {
@@ -1089,12 +1056,25 @@
     const previousAccounts = Array.isArray(accounts) ? accounts : [];
     const previousAPIActiveID = String(activeAPIAccount()?.id || '').trim();
     const previousCLIActiveID = String(activeCLIAccount()?.id || '').trim();
-    const data = await req('/api/accounts');
+    
+    const params = new URLSearchParams({
+      page: dashboardPage,
+      limit: dashboardPageSize
+    });
+    if (accountSearchQuery) params.set('q', accountSearchQuery);
+    if (accountTypeFilter && accountTypeFilter !== 'all') params.set('type', accountTypeFilter);
+    if (accountStatusFilter && accountStatusFilter !== 'all') params.set('status', accountStatusFilter);
+    if (usageAvailabilityFilter && usageAvailabilityFilter !== 'all') params.set('usage', usageAvailabilityFilter);
+
+    const data = await req(`/api/accounts?${params.toString()}`);
     const nextAccounts = Array.isArray(data.accounts) ? data.accounts : [];
     accounts = nextAccounts;
+    if (typeof data.total_filtered === 'number') {
+      totalFilteredAccounts = data.total_filtered;
+    }
 
-    const nextAPIActiveID = String(nextAccounts.find((account) => account?.active_api)?.id || '').trim();
-    const nextCLIActiveID = String(nextAccounts.find((account) => account?.active_cli)?.id || '').trim();
+    const nextAPIActiveID = String(nextAccounts.find((a) => a?.active_api)?.id || '').trim();
+    const nextCLIActiveID = String(nextAccounts.find((a) => a?.active_cli)?.id || '').trim();
     const apiSwitched = previousAPIActiveID !== '' && nextAPIActiveID !== '' && previousAPIActiveID !== nextAPIActiveID;
     const cliSwitched = previousCLIActiveID !== '' && nextCLIActiveID !== '' && previousCLIActiveID !== nextCLIActiveID;
     const toneSuppressed = Date.now() < suppressActiveSwitchToneUntil;
@@ -1156,7 +1136,12 @@
       usageAutoSwitchThresholdInput = String(usageAutoSwitchThreshold);
       usageThresholdLastSavedSwitch = usageAutoSwitchThreshold;
     }
-    autoRefreshEnabled = data.usage_scheduler_enabled !== false;
+    const schedulerIntervalMinutes = Number(data.usage_scheduler_interval_minutes);
+    if (Number.isFinite(schedulerIntervalMinutes)) {
+      usageSchedulerIntervalMinutes = parseSchedulerIntervalInput(schedulerIntervalMinutes, usageSchedulerIntervalMinutes);
+      usageSchedulerIntervalMinutesInput = String(usageSchedulerIntervalMinutes);
+      usageThresholdLastSavedInterval = usageSchedulerIntervalMinutes;
+    }
     if (!availableModels.includes(mappingTargetModel) && availableModels.length > 0) {
       mappingTargetModel = availableModels[0];
     }
@@ -1432,7 +1417,17 @@
       await refreshAllInFlight;
       return;
     }
-    refreshAllInFlight = Promise.all([loadAccounts(), loadSettings(), loadZoKeys()]);
+
+    const loadTotalTask = async () => {
+      try {
+        const totalData = await req('/api/accounts/total');
+        totalAccountsFromServer = Number(totalData.total) || 0;
+      } catch (err) {
+        console.error('Failed to load total accounts', err);
+      }
+    };
+
+    refreshAllInFlight = Promise.all([loadTotalTask(), loadAccounts(), loadSettings(), loadZoKeys()]);
     try {
       await refreshAllInFlight;
       await loadZoModels();
@@ -1584,6 +1579,22 @@
     }
   }
 
+  async function deleteRevokedAccounts() {
+    if (!confirm('Delete all revoked accounts permanently? This cannot be undone.')) return;
+    busy = true;
+    try {
+      const data = await req('/api/accounts/revoked', { method: 'DELETE' });
+      const n = data?.deleted ?? 0;
+      await refreshAllData();
+      setStatus(n > 0 ? `Deleted ${n} revoked account(s).` : 'No revoked accounts to delete.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      busy = false;
+    }
+  }
+
+
   async function regenerateAPIKey() {
     settingsBusy = true;
     try {
@@ -1672,23 +1683,6 @@
 
   function toggleShowAccountEmail() {
     showAccountEmail = !showAccountEmail;
-  }
-
-  async function toggleAutoRefreshEnabled() {
-    const nextEnabled = !autoRefreshEnabled;
-    autoRefreshBusy = true;
-    try {
-      const data = await req('/api/settings', {
-        method: 'POST',
-        body: JSON.stringify({ usage_scheduler_enabled: nextEnabled })
-      });
-      autoRefreshEnabled = Boolean(data.usage_scheduler_enabled);
-      setStatus(`Background auto-switch scheduler ${autoRefreshEnabled ? 'enabled' : 'disabled'}.`, 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      autoRefreshBusy = false;
-    }
   }
 
   function toggleUsageSoundEnabled() {
@@ -1818,6 +1812,12 @@
     usageAutoSwitchThresholdInput = String(normalized);
   }
 
+  function setUsageSchedulerIntervalInput(value) {
+    const normalized = parseSchedulerIntervalInput(value, usageSchedulerIntervalMinutes);
+    usageSchedulerIntervalMinutes = normalized;
+    usageSchedulerIntervalMinutesInput = String(normalized);
+  }
+
   function commitUsageAutoSwitchThresholdInput(nextValue = null) {
     const sourceValue = nextValue === null || nextValue === undefined ? usageAutoSwitchThresholdInput : nextValue;
     const normalized = parsePercentInput(sourceValue, usageAutoSwitchThreshold);
@@ -1833,10 +1833,26 @@
     queuePersistUsageThresholdSettings('switch');
   }
 
+  function commitUsageSchedulerIntervalInput(nextValue = null) {
+    const sourceValue = nextValue === null || nextValue === undefined ? usageSchedulerIntervalMinutesInput : nextValue;
+    const normalized = parseSchedulerIntervalInput(sourceValue, usageSchedulerIntervalMinutes);
+    usageSchedulerIntervalMinutes = normalized;
+    usageSchedulerIntervalMinutesInput = String(normalized);
+    queuePersistUsageThresholdSettings('interval');
+  }
+
+  function nudgeUsageSchedulerInterval(delta) {
+    const next = parseSchedulerIntervalInput(Number(usageSchedulerIntervalMinutes) + Number(delta), usageSchedulerIntervalMinutes);
+    usageSchedulerIntervalMinutes = next;
+    usageSchedulerIntervalMinutesInput = String(next);
+    queuePersistUsageThresholdSettings('interval');
+  }
+
   function queuePersistUsageThresholdSettings(changedType) {
     usageThresholdPersistQueued = {
       alertThreshold: parsePercentInput(usageAlertThreshold, 5),
       autoSwitchThreshold: parsePercentInput(usageAutoSwitchThreshold, 2),
+      schedulerIntervalMinutes: parseSchedulerIntervalInput(usageSchedulerIntervalMinutes, 30),
       changedType
     };
     if (usageThresholdPersistTimer) {
@@ -1857,10 +1873,12 @@
 
     const alertThreshold = parsePercentInput(next.alertThreshold, 5);
     const autoSwitchThreshold = parsePercentInput(next.autoSwitchThreshold, 2);
+    const schedulerIntervalMinutes = parseSchedulerIntervalInput(next.schedulerIntervalMinutes, 30);
     const changedType = next.changedType;
     if (
       usageThresholdLastSavedAlert === alertThreshold &&
-      usageThresholdLastSavedSwitch === autoSwitchThreshold
+      usageThresholdLastSavedSwitch === autoSwitchThreshold &&
+      usageThresholdLastSavedInterval === schedulerIntervalMinutes
     ) {
       return;
     }
@@ -1871,19 +1889,26 @@
         method: 'POST',
         body: JSON.stringify({
           usage_alert_threshold: alertThreshold,
-          usage_auto_switch_threshold: autoSwitchThreshold
+          usage_auto_switch_threshold: autoSwitchThreshold,
+          usage_scheduler_interval_minutes: schedulerIntervalMinutes
         })
       });
       const savedAlert = parsePercentInput(Number(data.usage_alert_threshold), usageAlertThreshold);
       const savedSwitch = parsePercentInput(Number(data.usage_auto_switch_threshold), usageAutoSwitchThreshold);
+      const savedInterval = parseSchedulerIntervalInput(Number(data.usage_scheduler_interval_minutes), usageSchedulerIntervalMinutes);
       usageAlertThreshold = savedAlert;
       usageAlertThresholdInput = String(savedAlert);
       usageAutoSwitchThreshold = savedSwitch;
       usageAutoSwitchThresholdInput = String(savedSwitch);
+      usageSchedulerIntervalMinutes = savedInterval;
+      usageSchedulerIntervalMinutesInput = String(savedInterval);
       usageThresholdLastSavedAlert = savedAlert;
       usageThresholdLastSavedSwitch = savedSwitch;
+      usageThresholdLastSavedInterval = savedInterval;
       if (changedType === 'alert') {
         setStatus(`Usage alert threshold set to ${savedAlert}%.`, 'success');
+      } else if (changedType === 'interval') {
+        setStatus(`Scheduler interval set to ${savedInterval} minutes.`, 'success');
       } else {
         setStatus(`Usage auto-switch threshold set to ${savedSwitch}%.`, 'success');
       }
@@ -2335,7 +2360,6 @@
 
   $effect(() => {
     if (isChatRoute) return;
-    if (!autoRefreshEnabled) return;
     const timer = setInterval(() => {
       refreshAllData({ statusMessage: false, force: true }).catch(() => {});
     }, 60000);
@@ -2371,7 +2395,7 @@
   <aside class="sidebar {mobileSidebarOpen ? 'is-open' : ''}">
     <div class="brand">
       <strong>CodexSess</strong>
-      <span class="brand-meta brand-meta-count">[{accounts.length} Accounts]</span>
+      <span class="brand-meta brand-meta-count">[{totalAccountsFromServer} Accounts]</span>
       <span class="brand-title">Codex Account Management</span>
       <span class="brand-meta brand-meta-cli">
         {#if String(codexVersion || '').trim().toLowerCase().includes('codex-cli')}
@@ -2391,21 +2415,21 @@
       </button>
       <button class={activeMenu === 'coding' ? 'is-active' : ''} onclick={() => switchMenu('coding')}>
         <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M4 5h16v14H4V5zm2 2v10h12V7H6zm2 2h8v2H8V9zm0 4h6v2H8v-2z"></path></svg>
+          <svg viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8A2.5 2.5 0 0 1 17.5 16H10l-4.5 4v-4H6.5A2.5 2.5 0 0 1 4 13.5v-8zm4 2.5h8v1.8H8zm0 3.6h5.8v1.8H8z"></path></svg>
         </span>
         <span>Chat</span>
       </button>
       <button class={activeMenu === 'api-endpoints' ? 'is-active' : ''} onclick={() => switchMenu('api-endpoints')}>
         <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M3 5h18v4H3V5zm0 5.5h18v4H3v-4zM3 16h18v3H3v-3z"></path></svg>
+          <svg viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h5A2.5 2.5 0 0 1 13 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-5A2.5 2.5 0 0 1 3 16.5v-9zm8 0A2.5 2.5 0 0 1 13.5 5h5A2.5 2.5 0 0 1 21 7.5v9a2.5 2.5 0 0 1-2.5 2.5h-5A2.5 2.5 0 0 1 11 16.5v-9zM6 8h4v1.6H6zm0 3h4v1.6H6zm7-3h4v1.6h-4zm0 3h4v1.6h-4z"></path></svg>
         </span>
-        <span>API Workspace</span>
+        <span>Workspaces</span>
       </button>
       <button class={activeMenu === 'logs' ? 'is-active' : ''} onclick={() => switchMenu('logs')}>
         <span class="nav-icon" aria-hidden="true">
           <svg viewBox="0 0 24 24"><path d="M4 4h16v4H4V4zm0 6h16v10H4V10zm3 3v4h2v-4H7zm4 0v4h2v-4h-2zm4 0v4h2v-4h-2z"></path></svg>
         </span>
-        <span>API Logs</span>
+        <span>API Activity</span>
       </button>
       <button class={activeMenu === 'system-logs' ? 'is-active' : ''} onclick={() => switchMenu('system-logs')}>
         <span class="nav-icon" aria-hidden="true">
@@ -2469,7 +2493,7 @@
       <DashboardView
         {apiMode}
         accounts={dashboardPagination.items}
-        totalAccounts={accounts.length}
+        totalAccounts={totalAccountsFromServer}
         filteredCount={dashboardPagination.totalFiltered}
         page={dashboardPagination.page}
         totalPages={dashboardPagination.totalPages}
@@ -2495,6 +2519,7 @@
         onOpenAddAccountModal={openAddAccountModal}
         onBackupAccounts={backupAllAccounts}
         onRestoreAccounts={restoreAccounts}
+        onDeleteRevokedAccounts={deleteRevokedAccounts}
         onUseApiAccount={useAccount}
         onUseCliAccount={useCLIAccount}
         onRefreshUsage={refreshUsage}
@@ -2518,21 +2543,23 @@
         onSetCodingCLIStrategy={setCodingCLIStrategy}
         {showAccountEmail}
         onToggleShowAccountEmail={toggleShowAccountEmail}
-        {autoRefreshEnabled}
         {usageAlertThreshold}
         {usageAlertThresholdInput}
         {usageAutoSwitchThreshold}
         {usageAutoSwitchThresholdInput}
+        {usageSchedulerIntervalMinutes}
+        {usageSchedulerIntervalMinutesInput}
         {usageSoundEnabled}
-        onToggleAutoRefreshEnabled={toggleAutoRefreshEnabled}
         onSetUsageAlertThresholdInput={setUsageAlertThresholdInput}
         onCommitUsageAlertThresholdInput={commitUsageAlertThresholdInput}
         onSetUsageAutoSwitchThresholdInput={setUsageAutoSwitchThresholdInput}
         onCommitUsageAutoSwitchThresholdInput={commitUsageAutoSwitchThresholdInput}
+        onSetUsageSchedulerIntervalInput={setUsageSchedulerIntervalInput}
+        onCommitUsageSchedulerIntervalInput={commitUsageSchedulerIntervalInput}
         onNudgeUsageAlertThreshold={nudgeUsageAlertThreshold}
         onNudgeUsageAutoSwitchThreshold={nudgeUsageAutoSwitchThreshold}
+        onNudgeUsageSchedulerInterval={nudgeUsageSchedulerInterval}
         onToggleUsageSoundEnabled={toggleUsageSoundEnabled}
-        {autoRefreshBusy}
         {backgroundRefreshError}
         {backgroundRefreshLastAt}
       />

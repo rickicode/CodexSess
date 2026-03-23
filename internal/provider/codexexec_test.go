@@ -280,8 +280,11 @@ func TestBuildExecArgs_ReviewCommandMode(t *testing.T) {
 	if !strings.HasPrefix(joined, "exec review") {
 		t.Fatalf("expected exec review args, got: %v", args)
 	}
-	if !strings.Contains(joined, "--json") || !strings.Contains(joined, "--skip-git-repo-check") || !strings.Contains(joined, "--uncommitted") {
+	if !strings.Contains(joined, "--json") || !strings.Contains(joined, "--skip-git-repo-check") {
 		t.Fatalf("missing review flags in args: %v", args)
+	}
+	if strings.Contains(joined, "--uncommitted") {
+		t.Fatalf("review prompt mode must not include --uncommitted, args: %v", args)
 	}
 	if !strings.Contains(joined, "--dangerously-bypass-approvals-and-sandbox") {
 		t.Fatalf("expected full-access review to bypass sandbox, args: %v", args)
@@ -313,13 +316,30 @@ func TestBuildExecArgs_ReviewModeUsesReviewSubcommand(t *testing.T) {
 		t.Fatalf("expected review subcommand: got %q want %q (args=%v)", got, want, args)
 	}
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "--uncommitted") {
-		t.Fatalf("expected --uncommitted in review args, got: %v", args)
+	if strings.Contains(joined, "--uncommitted") {
+		t.Fatalf("prompted review should not include --uncommitted, got: %v", args)
 	}
 	if !strings.Contains(joined, "--full-auto") {
 		t.Fatalf("expected --full-auto in review args for write sandbox, got: %v", args)
 	}
 	if args[len(args)-1] != "-" {
 		t.Fatalf("expected stdin prompt marker '-' at end, got: %v", args)
+	}
+}
+
+func TestBuildExecArgs_ReviewModeWithoutPromptUsesUncommitted(t *testing.T) {
+	c := NewCodexExec("codex")
+	args := c.buildExecArgs(ExecOptions{
+		Model:       "gpt-5.2-codex",
+		Prompt:      "",
+		CommandMode: "review",
+		SandboxMode: "write",
+	}, false)
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--uncommitted") {
+		t.Fatalf("expected --uncommitted in bare review args, got: %v", args)
+	}
+	if len(args) > 0 && args[len(args)-1] == "-" {
+		t.Fatalf("bare review must not pass stdin marker '-', got: %v", args)
 	}
 }

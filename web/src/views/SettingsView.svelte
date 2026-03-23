@@ -5,25 +5,27 @@
     onSetAPIMode,
     showAccountEmail,
     onToggleShowAccountEmail,
-    autoRefreshEnabled,
     directAPIStrategy,
     codingCLIStrategy,
     usageAlertThreshold,
     usageAlertThresholdInput,
     usageAutoSwitchThreshold,
     usageAutoSwitchThresholdInput,
+    usageSchedulerIntervalMinutes,
+    usageSchedulerIntervalMinutesInput,
     usageSoundEnabled,
-    onToggleAutoRefreshEnabled,
     onSetDirectAPIStrategy,
     onSetCodingCLIStrategy,
     onSetUsageAlertThresholdInput,
     onCommitUsageAlertThresholdInput,
     onSetUsageAutoSwitchThresholdInput,
     onCommitUsageAutoSwitchThresholdInput,
+    onSetUsageSchedulerIntervalInput,
+    onCommitUsageSchedulerIntervalInput,
     onNudgeUsageAlertThreshold,
     onNudgeUsageAutoSwitchThreshold,
-    onToggleUsageSoundEnabled,
-    autoRefreshBusy
+    onNudgeUsageSchedulerInterval,
+    onToggleUsageSoundEnabled
   } = $props();
 
   function nudgeAlert(delta) {
@@ -32,6 +34,10 @@
 
   function nudgeAutoSwitch(delta) {
     onNudgeUsageAutoSwitchThreshold(delta);
+  }
+
+  function nudgeSchedulerInterval(delta) {
+    onNudgeUsageSchedulerInterval(delta);
   }
 </script>
 
@@ -124,12 +130,12 @@
             disabled={busy || codingCLIStrategy === 'round_robin'}
             aria-pressed={codingCLIStrategy === 'round_robin'}
           >
-            Round Robin (5m)
+            Round Robin
           </button>
         </div>
         <p class="setting-title">
           {#if codingCLIStrategy === 'round_robin'}
-            CLI active account rotates every backend active-check cycle (~5 menit).
+            CLI active account rotates on each scheduler cycle ({usageSchedulerIntervalMinutes}m).
           {:else}
             CLI only auto-switches when remaining usage is below `Auto-switch when remaining usage is below`.
           {/if}
@@ -153,20 +159,40 @@
     <section class="setting-category">
       <h3 class="setting-category-title">Usage Automation</h3>
       <div class="setting-row">
-        <p class="setting-title">Background Auto Switch Scheduler</p>
-        <div class="setting-actions-grid">
-          <button class="btn btn-secondary" onclick={onToggleAutoRefreshEnabled} disabled={busy || autoRefreshBusy}>
-            {#if autoRefreshEnabled}Disable{:else}Enable{/if}
-          </button>
+        <p class="setting-title">Background Usage Scheduler</p>
+        <p class="setting-title">Scheduler selalu aktif dari backend dan menjalankan refresh usage + auto-switch sesuai interval.</p>
+      </div>
+
+      <div class="setting-row">
+        <p class="setting-title">Scheduler Interval (minutes)</p>
+        <div class="slider-wrap">
+        <div class="slider-head">
+          <span class="setting-title">Run scheduler every</span>
+          <div class="inline-actions">
+            <button type="button" class="btn btn-small btn-secondary" onclick={() => nudgeSchedulerInterval(-1)}>-</button>
+            <span class="slider-value">{usageSchedulerIntervalMinutes}m</span>
+            <button type="button" class="btn btn-small btn-secondary" onclick={() => nudgeSchedulerInterval(1)}>+</button>
+          </div>
         </div>
-        <p class="setting-title">
-          {#if autoRefreshEnabled}
-            Scheduler aktif: cek usage progresif (maks 3 akun per loop) dan auto-switch dari backend.
-          {:else}
-            Scheduler backend nonaktif.
-          {/if}
-        </p>
-        <p class="setting-title">Scheduler status is handled fully by backend loop.</p>
+          <input
+            class="threshold-slider"
+            type="range"
+            min="10"
+            max="120"
+            step="1"
+            value={usageSchedulerIntervalMinutes}
+            oninput={(event) => onSetUsageSchedulerIntervalInput(event.currentTarget.value)}
+            onmouseup={(event) => onCommitUsageSchedulerIntervalInput(event.currentTarget.value)}
+            onchange={(event) => onCommitUsageSchedulerIntervalInput(event.currentTarget.value)}
+            aria-label="Usage scheduler interval minutes"
+          />
+          <div class="slider-scale">
+            <span>10m</span>
+            <span>60m</span>
+            <span>120m</span>
+          </div>
+        </div>
+        <p class="setting-title">Current scheduler interval: {usageSchedulerIntervalMinutesInput} minutes</p>
       </div>
 
       <div class="setting-row">
@@ -201,7 +227,6 @@
         <p class="setting-title">Current alert threshold: {usageAlertThreshold}%</p>
       </div>
 
-      {#if autoRefreshEnabled}
       <div class="setting-row">
         <p class="setting-title">Usage Auto-Switch Threshold (%)</p>
         <div class="slider-wrap">
@@ -234,7 +259,6 @@
         <p class="setting-title">Current auto-switch threshold: {usageAutoSwitchThreshold}%</p>
               <p class="setting-title">Default logic: alert at 5%, auto-switch at 15%.</p>
       </div>
-      {/if}
 
       <div class="setting-row">
         <p class="setting-title">Notification Sound</p>

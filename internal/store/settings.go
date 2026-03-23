@@ -18,7 +18,7 @@ func (s *Store) GetSetting(ctx context.Context, key string) (string, error) {
 
 func (s *Store) SetSetting(ctx context.Context, key string, value string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execWithRetry(ctx, `
 		INSERT INTO app_settings(key, value, updated_at)
 		VALUES(?,?,?)
 		ON CONFLICT(key) DO UPDATE SET
@@ -29,7 +29,7 @@ func (s *Store) SetSetting(ctx context.Context, key string, value string) error 
 }
 
 func (s *Store) DeleteSetting(ctx context.Context, key string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM app_settings WHERE key=?`, strings.TrimSpace(key))
+	_, err := s.execWithRetry(ctx, `DELETE FROM app_settings WHERE key=?`, strings.TrimSpace(key))
 	return err
 }
 

@@ -60,6 +60,8 @@ type Server struct {
 	invalidToolCacheMu    sync.Mutex
 	invalidToolCache      map[string]map[string]time.Time
 	lastActiveCheckAt     atomic.Int64
+	lastAllAttemptAt      atomic.Int64
+	lastAllFailureAt      atomic.Int64
 	lastAllCheckAt        atomic.Int64
 	cliSwitchStatusMu     sync.Mutex
 	cliSwitchStatus       cliSwitchStatus
@@ -68,9 +70,10 @@ type Server struct {
 const (
 	maxTrafficRequestCaptureBytes  = 8 * 1024 * 1024
 	maxTrafficResponseCaptureBytes = 8 * 1024 * 1024
-	usageSchedulerTickInterval     = 15 * time.Minute
 	usageSchedulerWorkerPercent    = 10
 	usageSchedulerParallelWorkers  = 2
+	usageSchedulerLoopPollInterval = 1 * time.Minute
+	usageSchedulerRetryCooldown    = 2 * time.Minute
 	autoSwitchUsageFreshness       = 5 * time.Minute
 	invalidToolCacheTTL            = 20 * time.Minute
 	claudeTokenSoftLimitDefault    = 14000
@@ -102,6 +105,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/accounts", s.handleWebAccounts)
+	mux.HandleFunc("/api/accounts/total", s.handleWebAccountsTotal)
+	mux.HandleFunc("/api/accounts/revoked", s.handleDeleteRevokedAccounts)
 	mux.HandleFunc("/api/account/use", s.handleWebUseAccount)
 	mux.HandleFunc("/api/account/use-api", s.handleWebUseAPIAccount)
 	mux.HandleFunc("/api/account/use-cli", s.handleWebUseCLIAccount)
@@ -174,32 +179,57 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 func (s *Server) runUsageAutoSwitchLoop(ctx context.Context) {
 	s.runUsageSchedulerTick(ctx)
-	ticker := time.NewTicker(usageSchedulerTickInterval)
+	ticker := time.NewTicker(usageSchedulerLoopPollInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.runUsageSchedulerTick(ctx)
+			s.runUsageSchedulerTickIfDue(ctx)
 		}
 	}
+}
+
+func (s *Server) runUsageSchedulerTickIfDue(parent context.Context) {
+	enabled, _, _, intervalMinutes := s.currentUsageSchedulerState()
+	if !enabled {
+		return
+	}
+	lastFailureMS := s.lastAllFailureAt.Load()
+	lastSuccessMS := s.lastAllCheckAt.Load()
+	if lastFailureMS > 0 && (lastSuccessMS == 0 || lastFailureMS > lastSuccessMS) {
+		lastFailure := time.UnixMilli(lastFailureMS)
+		if time.Since(lastFailure) < usageSchedulerRetryCooldown {
+			return
+		}
+	}
+	lastTickMS := s.lastAllCheckAt.Load()
+	if lastTickMS > 0 {
+		lastTick := time.UnixMilli(lastTickMS)
+		if time.Since(lastTick) < time.Duration(intervalMinutes)*time.Minute {
+			return
+		}
+	}
+	s.runUsageSchedulerTick(parent)
 }
 
 func (s *Server) runUsageSchedulerTick(parent context.Context) {
 	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 	defer cancel()
 
-	enabled, threshold, cliStrategy := s.currentUsageSchedulerState()
-	nowMS := time.Now().UTC().UnixMilli()
-	s.lastAllCheckAt.Store(nowMS)
-	s.lastActiveCheckAt.Store(nowMS)
+	enabled, threshold, cliStrategy, intervalMinutes := s.currentUsageSchedulerState()
 	if !enabled {
 		return
 	}
+	nowMS := time.Now().UTC().UnixMilli()
+	s.lastAllAttemptAt.Store(nowMS)
+	s.lastActiveCheckAt.Store(nowMS)
 
+	var tickErr bool
 	refreshed, total, nextCursor, err := s.refreshUsageBatchedByCursor(ctx, usageSchedulerWorkerPercent, usageSchedulerParallelWorkers)
 	if err != nil {
+		tickErr = true
 		log.Printf("[usage-scheduler] refresh tick failed: %v", err)
 	} else {
 		s.svc.AddSystemLog(ctx, "usage_refresh", "Scheduled usage refresh", map[string]any{
@@ -210,16 +240,25 @@ func (s *Server) runUsageSchedulerTick(parent context.Context) {
 			"cursor_next":  nextCursor,
 			"parallel":     usageSchedulerParallelWorkers,
 			"batch_pct":    usageSchedulerWorkerPercent * usageSchedulerParallelWorkers,
-			"tick_seconds": int(usageSchedulerTickInterval.Seconds()),
+			"tick_seconds": intervalMinutes * 60,
 		})
 	}
 
 	if err := s.autoSwitchAPIIfNeeded(ctx, threshold); err != nil {
+		tickErr = true
 		log.Printf("[autoswitch] api check failed: %v", err)
 	}
 	if err := s.autoSwitchCLIIfNeeded(ctx, threshold, cliStrategy); err != nil {
+		tickErr = true
 		log.Printf("[autoswitch] cli check failed: %v", err)
 	}
+	if tickErr {
+		s.lastAllFailureAt.Store(time.Now().UTC().UnixMilli())
+		return
+	}
+	successMS := time.Now().UTC().UnixMilli()
+	s.lastAllCheckAt.Store(successMS)
+	s.lastActiveCheckAt.Store(successMS)
 }
 
 func (s *Server) refreshUsageBatchedByCursor(ctx context.Context, workerPercent int, parallelWorkers int) (int, int, int, error) {
@@ -236,7 +275,7 @@ func (s *Server) refreshUsageBatchedByCursor(ctx context.Context, workerPercent 
 	ids := make([]string, 0, len(accounts))
 	for _, account := range accounts {
 		id := strings.TrimSpace(account.ID)
-		if id == "" {
+		if id == "" || account.Revoked {
 			continue
 		}
 		ids = append(ids, id)
@@ -366,19 +405,20 @@ func (s *Server) saveUsageSchedulerCursor(ctx context.Context, cursor int) error
 	return s.svc.Store.SetSetting(ctx, store.SettingUsageCursor, strconv.Itoa(cursor))
 }
 
-func (s *Server) currentUsageSchedulerState() (bool, int, string) {
+func (s *Server) currentUsageSchedulerState() (bool, int, string, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	enabled := s.svc.Cfg.UsageSchedulerEnabled
+	enabled := true
 	threshold := s.svc.Cfg.UsageAutoSwitchThreshold
 	cliStrategy := config.NormalizeCodingCLIStrategy(s.svc.Cfg.CodingCLIStrategy)
+	intervalMinutes := config.NormalizeUsageSchedulerIntervalMinutes(s.svc.Cfg.UsageSchedulerInterval)
 	if threshold < 0 {
 		threshold = 0
 	}
 	if threshold > 100 {
 		threshold = 100
 	}
-	return enabled, threshold, cliStrategy
+	return enabled, threshold, cliStrategy, intervalMinutes
 }
 
 func (s *Server) runUsageAutoSwitchActiveOnce(parent context.Context) {
@@ -386,7 +426,7 @@ func (s *Server) runUsageAutoSwitchActiveOnce(parent context.Context) {
 	defer cancel()
 
 	s.lastActiveCheckAt.Store(time.Now().UTC().UnixMilli())
-	enabled, threshold, cliStrategy := s.currentUsageSchedulerState()
+	enabled, threshold, cliStrategy, _ := s.currentUsageSchedulerState()
 	if !enabled {
 		return
 	}
@@ -753,7 +793,7 @@ func (s *Server) listCLICandidatesWithUsage(ctx context.Context) ([]cliUsageCand
 	candidates := make([]cliUsageCandidate, 0, len(accounts))
 	for _, account := range accounts {
 		id := strings.TrimSpace(account.ID)
-		if id == "" {
+		if id == "" || account.Revoked {
 			continue
 		}
 		score, scoreErr := s.usageScoreForDecision(ctx, id)
@@ -787,7 +827,7 @@ func (s *Server) listCLICandidatesForRoundRobin(ctx context.Context) ([]cliUsage
 	candidates := make([]cliUsageCandidate, 0, len(accounts))
 	for _, account := range accounts {
 		id := strings.TrimSpace(account.ID)
-		if id == "" {
+		if id == "" || account.Revoked {
 			continue
 		}
 		candidates = append(candidates, cliUsageCandidate{
@@ -1077,7 +1117,7 @@ func pickBestUsageCandidateAbove(accounts []store.Account, skipID string, minSco
 	best := store.Account{}
 	bestScore := -1
 	for _, account := range accounts {
-		if strings.TrimSpace(account.ID) == "" || account.ID == skipID {
+		if strings.TrimSpace(account.ID) == "" || account.ID == skipID || account.Revoked {
 			continue
 		}
 		usage, err := loadUsage(account.ID)
@@ -1225,8 +1265,18 @@ func (s *Server) resolveAPIAccount(ctx context.Context, selector string) (store.
 		return store.Account{}, err
 	}
 
-	usage, usageErr := s.loadOrRefreshUsage(ctx, account.ID)
-	if usageErr == nil && usageErrorLooksRevoked(usage.LastError) {
+	var usageErr error
+	var usage store.UsageSnapshot
+
+	if account.Revoked {
+		// If DB already marks it as revoked, skip OpenAI checks and trigger switch directly
+		usageErr = nil
+		usage = store.UsageSnapshot{LastError: "token_invalidated"} // Mock to force usageErrorLooksRevoked
+	} else {
+		usage, usageErr = s.loadOrRefreshUsage(ctx, account.ID)
+	}
+
+	if usageErr == nil && usageErrorLooksRevoked(usage.LastError) || account.Revoked {
 		// Explicit selector should stay strict and not auto-switch.
 		if strings.TrimSpace(selector) != "" {
 			return store.Account{}, fmt.Errorf("target account token revoked")
@@ -1241,8 +1291,7 @@ func (s *Server) resolveAPIAccount(ctx context.Context, selector string) (store.
 			return store.Account{}, err
 		}
 		account = switched
-	}
-	if usageErr == nil && !usageAvailable(usage) {
+	} else if usageErr == nil && !usageAvailable(usage) {
 		// Explicit selector should stay strict and not auto-switch.
 		if strings.TrimSpace(selector) != "" {
 			return store.Account{}, fmt.Errorf("target account quota exhausted")
@@ -1269,7 +1318,18 @@ func (s *Server) resolveAPIAccount(ctx context.Context, selector string) (store.
 }
 
 func (s *Server) loadOrRefreshUsage(ctx context.Context, accountID string) (store.UsageSnapshot, error) {
-	return s.svc.Store.GetUsage(ctx, accountID)
+	u, err := s.svc.Store.GetUsage(ctx, accountID)
+	if err == nil && !u.FetchedAt.IsZero() && time.Since(u.FetchedAt) <= autoSwitchUsageFreshness {
+		return u, nil
+	}
+	refreshed, refreshErr := s.svc.RefreshUsage(ctx, accountID)
+	if refreshErr == nil {
+		return refreshed, nil
+	}
+	if err == nil {
+		return u, nil
+	}
+	return store.UsageSnapshot{}, refreshErr
 }
 
 func usageErrorLooksRevoked(raw string) bool {
@@ -1330,11 +1390,18 @@ func (s *Server) findBestUsageAccount(ctx context.Context, skipID string) (store
 	found := false
 
 	for _, a := range accounts {
-		if strings.TrimSpace(a.ID) == "" || a.ID == skipID {
+		if strings.TrimSpace(a.ID) == "" || a.ID == skipID || a.Revoked {
 			continue
 		}
 		u, ok := usageMap[a.ID]
-		if !ok || strings.TrimSpace(u.LastError) != "" {
+		if !ok || u.FetchedAt.IsZero() || time.Since(u.FetchedAt) > autoSwitchUsageFreshness {
+			refreshed, refreshErr := s.loadOrRefreshUsage(ctx, a.ID)
+			if refreshErr != nil {
+				continue
+			}
+			u = refreshed
+		}
+		if strings.TrimSpace(u.LastError) != "" {
 			continue
 		}
 		if !usageAvailable(u) {
@@ -1348,7 +1415,10 @@ func (s *Server) findBestUsageAccount(ctx context.Context, skipID string) (store
 		}
 	}
 
-	return best, found
+	if found {
+		return best, true
+	}
+	return store.Account{}, false
 }
 
 type accessLogRecorder struct {
@@ -1803,7 +1873,31 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	accounts, err := s.svc.ListAccounts(r.Context())
+	
+	qPage := r.URL.Query().Get("page")
+	qLimit := r.URL.Query().Get("limit")
+	
+	filter := store.AccountFilter{
+		Query:    r.URL.Query().Get("q"),
+		PlanType: r.URL.Query().Get("type"),
+		Status:   r.URL.Query().Get("status"),
+		Usage:    r.URL.Query().Get("usage"),
+	}
+
+	var accounts []store.Account
+	var totalFiltered int
+	var err error
+
+	page, _ := strconv.Atoi(qPage)
+	limit, _ := strconv.Atoi(qLimit)
+
+	if qPage != "" || qLimit != "" {
+		accounts, totalFiltered, err = s.svc.ListAccountsPaginated(r.Context(), page, limit, filter)
+	} else {
+		accounts, err = s.svc.ListAccounts(r.Context())
+		totalFiltered = len(accounts)
+	}
+	
 	if err != nil {
 		respondErr(w, 500, "internal_error", err.Error())
 		return
@@ -1821,8 +1915,11 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 		RevokedReason string               `json:"revoked_reason,omitempty"`
 	}
 	resp := struct {
-		Accounts []webAccount `json:"accounts"`
-	}{}
+		Accounts      []webAccount `json:"accounts"`
+		TotalFiltered int          `json:"total_filtered"`
+	}{
+		TotalFiltered: totalFiltered,
+	}
 	usageMap, err := s.svc.Store.ListUsageSnapshots(r.Context())
 	if err != nil {
 		usageMap = map[string]store.UsageSnapshot{}
@@ -1859,7 +1956,12 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 				_, _ = s.svc.UseAccountCLI(service.WithCLISwitchReason(r.Context(), "revoked"), best.ID)
 			}
 		}
-		accounts, err = s.svc.ListAccounts(r.Context())
+		if qPage != "" || qLimit != "" {
+			accounts, totalFiltered, err = s.svc.ListAccountsPaginated(r.Context(), page, limit, filter)
+		} else {
+			accounts, err = s.svc.ListAccounts(r.Context())
+			totalFiltered = len(accounts)
+		}
 		if err != nil {
 			respondErr(w, 500, "internal_error", err.Error())
 			return
@@ -1887,17 +1989,48 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 			ActiveAPI: isAPI,
 			ActiveCLI: isCLI,
 		}
+		item.Revoked = a.Revoked
 		if u, ok := usageMap[a.ID]; ok {
 			ux := u
 			item.Usage = &ux
 			if usageErrorLooksRevoked(ux.LastError) {
 				item.Revoked = true
 				item.RevokedReason = strings.TrimSpace(ux.LastError)
+			} else if a.Revoked {
+				item.RevokedReason = "Marked as revoked in database"
 			}
+		} else if a.Revoked {
+			item.RevokedReason = "Marked as revoked in database"
 		}
 		resp.Accounts = append(resp.Accounts, item)
 	}
 	respondJSON(w, 200, resp)
+}
+
+func (s *Server) handleWebAccountsTotal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	total, err := s.svc.CountAccounts(r.Context())
+	if err != nil {
+		respondErr(w, 500, "internal_error", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]int{"total": total})
+}
+
+func (s *Server) handleDeleteRevokedAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	n, err := s.svc.DeleteRevokedAccounts(r.Context())
+	if err != nil {
+		respondErr(w, 500, "internal_error", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]any{"deleted": n})
 }
 
 func (s *Server) handleWebUseAccount(w http.ResponseWriter, r *http.Request) {
@@ -2106,23 +2239,27 @@ func (s *Server) handleWebUsageAutomationStatus(w http.ResponseWriter, r *http.R
 		respondErr(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	enabled, threshold, cliStrategy := s.currentUsageSchedulerState()
+	enabled, threshold, cliStrategy, intervalMinutes := s.currentUsageSchedulerState()
 	status := s.getCLISwitchStatus()
 	respondJSON(w, http.StatusOK, map[string]any{
-		"usage_scheduler_enabled":       enabled,
-		"usage_auto_switch_threshold":   threshold,
-		"coding_cli_strategy":           cliStrategy,
-		"active_check_interval_seconds": int(usageSchedulerTickInterval.Seconds()),
-		"all_check_interval_seconds":    int(usageSchedulerTickInterval.Seconds()),
-		"last_active_check_at":          s.lastActiveCheckAt.Load(),
-		"last_all_check_at":             s.lastAllCheckAt.Load(),
-		"last_cli_switch_at":            status.At,
-		"last_cli_switch_from":          status.From,
-		"last_cli_switch_to":            status.To,
-		"last_cli_switch_reason":        status.Reason,
-		"last_cli_switch_strategy":      status.Strategy,
-		"last_cli_switch_error":         status.Error,
-		"last_cli_switch_candidates":    status.Candidates,
+		"usage_scheduler_enabled":          enabled,
+		"usage_auto_switch_threshold":      threshold,
+		"usage_scheduler_interval_minutes": intervalMinutes,
+		"retry_cooldown_seconds":           int(usageSchedulerRetryCooldown.Seconds()),
+		"coding_cli_strategy":              cliStrategy,
+		"active_check_interval_seconds":    intervalMinutes * 60,
+		"all_check_interval_seconds":       intervalMinutes * 60,
+		"last_all_attempt_at":              s.lastAllAttemptAt.Load(),
+		"last_all_failure_at":              s.lastAllFailureAt.Load(),
+		"last_active_check_at":             s.lastActiveCheckAt.Load(),
+		"last_all_check_at":                s.lastAllCheckAt.Load(),
+		"last_cli_switch_at":               status.At,
+		"last_cli_switch_from":             status.From,
+		"last_cli_switch_to":               status.To,
+		"last_cli_switch_reason":           status.Reason,
+		"last_cli_switch_strategy":         status.Strategy,
+		"last_cli_switch_error":            status.Error,
+		"last_cli_switch_candidates":       status.Candidates,
 	})
 }
 
@@ -2177,7 +2314,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	if BearerToken(r.Header.Get("Authorization")) != s.currentAPIKey() {
+	if !s.isValidAPIKey(r) {
 		respondErr(w, 401, "unauthorized", "invalid API key")
 		return
 	}
@@ -2375,7 +2512,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	if BearerToken(r.Header.Get("Authorization")) != s.currentAPIKey() {
+	if !s.isValidAPIKey(r) {
 		respondErr(w, 401, "unauthorized", "invalid API key")
 		return
 	}
@@ -2463,11 +2600,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				}
 				writeChatCompletionsChunk(w, flusher, chunk)
 				return nil
-			})
+			}, !bufferedToolsMode)
 			stopKeepAlive()
 			if err != nil {
-				status = 500
-				_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"`+escape(err.Error())+`"}}`)
+				code, errType := classifyDirectUpstreamError(err)
+				status = code
+				_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"`+escape(err.Error())+`","type":"`+escape(errType)+`"}}`)
 				_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 				flusher.Flush()
 				return
@@ -2477,6 +2615,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				toolCalls, hasToolCalls := resolveToolCalls(res.Text, req.Tools, res.ToolCalls)
 				if structuredSpec != nil {
 					if hasToolCalls {
+						status = 400
 						_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"tool_calls not allowed when response_format is set","type":"invalid_response_format"}}`)
 						_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 						flusher.Flush()
@@ -2487,6 +2626,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 						text = res.Text
 					}
 					if err := validateStructuredOutput(structuredSpec, text); err != nil {
+						status = 400
 						_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"`+escape(err.Error())+`","type":"invalid_response_format"}}`)
 						_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 						flusher.Flush()
@@ -2546,6 +2686,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			toolCalls, hasToolCalls := resolveToolCalls(res.Text, req.Tools, mapProviderToolCalls(res.ToolCalls))
 			if structuredSpec != nil {
 				if hasToolCalls {
+					status = 400
 					_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"tool_calls not allowed when response_format is set","type":"invalid_response_format"}}`)
 					_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 					flusher.Flush()
@@ -2556,6 +2697,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					text = res.Text
 				}
 				if err := validateStructuredOutput(structuredSpec, text); err != nil {
+					status = 400
 					_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"error":{"message":"`+escape(err.Error())+`","type":"invalid_response_format"}}`)
 					_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 					flusher.Flush()
@@ -2580,7 +2722,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.currentAPIMode() == "direct_api" {
-		res, err := s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, nil)
+		res, err := s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, nil, false)
 		if err != nil {
 			status = 500
 			code, errType := classifyDirectUpstreamError(err)
@@ -2591,10 +2733,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		toolCalls, hasToolCalls := resolveToolCalls(res.Text, req.Tools, res.ToolCalls)
 		if structuredSpec != nil {
 			if hasToolCalls {
+				status = 400
 				respondErr(w, 400, "invalid_response_format", "tool_calls not allowed when response_format is set")
 				return
 			}
 			if err := validateStructuredOutput(structuredSpec, res.Text); err != nil {
+				status = 400
 				respondErr(w, 400, "invalid_response_format", err.Error())
 				return
 			}
@@ -2633,10 +2777,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	toolCalls, hasToolCalls := resolveToolCalls(res.Text, req.Tools, mapProviderToolCalls(res.ToolCalls))
 	if structuredSpec != nil {
 		if hasToolCalls {
+			status = 400
 			respondErr(w, 400, "invalid_response_format", "tool_calls not allowed when response_format is set")
 			return
 		}
 		if err := validateStructuredOutput(structuredSpec, res.Text); err != nil {
+			status = 400
 			respondErr(w, 400, "invalid_response_format", err.Error())
 			return
 		}
@@ -2672,7 +2818,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	if BearerToken(r.Header.Get("Authorization")) != s.currentAPIKey() {
+	if !s.isValidAPIKey(r) {
 		respondErr(w, 401, "unauthorized", "invalid API key")
 		return
 	}
@@ -2805,13 +2951,14 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				}
 				emit("response.output_text.delta", deltaEvent)
 				return nil
-			})
+			}, !bufferedToolsMode)
 			stopKeepAlive()
 			if err != nil {
-				status = 500
+				code, errType := classifyDirectUpstreamError(err)
+				status = code
 				emit("error", map[string]any{
 					"type":    "error",
-					"code":    "upstream_error",
+					"code":    errType,
 					"message": err.Error(),
 					"param":   nil,
 				})
@@ -2828,6 +2975,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				toolCalls, hasToolCalls := resolveToolCalls(result.Text, req.Tools, result.ToolCalls)
 				if structuredSpec != nil {
 					if hasToolCalls {
+						status = 400
 						emit("error", map[string]any{
 							"type":    "error",
 							"code":    "invalid_response_format",
@@ -2843,6 +2991,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 						text = strings.TrimSpace(result.Text)
 					}
 					if err := validateStructuredOutput(structuredSpec, text); err != nil {
+						status = 400
 						emit("error", map[string]any{
 							"type":    "error",
 							"code":    "invalid_response_format",
@@ -2974,6 +3123,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			toolCalls, hasToolCalls := resolveToolCalls(result.Text, req.Tools, mapProviderToolCalls(result.ToolCalls))
 			if structuredSpec != nil {
 				if hasToolCalls {
+					status = 400
 					emit("error", map[string]any{
 						"type":    "error",
 						"code":    "invalid_response_format",
@@ -2989,6 +3139,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 					text = strings.TrimSpace(result.Text)
 				}
 				if err := validateStructuredOutput(structuredSpec, text); err != nil {
+					status = 400
 					emit("error", map[string]any{
 						"type":    "error",
 						"code":    "invalid_response_format",
@@ -3060,7 +3211,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.currentAPIMode() == "direct_api" {
-		result, err := s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, nil)
+		result, err := s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, nil, false)
 		if err != nil {
 			code, errType := classifyDirectUpstreamError(err)
 			status = code
@@ -3070,10 +3221,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		toolCalls, hasToolCalls := resolveToolCalls(result.Text, req.Tools, result.ToolCalls)
 		if structuredSpec != nil {
 			if hasToolCalls {
+				status = 400
 				respondErr(w, 400, "invalid_response_format", "tool_calls not allowed when text.format is set")
 				return
 			}
 			if err := validateStructuredOutput(structuredSpec, result.Text); err != nil {
+				status = 400
 				respondErr(w, 400, "invalid_response_format", err.Error())
 				return
 			}
@@ -3135,10 +3288,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	toolCalls, hasToolCalls := resolveToolCalls(result.Text, req.Tools, mapProviderToolCalls(result.ToolCalls))
 	if structuredSpec != nil {
 		if hasToolCalls {
+			status = 400
 			respondErr(w, 400, "invalid_response_format", "tool_calls not allowed when text.format is set")
 			return
 		}
 		if err := validateStructuredOutput(structuredSpec, result.Text); err != nil {
+			status = 400
 			respondErr(w, 400, "invalid_response_format", err.Error())
 			return
 		}
@@ -3306,23 +3461,27 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 			usage        ClaudeMessagesUsage
 			toolCalls    []ChatToolCall
 			streamedText strings.Builder
+			streamMu     sync.Mutex
 		)
 		onDelta := func(delta string) error {
 			if strings.TrimSpace(delta) == "" {
 				return nil
 			}
+			streamMu.Lock()
 			streamedText.WriteString(delta)
+			streamMu.Unlock()
 			return nil
 		}
 
 		if s.currentAPIMode() == "direct_api" {
-			directRes, err = s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, onDelta)
+			directRes, err = s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, onDelta, false)
 			if err != nil {
-				status = 500
+				code, errType := classifyDirectUpstreamClaudeError(err)
+				status = code
 				writeSSE(w, "error", map[string]any{
 					"type": "error",
 					"error": map[string]any{
-						"type":    "api_error",
+						"type":    errType,
 						"message": err.Error(),
 					},
 				})
@@ -3337,6 +3496,9 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 			toolCalls = sanitizeClaudeClientToolCalls(toolCalls)
 		} else {
 			streamRes, err = s.svc.Codex.StreamChat(r.Context(), s.svc.APICodexHome(account.ID), req.Model, prompt, func(evt provider.ChatEvent) error {
+				if evt.Type != "delta" {
+					return nil
+				}
 				return onDelta(evt.Text)
 			})
 			if err != nil {
@@ -3359,7 +3521,9 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 			toolCalls = sanitizeClaudeClientToolCalls(toolCalls)
 		}
 
+		streamMu.Lock()
 		finalText := strings.TrimSpace(streamedText.String())
+		streamMu.Unlock()
 		if finalText == "" {
 			if s.currentAPIMode() == "direct_api" {
 				finalText = strings.TrimSpace(directRes.Text)
@@ -3446,7 +3610,7 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.currentAPIMode() == "direct_api" {
-		res, err := s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, nil)
+		res, err := s.callDirectCodexResponsesAutoSwitch429(r.Context(), selector, &account, &tk, req.Model, prompt, directOpts, nil, false)
 		if err != nil {
 			code, errType := classifyDirectUpstreamClaudeError(err)
 			status = code
@@ -5593,6 +5757,68 @@ func (s *Server) bootstrapSettingsFromStore(ctx context.Context) error {
 		}
 	}
 
+	usageAlertThreshold, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageAlertThreshold)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if ok {
+		if parsed, parseErr := strconv.Atoi(strings.TrimSpace(usageAlertThreshold)); parseErr == nil {
+			if parsed < 0 {
+				parsed = 0
+			}
+			if parsed > 100 {
+				parsed = 100
+			}
+			cfg.UsageAlertThreshold = parsed
+		}
+	} else {
+		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageAlertThreshold, strconv.Itoa(cfg.UsageAlertThreshold)); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	usageAutoSwitchThreshold, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageAutoSwitchThreshold)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if ok {
+		if parsed, parseErr := strconv.Atoi(strings.TrimSpace(usageAutoSwitchThreshold)); parseErr == nil {
+			if parsed < 0 {
+				parsed = 0
+			}
+			if parsed > 100 {
+				parsed = 100
+			}
+			cfg.UsageAutoSwitchThreshold = parsed
+		}
+	} else {
+		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageAutoSwitchThreshold, strconv.Itoa(cfg.UsageAutoSwitchThreshold)); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	usageSchedulerInterval, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageSchedulerInterval)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if ok {
+		if parsed, parseErr := strconv.Atoi(strings.TrimSpace(usageSchedulerInterval)); parseErr == nil {
+			cfg.UsageSchedulerInterval = config.NormalizeUsageSchedulerIntervalMinutes(parsed)
+		}
+	} else {
+		cfg.UsageSchedulerInterval = config.NormalizeUsageSchedulerIntervalMinutes(cfg.UsageSchedulerInterval)
+		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageSchedulerInterval, strconv.Itoa(cfg.UsageSchedulerInterval)); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+
+	usageSchedulerEnabled, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageSchedulerEnabled)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if ok && strings.EqualFold(strings.TrimSpace(usageSchedulerEnabled), "false") {
+		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageSchedulerEnabled, "true"); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	cfg.UsageSchedulerEnabled = true
+
 	codexHome, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingCodexHome)
 	if err != nil {
 		errs = append(errs, err.Error())
@@ -5675,6 +5901,32 @@ func (s *Server) saveSetting(ctx context.Context, key string, value string) erro
 		cfg.ZoAPIStrategy = config.NormalizeZoAPIStrategy(value)
 	case store.SettingCodexHome:
 		cfg.CodexHome = strings.TrimSpace(value)
+	case store.SettingUsageAlertThreshold:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			if parsed < 0 {
+				parsed = 0
+			}
+			if parsed > 100 {
+				parsed = 100
+			}
+			cfg.UsageAlertThreshold = parsed
+		}
+	case store.SettingUsageAutoSwitchThreshold:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			if parsed < 0 {
+				parsed = 0
+			}
+			if parsed > 100 {
+				parsed = 100
+			}
+			cfg.UsageAutoSwitchThreshold = parsed
+		}
+	case store.SettingUsageSchedulerEnabled:
+		cfg.UsageSchedulerEnabled = true
+	case store.SettingUsageSchedulerInterval:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			cfg.UsageSchedulerInterval = config.NormalizeUsageSchedulerIntervalMinutes(parsed)
+		}
 	case store.SettingModelMappings:
 		mappings := map[string]string{}
 		if err := json.Unmarshal([]byte(strings.TrimSpace(value)), &mappings); err != nil {
@@ -5810,7 +6062,8 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		usageAlertThreshold := s.svc.Cfg.UsageAlertThreshold
 		usageAutoSwitchThreshold := s.svc.Cfg.UsageAutoSwitchThreshold
-		usageSchedulerEnabled := s.svc.Cfg.UsageSchedulerEnabled
+		usageSchedulerEnabled := true
+		usageSchedulerInterval := config.NormalizeUsageSchedulerIntervalMinutes(s.svc.Cfg.UsageSchedulerInterval)
 		directAPIStrategy := config.NormalizeDirectAPIStrategy(s.svc.Cfg.DirectAPIStrategy)
 		codingCLIStrategy := config.NormalizeCodingCLIStrategy(s.svc.Cfg.CodingCLIStrategy)
 		zoStrategy := config.NormalizeZoAPIStrategy(s.svc.Cfg.ZoAPIStrategy)
@@ -5818,35 +6071,36 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		updateInfo := s.getUpdateInfo(r.Context(), false)
 		claudeCodeStatus := s.claudeCodeIntegrationStatus(base)
 		respondJSON(w, 200, map[string]any{
-			"api_key":                     s.currentAPIKey(),
-			"api_mode":                    s.currentAPIMode(),
-			"openai_endpoint":             strings.TrimRight(base, "/") + "/v1/chat/completions",
-			"claude_endpoint":             strings.TrimRight(base, "/") + "/v1/messages",
-			"auth_json_endpoint":          strings.TrimRight(base, "/") + "/v1/auth.json",
-			"usage_status_endpoint":       strings.TrimRight(base, "/") + "/v1/usage",
-			"openai_models_url":           strings.TrimRight(base, "/") + "/v1/models",
-			"openai_chat_url":             strings.TrimRight(base, "/") + "/v1/chat/completions",
-			"openai_responses_url":        strings.TrimRight(base, "/") + "/v1/responses",
-			"zo_models_url":               strings.TrimRight(base, "/") + "/zo/v1/models",
-			"zo_chat_url":                 strings.TrimRight(base, "/") + "/zo/v1/chat/completions",
-			"available_models":            codexAvailableModels(),
-			"model_mappings":              modelMappings,
-			"usage_alert_threshold":       usageAlertThreshold,
-			"usage_auto_switch_threshold": usageAutoSwitchThreshold,
-			"usage_scheduler_enabled":     usageSchedulerEnabled,
-			"direct_api_strategy":         directAPIStrategy,
-			"coding_cli_strategy":         codingCLIStrategy,
-			"zo_api_strategy":             zoStrategy,
-			"direct_api_inject_prompt":    true,
-			"claude_code":                 claudeCodeStatus,
-			"app_version":                 updateInfo.CurrentVersion,
-			"codex_version":               firstNonEmpty(s.codexVersion, "unknown"),
-			"latest_version":              updateInfo.LatestVersion,
-			"release_url":                 updateInfo.ReleaseURL,
-			"latest_changelog":            updateInfo.LatestChangelog,
-			"update_available":            updateInfo.UpdateAvailable,
-			"update_checked_at":           updateInfo.CheckedAt,
-			"update_check_error":          updateInfo.CheckError,
+			"api_key":                          s.currentAPIKey(),
+			"api_mode":                         s.currentAPIMode(),
+			"openai_endpoint":                  strings.TrimRight(base, "/") + "/v1/chat/completions",
+			"claude_endpoint":                  strings.TrimRight(base, "/") + "/v1/messages",
+			"auth_json_endpoint":               strings.TrimRight(base, "/") + "/v1/auth.json",
+			"usage_status_endpoint":            strings.TrimRight(base, "/") + "/v1/usage",
+			"openai_models_url":                strings.TrimRight(base, "/") + "/v1/models",
+			"openai_chat_url":                  strings.TrimRight(base, "/") + "/v1/chat/completions",
+			"openai_responses_url":             strings.TrimRight(base, "/") + "/v1/responses",
+			"zo_models_url":                    strings.TrimRight(base, "/") + "/zo/v1/models",
+			"zo_chat_url":                      strings.TrimRight(base, "/") + "/zo/v1/chat/completions",
+			"available_models":                 codexAvailableModels(),
+			"model_mappings":                   modelMappings,
+			"usage_alert_threshold":            usageAlertThreshold,
+			"usage_auto_switch_threshold":      usageAutoSwitchThreshold,
+			"usage_scheduler_enabled":          usageSchedulerEnabled,
+			"usage_scheduler_interval_minutes": usageSchedulerInterval,
+			"direct_api_strategy":              directAPIStrategy,
+			"coding_cli_strategy":              codingCLIStrategy,
+			"zo_api_strategy":                  zoStrategy,
+			"direct_api_inject_prompt":         true,
+			"claude_code":                      claudeCodeStatus,
+			"app_version":                      updateInfo.CurrentVersion,
+			"codex_version":                    firstNonEmpty(s.codexVersion, "unknown"),
+			"latest_version":                   updateInfo.LatestVersion,
+			"release_url":                      updateInfo.ReleaseURL,
+			"latest_changelog":                 updateInfo.LatestChangelog,
+			"update_available":                 updateInfo.UpdateAvailable,
+			"update_checked_at":                updateInfo.CheckedAt,
+			"update_check_error":               updateInfo.CheckError,
 		})
 		return
 	case http.MethodPost:
@@ -5855,6 +6109,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			UsageAlertThreshold      *int    `json:"usage_alert_threshold"`
 			UsageAutoSwitchThreshold *int    `json:"usage_auto_switch_threshold"`
 			UsageSchedulerEnabled    *bool   `json:"usage_scheduler_enabled"`
+			UsageSchedulerInterval   *int    `json:"usage_scheduler_interval_minutes"`
 			DirectAPIStrategy        *string `json:"direct_api_strategy"`
 			CodingCLIStrategy        *string `json:"coding_cli_strategy"`
 			ZoAPIStrategy            *string `json:"zo_api_strategy"`
@@ -5890,7 +6145,11 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			cfg.UsageAutoSwitchThreshold = v
 		}
 		if req.UsageSchedulerEnabled != nil {
-			cfg.UsageSchedulerEnabled = *req.UsageSchedulerEnabled
+			cfg.UsageSchedulerEnabled = true
+		}
+		if req.UsageSchedulerInterval != nil {
+			v := config.NormalizeUsageSchedulerIntervalMinutes(*req.UsageSchedulerInterval)
+			cfg.UsageSchedulerInterval = v
 		}
 		if req.DirectAPIStrategy != nil {
 			cfg.DirectAPIStrategy = config.NormalizeDirectAPIStrategy(strings.TrimSpace(*req.DirectAPIStrategy))
@@ -5913,6 +6172,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			adminPasswordChanged = true
 		}
 		cfg.DirectAPIInjectPrompt = true
+		cfg.UsageSchedulerEnabled = true
 		s.svc.Cfg = cfg
 		s.adminPasswordHash = strings.TrimSpace(cfg.AdminPasswordHash)
 		s.mu.Unlock()
@@ -5940,6 +6200,30 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if req.UsageAlertThreshold != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageAlertThreshold, strconv.Itoa(cfg.UsageAlertThreshold)); err != nil {
+				respondErr(w, 500, "internal_error", err.Error())
+				return
+			}
+		}
+		if req.UsageAutoSwitchThreshold != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageAutoSwitchThreshold, strconv.Itoa(cfg.UsageAutoSwitchThreshold)); err != nil {
+				respondErr(w, 500, "internal_error", err.Error())
+				return
+			}
+		}
+		if req.UsageSchedulerEnabled != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageSchedulerEnabled, "true"); err != nil {
+				respondErr(w, 500, "internal_error", err.Error())
+				return
+			}
+		}
+		if req.UsageSchedulerInterval != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageSchedulerInterval, strconv.Itoa(cfg.UsageSchedulerInterval)); err != nil {
+				respondErr(w, 500, "internal_error", err.Error())
+				return
+			}
+		}
 		if adminPasswordChanged {
 			if err := s.saveSetting(r.Context(), store.SettingAdminPasswordHash, cfg.AdminPasswordHash); err != nil {
 				respondErr(w, 500, "internal_error", err.Error())
@@ -5959,6 +6243,9 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if before.UsageSchedulerEnabled != cfg.UsageSchedulerEnabled {
 			changed["usage_scheduler_enabled"] = map[string]any{"from": before.UsageSchedulerEnabled, "to": cfg.UsageSchedulerEnabled}
+		}
+		if before.UsageSchedulerInterval != cfg.UsageSchedulerInterval {
+			changed["usage_scheduler_interval_minutes"] = map[string]any{"from": before.UsageSchedulerInterval, "to": cfg.UsageSchedulerInterval}
 		}
 		if before.DirectAPIStrategy != cfg.DirectAPIStrategy {
 			changed["direct_api_strategy"] = map[string]any{"from": before.DirectAPIStrategy, "to": cfg.DirectAPIStrategy}
@@ -5980,15 +6267,16 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		respondJSON(w, 200, map[string]any{
-			"api_mode":                    cfg.APIMode,
-			"direct_api_strategy":         cfg.DirectAPIStrategy,
-			"coding_cli_strategy":         cfg.CodingCLIStrategy,
-			"zo_api_strategy":             cfg.ZoAPIStrategy,
-			"direct_api_inject_prompt":    true,
-			"ok":                          true,
-			"usage_alert_threshold":       cfg.UsageAlertThreshold,
-			"usage_auto_switch_threshold": cfg.UsageAutoSwitchThreshold,
-			"usage_scheduler_enabled":     cfg.UsageSchedulerEnabled,
+			"api_mode":                         cfg.APIMode,
+			"direct_api_strategy":              cfg.DirectAPIStrategy,
+			"coding_cli_strategy":              cfg.CodingCLIStrategy,
+			"zo_api_strategy":                  cfg.ZoAPIStrategy,
+			"direct_api_inject_prompt":         true,
+			"ok":                               true,
+			"usage_alert_threshold":            cfg.UsageAlertThreshold,
+			"usage_auto_switch_threshold":      cfg.UsageAutoSwitchThreshold,
+			"usage_scheduler_enabled":          cfg.UsageSchedulerEnabled,
+			"usage_scheduler_interval_minutes": config.NormalizeUsageSchedulerIntervalMinutes(cfg.UsageSchedulerInterval),
 		})
 		return
 	default:
@@ -6722,14 +7010,39 @@ func (s *Server) handleWebCodingMessages(w http.ResponseWriter, r *http.Request)
 		respondErr(w, 400, "bad_request", "session_id is required")
 		return
 	}
-	messages, err := s.svc.GetCodingMessages(r.Context(), sessionID)
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil {
+			respondErr(w, 400, "bad_request", "limit must be an integer")
+			return
+		}
+		if v < 1 {
+			v = 1
+		}
+		if v > 200 {
+			v = 200
+		}
+		limit = v
+	}
+	beforeID := strings.TrimSpace(r.URL.Query().Get("before_id"))
+	messages, hasMore, err := s.svc.GetCodingMessagesPage(r.Context(), sessionID, limit, beforeID)
 	if err != nil {
 		respondErr(w, 400, "bad_request", err.Error())
 		return
 	}
+	oldestID := ""
+	newestID := ""
+	if len(messages) > 0 {
+		oldestID = messages[0].ID
+		newestID = messages[len(messages)-1].ID
+	}
 	respondJSON(w, 200, map[string]any{
-		"ok":       true,
-		"messages": mapCodingMessages(messages),
+		"ok":        true,
+		"messages":  mapCodingMessages(messages),
+		"has_more":  hasMore,
+		"oldest_id": oldestID,
+		"newest_id": newestID,
 	})
 }
 

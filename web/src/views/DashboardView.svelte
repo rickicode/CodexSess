@@ -28,6 +28,7 @@
     onOpenAddAccountModal,
     onBackupAccounts,
     onRestoreAccounts,
+    onDeleteRevokedAccounts,
     onUseApiAccount,
     onUseCliAccount,
     onRefreshUsage,
@@ -57,6 +58,7 @@
       Restore Accounts
       <input type="file" accept=".json,application/json" onchange={pickRestoreFile} disabled={busy} />
     </label>
+    <button class="btn btn-danger" onclick={onDeleteRevokedAccounts} disabled={busy}>Delete Revoked</button>
   </div>
   <div class="dashboard-filters">
     <input
@@ -165,7 +167,12 @@
             </span>
           </div>
 
-          {#if usageWindows.length === 0}
+          {#if revoked}
+            <div class="empty-state compact status-revoked">
+              <strong>Status: Revoked</strong><br/>
+              <span style="font-size: 0.9em; opacity: 0.8;">{revokedReason || 'Token invalid, exhausted, or suspended.'}</span>
+            </div>
+          {:else if usageWindows.length === 0}
             <div class="empty-state compact">Usage unavailable. Click refresh.</div>
           {:else}
             <div class="usage-list">
@@ -188,9 +195,6 @@
                 </div>
               {/each}
             </div>
-          {/if}
-          {#if revoked}
-            <div class="empty-state compact">Token revoked (401). Account tidak bisa dipakai sampai login ulang.</div>
           {/if}
 
           <div class="account-foot">

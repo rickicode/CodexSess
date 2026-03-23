@@ -3,16 +3,20 @@ package store
 import "time"
 
 const (
-	SettingLegacyAPIKey      = "api_key"
-	SettingAPIKey            = "codexsess_api_key"
-	SettingAPIMode           = "api_mode"
-	SettingDirectAPIStrategy = "direct_api_strategy"
-	SettingCodingCLIStrategy = "coding_cli_strategy"
-	SettingZoAPIStrategy     = "zo_api_strategy"
-	SettingModelMappings     = "model_mappings"
-	SettingAdminPasswordHash = "admin_password_hash"
-	SettingCodexHome         = "codex_home"
-	SettingUsageCursor       = "usage_scheduler_cursor"
+	SettingLegacyAPIKey             = "api_key"
+	SettingAPIKey                   = "codexsess_api_key"
+	SettingAPIMode                  = "api_mode"
+	SettingDirectAPIStrategy        = "direct_api_strategy"
+	SettingCodingCLIStrategy        = "coding_cli_strategy"
+	SettingZoAPIStrategy            = "zo_api_strategy"
+	SettingModelMappings            = "model_mappings"
+	SettingAdminPasswordHash        = "admin_password_hash"
+	SettingCodexHome                = "codex_home"
+	SettingUsageAlertThreshold      = "usage_alert_threshold"
+	SettingUsageAutoSwitchThreshold = "usage_auto_switch_threshold"
+	SettingUsageSchedulerEnabled    = "usage_scheduler_enabled"
+	SettingUsageSchedulerInterval   = "usage_scheduler_interval_minutes"
+	SettingUsageCursor              = "usage_scheduler_cursor"
 )
 
 type Account struct {
@@ -32,6 +36,7 @@ type Account struct {
 	UpdatedAt            time.Time
 	LastUsedAt           time.Time
 	Active               bool
+	Revoked              bool
 	UsageHourlyPct       int
 	UsageWeeklyPct       int
 	UsageHourlyResetAt   *time.Time
@@ -44,6 +49,13 @@ type Account struct {
 	UsageLastCheckedAt   *time.Time
 	UsageNextCheckAt     *time.Time
 	UsageFailCount       int
+}
+
+type AccountFilter struct {
+	Query    string
+	PlanType string
+	Status   string
+	Usage    string
 }
 
 type UsageSnapshot struct {

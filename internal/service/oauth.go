@@ -646,18 +646,7 @@ func asString(v any) string {
 	return strings.TrimSpace(s)
 }
 
-func asInt(v any) int {
-	switch n := v.(type) {
-	case float64:
-		return int(n)
-	case int:
-		return n
-	case int64:
-		return int(n)
-	default:
-		return 0
-	}
-}
+
 
 func (s *Service) cleanupPendingDevice(d DeviceLogin) {
 	_ = s.deletePendingDevice(d.LoginID)

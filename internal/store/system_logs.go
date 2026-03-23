@@ -32,7 +32,7 @@ func (s *Store) AddSystemLog(ctx context.Context, entry SystemLogEntry) error {
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execWithRetry(ctx, `
 		INSERT INTO system_logs(id, kind, message, meta_json, created_at)
 		VALUES(?, ?, ?, ?, ?)
 	`, entry.ID, entry.Kind, entry.Message, entry.MetaJSON, entry.CreatedAt.Format(time.RFC3339))
@@ -81,7 +81,7 @@ func (s *Store) CountSystemLogs(ctx context.Context) (int, error) {
 }
 
 func (s *Store) ClearSystemLogs(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM system_logs`)
+	_, err := s.execWithRetry(ctx, `DELETE FROM system_logs`)
 	return err
 }
 
@@ -89,7 +89,7 @@ func (s *Store) PruneSystemLogs(ctx context.Context, maxRows int) error {
 	if maxRows <= 0 {
 		return nil
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execWithRetry(ctx, `
 		DELETE FROM system_logs
 		WHERE id NOT IN (
 			SELECT id FROM system_logs

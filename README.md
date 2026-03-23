@@ -53,7 +53,8 @@ For normal usage, download binaries/packages from the latest release page:
 - New `/chat` coding workspace:
   - persistent sessions and message history
   - workspace picker + path suggestions
-  - live activity stream, slash commands (`/status`, `/review`), and skill picker
+  - WebSocket-based live activity stream (`/api/coding/ws`) with auto reconnect and connection status indicator (`[WS Connected/Connecting/Disconnected]`)
+  - slash commands (`/status`, `/review`) and skill picker
 - Zo OpenAI-compatible integration:
   - multi Zo API key management in dashboard
   - per-key request tracking (`Requests` + `Last request`)
@@ -152,7 +153,8 @@ Your chat history and workspace context are saved, so you can leave and come bac
 The experience is designed to feel practical for daily work:
 - You can resume existing sessions from the session list.
 - New session flow includes workspace picker with path suggestions.
-- Assistant responses and activity updates are shown in real time.
+- Assistant responses and activity updates are streamed in real time over WebSocket (`/api/coding/ws`).
+- The status line shows runtime connection state (`[WS Connected]`, `[WS Connecting]`, `[WS Disconnected]`) and reconnects automatically when connection drops.
 - Helpful commands like `/status` and `/review` are available in chat.
 - Skill hints can be inserted quickly using `$skill_name`.
 
@@ -160,21 +162,37 @@ This makes CodexSess useful as a browser-based coding companion for desktop and 
 
 ## UI Preview
 
-<p align="center">
-  <img src="./screenshots/codexsess-dashboard.png" alt="CodexSess Dashboard" width="92%">
-</p>
-
-<p align="center">
-  <img src="./screenshots/codexsess-settings.png" alt="CodexSess Settings" width="92%">
-</p>
-
-<p align="center">
-  <img src="./screenshots/codexsess-apilogs.png" alt="CodexSess API Logs" width="92%">
-</p>
-
-<p align="center">
-  <img src="./screenshots/codexsess-about.png" alt="CodexSess About" width="92%">
-</p>
+<table>
+  <tr>
+    <td align="center">
+      <img src="./screenshots/dashboard.png" alt="Dashboard" width="420">
+    </td>
+    <td align="center">
+      <img src="./screenshots/settings.png" alt="Settings" width="420">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./screenshots/chat.png" alt="Chat Workspace" width="420">
+    </td>
+    <td align="center">
+      <img src="./screenshots/workspaces.png" alt="Workspaces" width="420">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./screenshots/api-activity.png" alt="API Activity" width="420">
+    </td>
+    <td align="center">
+      <img src="./screenshots/system-logs.png" alt="System Logs" width="420">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="./screenshots/about.png" alt="About" width="420">
+    </td>
+  </tr>
+</table>
 
 ## Authentication & Session
 
@@ -218,8 +236,7 @@ Behavior:
 
 ## TODO
 
-- Add a web-based Codex runtime wrapper so coding sessions can be run from mobile/desktop browser with CLI-like behavior.
-- Target parity with Codex CLI core flow:
+- Continue parity improvements with Codex CLI core flow:
   - start/resume/stop interactive sessions
   - stream tool/terminal output in real time
   - workspace-aware file editing and diffs

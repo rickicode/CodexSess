@@ -51,7 +51,8 @@ Untuk penggunaan normal, unduh binary/package dari halaman rilis terbaru:
 - Workspace coding `/chat` baru:
   - sesi dan riwayat chat persisten
   - pemilih workspace + saran path
-  - activity stream realtime, slash command (`/status`, `/review`), dan skill picker
+  - activity stream realtime berbasis WebSocket (`/api/coding/ws`) dengan auto reconnect dan indikator status koneksi (`[WS Connected/Connecting/Disconnected]`)
+  - slash command (`/status`, `/review`) dan skill picker
 - Integrasi Zo kompatibel OpenAI:
   - manajemen multi Zo API key di dashboard
   - tracking request per key (`Requests` + `Last request`)
@@ -97,28 +98,44 @@ Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbed
   - pantau jumlah request per key
   - gunakan daftar model Zo untuk mapping
 - Workspace coding berbasis browser:
-  - sesi `/chat` dengan context persisten dan activity timeline
+  - sesi `/chat` dengan context persisten, activity timeline, dan streaming realtime via WebSocket (`/api/coding/ws`)
 - Observability sistem:
   - tampilan System Logs dengan rotasi log otomatis
 - Web console + API proxy tertanam dalam satu binary
 
 ## Pratinjau UI
 
-<p align="center">
-  <img src="./screenshots/codexsess-dashboard.png" alt="CodexSess Dashboard" width="92%">
-</p>
-
-<p align="center">
-  <img src="./screenshots/codexsess-settings.png" alt="CodexSess Settings" width="92%">
-</p>
-
-<p align="center">
-  <img src="./screenshots/codexsess-apilogs.png" alt="CodexSess API Logs" width="92%">
-</p>
-
-<p align="center">
-  <img src="./screenshots/codexsess-about.png" alt="CodexSess About" width="92%">
-</p>
+<table>
+  <tr>
+    <td align="center">
+      <img src="./screenshots/dashboard.png" alt="Dashboard" width="420">
+    </td>
+    <td align="center">
+      <img src="./screenshots/settings.png" alt="Settings" width="420">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./screenshots/chat.png" alt="Chat Workspace" width="420">
+    </td>
+    <td align="center">
+      <img src="./screenshots/workspaces.png" alt="Workspaces" width="420">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="./screenshots/api-activity.png" alt="API Activity" width="420">
+    </td>
+    <td align="center">
+      <img src="./screenshots/system-logs.png" alt="System Logs" width="420">
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="./screenshots/about.png" alt="About" width="420">
+    </td>
+  </tr>
+</table>
 
 ## Autentikasi & Sesi
 

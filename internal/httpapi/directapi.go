@@ -191,21 +191,38 @@ func (s *Server) callDirectCodexResponsesAutoSwitch429(
 	prompt string,
 	opts directCodexRequestOptions,
 	onDelta func(string) error,
+	deltaVisible bool,
 ) (directAPIResult, error) {
 	if account == nil || tk == nil {
 		return directAPIResult{}, fmt.Errorf("direct_api account context is required")
 	}
-	res, err := s.callDirectCodexResponses(ctx, *account, *tk, model, prompt, opts, onDelta)
+	streamEmitted := false
+	trackedOnDelta := onDelta
+	if onDelta != nil {
+		trackedOnDelta = func(delta string) error {
+			if deltaVisible && strings.TrimSpace(delta) != "" {
+				streamEmitted = true
+			}
+			return onDelta(delta)
+		}
+	}
+	res, err := s.callDirectCodexResponses(ctx, *account, *tk, model, prompt, opts, trackedOnDelta)
 	if err == nil {
 		return res, nil
 	}
+	if streamEmitted {
+		return directAPIResult{}, err
+	}
 	if shouldRetryDirectAPIError(err) {
 		log.Printf("[autoswitch] direct_api transient error, retrying once on same account %s: %v", strings.TrimSpace(account.ID), err)
-		retryRes, retryErr := s.callDirectCodexResponses(ctx, *account, *tk, model, prompt, opts, onDelta)
+		retryRes, retryErr := s.callDirectCodexResponses(ctx, *account, *tk, model, prompt, opts, trackedOnDelta)
 		if retryErr == nil {
 			return retryRes, nil
 		}
 		err = retryErr
+	}
+	if streamEmitted {
+		return directAPIResult{}, err
 	}
 	if isDirectAPIRevokedError(err) {
 		s.markUsageLastError(ctx, account.ID, err.Error())

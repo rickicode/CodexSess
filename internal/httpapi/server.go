@@ -412,6 +412,11 @@ func (s *Server) currentUsageSchedulerState() (bool, int, string, int) {
 	threshold := s.svc.Cfg.UsageAutoSwitchThreshold
 	cliStrategy := config.NormalizeCodingCLIStrategy(s.svc.Cfg.CodingCLIStrategy)
 	intervalMinutes := config.NormalizeUsageSchedulerIntervalMinutes(s.svc.Cfg.UsageSchedulerInterval)
+	if cliStrategy == "round_robin" {
+		// Round-robin CLI switching is designed to refresh auth context on
+		// a fixed short cadence.
+		intervalMinutes = 5
+	}
 	if threshold < 0 {
 		threshold = 0
 	}
@@ -491,6 +496,49 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 			return loadErr
 		}
 		if len(candidates) <= 1 {
+			if hasActive && len(candidates) == 1 && strings.TrimSpace(candidates[0].account.ID) == strings.TrimSpace(activeID) {
+				targetID := strings.TrimSpace(candidates[0].account.ID)
+				targetScore := candidates[0].score
+				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), targetID); err == nil {
+					s.setCLISwitchStatus(cliSwitchStatus{
+						At:         time.Now().UTC().UnixMilli(),
+						From:       targetID,
+						To:         targetID,
+						Reason:     "refresh_current_single",
+						Strategy:   "round_robin",
+						Candidates: 1,
+					})
+					s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI active refreshed", map[string]any{
+						"from":       targetID,
+						"to":         targetID,
+						"reason":     "refresh_current_single",
+						"strategy":   "round_robin",
+						"score":      targetScore,
+						"candidates": 1,
+					})
+					log.Printf("[autoswitch] cli active refreshed on %s (strategy=round_robin score=%d single-candidate)", targetID, targetScore)
+				} else {
+					s.setCLISwitchStatus(cliSwitchStatus{
+						At:         time.Now().UTC().UnixMilli(),
+						From:       targetID,
+						To:         targetID,
+						Reason:     "refresh_current_single",
+						Strategy:   "round_robin",
+						Error:      err.Error(),
+						Candidates: 1,
+					})
+					s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI active refresh failed", map[string]any{
+						"from":       targetID,
+						"to":         targetID,
+						"reason":     "refresh_current_single",
+						"strategy":   "round_robin",
+						"score":      targetScore,
+						"error":      err.Error(),
+						"candidates": 1,
+					})
+				}
+				return nil
+			}
 			if !hasActive && len(candidates) == 1 && strings.TrimSpace(candidates[0].account.ID) != "" {
 				target := candidates[0].account
 				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), target.ID); err == nil {
@@ -553,15 +601,44 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 			var lastErr error
 			switched := false
 			for len(tried) < len(candidates) {
-				target, ok := pickWeightedRandomCLICandidateExcluding(candidates, activeID, tried)
+				target, ok := pickWeightedRandomCLICandidateExcluding(candidates, "", tried)
 				if !ok || strings.TrimSpace(target.ID) == "" {
 					break
 				}
 				tried[strings.TrimSpace(target.ID)] = struct{}{}
-				if hasActive && strings.TrimSpace(target.ID) == strings.TrimSpace(active.ID) {
+				targetID := strings.TrimSpace(target.ID)
+				targetScore := findCLICandidateScore(candidates, targetID)
+				if hasActive && targetID == strings.TrimSpace(active.ID) {
+					// Keep auth.json synchronized every cycle when current account
+					// still has top availability (100% usage score).
+					if targetScore >= 100 {
+						if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), targetID); err != nil {
+							lastErr = err
+							continue
+						}
+						s.setCLISwitchStatus(cliSwitchStatus{
+							At:         time.Now().UTC().UnixMilli(),
+							From:       strings.TrimSpace(activeID),
+							To:         targetID,
+							Reason:     "refresh_current_100",
+							Strategy:   "round_robin",
+							Candidates: len(candidates),
+						})
+						s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin refreshed active auth", map[string]any{
+							"from":       strings.TrimSpace(activeID),
+							"to":         targetID,
+							"reason":     "refresh_current_100",
+							"strategy":   "round_robin",
+							"score":      targetScore,
+							"candidates": len(candidates),
+						})
+						log.Printf("[autoswitch] cli active refreshed on %s (strategy=round_robin score=%d)", targetID, targetScore)
+						switched = true
+						break
+					}
 					continue
 				}
-				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), target.ID); err != nil {
+				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), targetID); err != nil {
 					lastErr = err
 					continue
 				}
@@ -572,19 +649,20 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 				s.setCLISwitchStatus(cliSwitchStatus{
 					At:         time.Now().UTC().UnixMilli(),
 					From:       strings.TrimSpace(activeID),
-					To:         strings.TrimSpace(target.ID),
+					To:         targetID,
 					Reason:     reason,
 					Strategy:   "round_robin",
 					Candidates: len(candidates),
 				})
 				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin switched", map[string]any{
 					"from":       strings.TrimSpace(activeID),
-					"to":         strings.TrimSpace(target.ID),
+					"to":         targetID,
 					"reason":     reason,
 					"strategy":   "round_robin",
+					"score":      targetScore,
 					"candidates": len(candidates),
 				})
-				log.Printf("[autoswitch] cli active switched from %s to %s (strategy=round_robin)", activeID, target.ID)
+				log.Printf("[autoswitch] cli active switched from %s to %s (strategy=round_robin score=%d)", activeID, targetID, targetScore)
 				switched = true
 				break
 			}
@@ -609,45 +687,21 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 				})
 				return nil
 			}
-			target, ok := pickWeightedRandomCLICandidate(candidates, activeID)
-			if !ok || strings.TrimSpace(target.ID) == "" {
-				s.setCLISwitchStatus(cliSwitchStatus{
-					At:         time.Now().UTC().UnixMilli(),
-					From:       strings.TrimSpace(activeID),
-					Reason:     "skip",
-					Strategy:   "round_robin",
-					Error:      "no target",
-					Candidates: len(candidates),
-				})
-				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin skipped", map[string]any{
-					"from":       strings.TrimSpace(activeID),
-					"reason":     "no_target",
-					"strategy":   "round_robin",
-					"candidates": len(candidates),
-				})
-				log.Printf("[autoswitch] cli round_robin skipped: no target")
-				return nil
-			}
-			if hasActive && strings.TrimSpace(target.ID) == strings.TrimSpace(active.ID) {
-				s.setCLISwitchStatus(cliSwitchStatus{
-					At:         time.Now().UTC().UnixMilli(),
-					From:       strings.TrimSpace(activeID),
-					To:         strings.TrimSpace(target.ID),
-					Reason:     "skip",
-					Strategy:   "round_robin",
-					Error:      "target is current",
-					Candidates: len(candidates),
-				})
-				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin skipped", map[string]any{
-					"from":       strings.TrimSpace(activeID),
-					"to":         strings.TrimSpace(target.ID),
-					"reason":     "target_is_current",
-					"strategy":   "round_robin",
-					"candidates": len(candidates),
-				})
-				log.Printf("[autoswitch] cli round_robin skipped: target is current (%s)", strings.TrimSpace(active.ID))
-				return nil
-			}
+			s.setCLISwitchStatus(cliSwitchStatus{
+				At:         time.Now().UTC().UnixMilli(),
+				From:       strings.TrimSpace(activeID),
+				Reason:     "skip",
+				Strategy:   "round_robin",
+				Error:      "no eligible target",
+				Candidates: len(candidates),
+			})
+			s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin skipped", map[string]any{
+				"from":       strings.TrimSpace(activeID),
+				"reason":     "no_eligible_target",
+				"strategy":   "round_robin",
+				"candidates": len(candidates),
+			})
+			log.Printf("[autoswitch] cli round_robin skipped: no eligible target")
 			return nil
 		}
 		return nil
@@ -830,12 +884,21 @@ func (s *Server) listCLICandidatesForRoundRobin(ctx context.Context) ([]cliUsage
 		if id == "" || account.Revoked {
 			continue
 		}
+		score, _ := s.usageScoreForDecision(ctx, id)
+		if score <= 0 {
+			continue
+		}
 		candidates = append(candidates, cliUsageCandidate{
 			account: account,
-			score:   1,
+			score:   score,
 		})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		// Priority 1: High score (usage availability)
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		// Priority 2: Creation order (FIFO)
 		a := candidates[i].account
 		b := candidates[j].account
 		if !a.CreatedAt.IsZero() && !b.CreatedAt.IsZero() && !a.CreatedAt.Equal(b.CreatedAt) {
@@ -919,6 +982,7 @@ func pickWeightedRandomCLICandidate(candidates []cliUsageCandidate, currentID st
 func pickWeightedRandomCLICandidateExcluding(candidates []cliUsageCandidate, currentID string, exclude map[string]struct{}) (store.Account, bool) {
 	current := strings.TrimSpace(currentID)
 	filtered := make([]cliUsageCandidate, 0, len(candidates))
+	top := make([]cliUsageCandidate, 0, len(candidates))
 	total := int64(0)
 	for _, item := range candidates {
 		id := strings.TrimSpace(item.account.ID)
@@ -938,10 +1002,23 @@ func pickWeightedRandomCLICandidateExcluding(candidates []cliUsageCandidate, cur
 			account: item.account,
 			score:   score,
 		})
+		if score >= 100 {
+			top = append(top, cliUsageCandidate{
+				account: item.account,
+				score:   score,
+			})
+		}
 		total += int64(score)
 	}
 	if len(filtered) == 0 {
 		return store.Account{}, false
+	}
+	if len(top) > 0 {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(top))))
+		if err != nil {
+			return top[0].account, true
+		}
+		return top[n.Int64()].account, true
 	}
 	if total <= 0 {
 		return filtered[0].account, true
@@ -1369,13 +1446,14 @@ func usageAvailable(u store.UsageSnapshot) bool {
 }
 
 func usageScore(u store.UsageSnapshot) int {
-	if u.HourlyPct > 0 {
-		return u.HourlyPct
+	min := u.HourlyPct
+	if u.WeeklyPct < min {
+		min = u.WeeklyPct
 	}
-	if u.WeeklyPct > 0 {
-		return u.WeeklyPct
+	if min < 0 {
+		return 0
 	}
-	return 0
+	return min
 }
 
 func (s *Server) findBestUsageAccount(ctx context.Context, skipID string) (store.Account, bool) {

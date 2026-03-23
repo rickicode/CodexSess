@@ -82,7 +82,7 @@ func Default() Config {
 		UsageAlertThreshold:      5,
 		UsageAutoSwitchThreshold: 15,
 		UsageSchedulerEnabled:    true,
-		UsageSchedulerInterval:   30,
+		UsageSchedulerInterval:   5,
 		DirectAPIStrategy:        "round_robin",
 		CodingCLIStrategy:        "manual",
 		ZoAPIStrategy:            "round_robin",
@@ -317,8 +317,8 @@ func NormalizeZoAPIStrategy(v string) string {
 }
 
 func NormalizeUsageSchedulerIntervalMinutes(v int) int {
-	if v < 10 {
-		return 10
+	if v < 5 {
+		return 5
 	}
 	if v > 120 {
 		return 120

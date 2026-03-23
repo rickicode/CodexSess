@@ -7,17 +7,24 @@ VERSION="latest"     # latest or vX.Y.Z
 BIN_DIR="/usr/local/bin"
 NO_SUDO="0"
 DETECTED_SERVER_BIN=""
+RESOLVED_TAG=""
 TMP_PATHS=()
 
 if [[ -t 1 ]]; then
   COLOR_INFO=$'\033[1;36m'
+  COLOR_STEP=$'\033[1;34m'
   COLOR_OK=$'\033[1;32m'
+  COLOR_WARN=$'\033[1;33m'
   COLOR_ERR=$'\033[1;31m'
+  COLOR_TITLE=$'\033[1;97m'
   COLOR_RESET=$'\033[0m'
 else
   COLOR_INFO=""
+  COLOR_STEP=""
   COLOR_OK=""
+  COLOR_WARN=""
   COLOR_ERR=""
+  COLOR_TITLE=""
   COLOR_RESET=""
 fi
 
@@ -66,8 +73,22 @@ EOF
 }
 
 log() { printf '%s[codexsess-installer]%s %s\n' "${COLOR_INFO}" "${COLOR_RESET}" "$*"; }
-ok() { printf '%s[codexsess-installer]%s %s\n' "${COLOR_OK}" "${COLOR_RESET}" "$*"; }
-err() { printf '%s[codexsess-installer] ERROR:%s %s\n' "${COLOR_ERR}" "${COLOR_RESET}" "$*" >&2; }
+step() { printf '%s[codexsess-installer][STEP]%s %s\n' "${COLOR_STEP}" "${COLOR_RESET}" "$*"; }
+ok() { printf '%s[codexsess-installer][OK]%s %s\n' "${COLOR_OK}" "${COLOR_RESET}" "$*"; }
+warn() { printf '%s[codexsess-installer][WARN]%s %s\n' "${COLOR_WARN}" "${COLOR_RESET}" "$*"; }
+err() { printf '%s[codexsess-installer][ERROR]%s %s\n' "${COLOR_ERR}" "${COLOR_RESET}" "$*" >&2; }
+title() { printf '\n%s== %s ==%s\n' "${COLOR_TITLE}" "$*" "${COLOR_RESET}"; }
+
+normalize_version() {
+  local v
+  v="$(printf '%s' "${1:-}" | tr -d '\r' | tr -d '\n' | xargs)"
+  v="${v#v}"
+  if [[ -z "${v}" ]]; then
+    printf 'unknown'
+  else
+    printf '%s' "${v}"
+  fi
+}
 
 print_auth_help() {
   ok "default login: username=admin password=hijilabs"
@@ -78,8 +99,23 @@ run_root() {
   if [[ "${NO_SUDO}" == "1" || "${EUID:-$(id -u)}" -eq 0 ]]; then
     "$@"
   else
+    if ! has_cmd sudo; then
+      err "sudo not found while root privileges are required for: $*"
+      err "rerun as root, or use --no-sudo with --bin-dir \"\$HOME/.local/bin\""
+      exit 1
+    fi
     sudo "$@"
   fi
+}
+
+can_escalate_root() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    return 0
+  fi
+  if [[ "${NO_SUDO}" == "1" ]]; then
+    return 1
+  fi
+  has_cmd sudo
 }
 
 require_cmd() {
@@ -252,20 +288,64 @@ detect_existing_server_binary_path() {
   echo ""
 }
 
-resolve_tag() {
-  if [[ "${VERSION}" != "latest" ]]; then
-    echo "${VERSION}"
+detect_installed_gui_version() {
+  local v
+  if has_cmd dpkg-query; then
+    v="$(dpkg-query -W -f='${Version}\n' codexsess_GUI 2>/dev/null || true)"
+    if [[ -n "${v}" ]]; then
+      v="${v%%-*}"
+      normalize_version "${v}"
+      return
+    fi
+  fi
+  if has_cmd rpm; then
+    v="$(rpm -q --qf '%{VERSION}\n' codexsess_GUI 2>/dev/null || true)"
+    if [[ -n "${v}" ]]; then
+      normalize_version "${v}"
+      return
+    fi
+  fi
+  printf 'unknown'
+}
+
+detect_installed_server_version() {
+  local bin out first
+  bin="$(detect_existing_server_binary_path)"
+  if [[ -z "${bin}" || ! -x "${bin}" ]]; then
+    printf 'unknown'
     return
   fi
+  out="$("${bin}" --version 2>/dev/null || true)"
+  first="$(printf '%s' "${out}" | head -n1)"
+  if [[ "${first}" =~ v([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return
+  fi
+  normalize_version "${first}"
+}
+
+resolve_tag() {
+  if [[ -n "${RESOLVED_TAG}" ]]; then
+    echo "${RESOLVED_TAG}"
+    return
+  fi
+
+  if [[ "${VERSION}" != "latest" ]]; then
+    RESOLVED_TAG="${VERSION}"
+    echo "${RESOLVED_TAG}"
+    return
+  fi
+
   require_cmd curl
   local latest_url tag
   latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest")"
   tag="${latest_url##*/}"
-  if [[ -z "$tag" || "$tag" == "latest" ]]; then
+  if [[ -z "${tag}" || "${tag}" == "latest" ]]; then
     err "failed to resolve latest release tag"
     exit 1
   fi
-  echo "$tag"
+  RESOLVED_TAG="${tag}"
+  echo "${RESOLVED_TAG}"
 }
 
 download_release_asset() {
@@ -354,12 +434,14 @@ install_server_binary_release() {
 
 configure_server_systemd() {
   local outbin="$1"
-  if ! has_cmd systemctl; then
-    err "systemctl is not available on this Linux host. server mode requires systemd service setup"
+  if ! can_escalate_root; then
+    warn "root privileges unavailable; skipping systemd service setup."
+    warn "run binary manually: ${outbin}"
     return
   fi
-  if [[ "${NO_SUDO}" == "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
-    log "no root permission; skipping systemd service setup"
+  if ! has_cmd systemctl; then
+    warn "systemctl is not available. skipping systemd service setup."
+    warn "run binary manually: ${outbin}"
     return
   fi
   local tmp unit_path svc_user svc_home svc_group
@@ -430,6 +512,7 @@ finalize_service_restart() {
 
 main() {
   detect_os >/dev/null
+  title "CodexSess Installer"
 
   while [[ $# -gt 0 ]]; do
     if [[ "$1" == "--mode" || "$1" == "--version" || "$1" == "--repo" || "$1" == "--bin-dir" ]]; then
@@ -460,6 +543,7 @@ main() {
 
   if [[ "${MODE}" == "update" ]]; then
     local detected_mode
+    local installed_version target_version target_tag
     detected_mode="$(detect_existing_install_mode)"
     case "${detected_mode}" in
       gui|server)
@@ -467,16 +551,43 @@ main() {
         if [[ "${MODE}" == "server" && -n "${DETECTED_SERVER_BIN}" ]]; then
           BIN_DIR="$(dirname "${DETECTED_SERVER_BIN}")"
         fi
+        target_tag="$(resolve_tag)"
+        target_version="$(normalize_version "${target_tag#v}")"
+        if [[ "${MODE}" == "gui" ]]; then
+          installed_version="$(detect_installed_gui_version)"
+        else
+          installed_version="$(detect_installed_server_version)"
+        fi
+
+        title "Update Summary"
+        step "Mode terdeteksi   : ${MODE}"
+        step "Versi terpasang   : ${installed_version}"
+        step "Versi target      : ${target_version} (${target_tag})"
+        if [[ "${installed_version}" != "unknown" && "${installed_version}" == "${target_version}" ]]; then
+          warn "Status            : sudah versi terbaru. installer akan reinstall untuk memastikan file sinkron."
+        else
+          ok "Status            : update tersedia, proses upgrade akan dilanjutkan."
+        fi
         log "detected existing install mode: ${MODE}"
         ;;
       *)
         MODE="$(detect_mode_auto)"
-        log "no existing install detected; fallback mode: ${MODE}"
+        warn "tidak ditemukan instalasi sebelumnya; fallback mode: ${MODE}"
         ;;
     esac
   fi
 
+  if [[ "${MODE}" == "server" && "${BIN_DIR}" == "/usr/local/bin" ]] && ! can_escalate_root; then
+    BIN_DIR="${HOME}/.local/bin"
+    title "Server Install Context"
+    warn "non-root tanpa akses sudo terdeteksi."
+    warn "otomatis ganti bin-dir ke: ${BIN_DIR}"
+    warn "systemd service root akan dilewati; jalankan binary/manual service sendiri."
+  fi
+
+  step "Memastikan Codex CLI tersedia"
   ensure_codex_cli
+  step "Menjalankan mode instalasi: ${MODE}"
 
   case "${MODE}" in
     gui)

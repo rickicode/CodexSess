@@ -334,7 +334,15 @@ func TestAutoSwitchCLIIfNeeded_RoundRobinRotation(t *testing.T) {
 	if _, err := svc.UseAccountCLI(ctx, accA.ID); err != nil {
 		t.Fatalf("activate cli account a: %v", err)
 	}
+	restoreUsage := func() {
+		t.Helper()
+		_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: accA.ID, HourlyPct: 10, WeeklyPct: 10, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+		_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: accB.ID, HourlyPct: 60, WeeklyPct: 60, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+		_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: accC.ID, HourlyPct: 40, WeeklyPct: 40, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	}
+	restoreUsage()
 
+	restoreUsage()
 	if err := s.autoSwitchCLIIfNeeded(ctx, 15, "round_robin"); err != nil {
 		t.Fatalf("autoswitch round robin #1: %v", err)
 	}
@@ -350,6 +358,7 @@ func TestAutoSwitchCLIIfNeeded_RoundRobinRotation(t *testing.T) {
 	}
 	prev := active
 
+	restoreUsage()
 	if err := s.autoSwitchCLIIfNeeded(ctx, 15, "round_robin"); err != nil {
 		t.Fatalf("autoswitch round robin #2: %v", err)
 	}
@@ -362,6 +371,7 @@ func TestAutoSwitchCLIIfNeeded_RoundRobinRotation(t *testing.T) {
 	}
 	prev = active
 
+	restoreUsage()
 	if err := s.autoSwitchCLIIfNeeded(ctx, 15, "round_robin"); err != nil {
 		t.Fatalf("autoswitch round robin #3: %v", err)
 	}
@@ -462,16 +472,17 @@ func TestAutoSwitchCLIIfNeeded_RoundRobinFallbackRotationOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list round robin candidates: %v", err)
 	}
-	if len(allCandidates) != 3 {
-		t.Fatalf("expected 3 round robin candidates, got %d", len(allCandidates))
-	}
-	if allCandidates[0].account.ID != accA.ID || allCandidates[1].account.ID != accB.ID || allCandidates[2].account.ID != accC.ID {
-		t.Fatalf("unexpected candidate order: %s, %s, %s", allCandidates[0].account.ID, allCandidates[1].account.ID, allCandidates[2].account.ID)
+	if len(allCandidates) != 0 {
+		t.Fatalf("expected 0 round robin candidates when all usage=0, got %d", len(allCandidates))
 	}
 
 	if _, err := svc.UseAccountCLI(ctx, accB.ID); err != nil {
 		t.Fatalf("activate cli account b: %v", err)
 	}
+	// Keep deterministic usage scores (all zero) for fallback round-robin path.
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: accA.ID, HourlyPct: 0, WeeklyPct: 0, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: accB.ID, HourlyPct: 0, WeeklyPct: 0, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: accC.ID, HourlyPct: 0, WeeklyPct: 0, RawJSON: "{}", FetchedAt: time.Now().UTC()})
 
 	if err := s.autoSwitchCLIIfNeeded(ctx, 15, "round_robin"); err != nil {
 		t.Fatalf("autoswitch round robin #1: %v", err)
@@ -480,11 +491,8 @@ func TestAutoSwitchCLIIfNeeded_RoundRobinFallbackRotationOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("active cli after #1: %v", err)
 	}
-	if active == accB.ID {
-		t.Fatalf("expected active cli to switch away from %s, got %s", accB.ID, active)
-	}
-	if active != accA.ID && active != accC.ID {
-		t.Fatalf("expected active cli to be one of %s/%s, got %s", accA.ID, accC.ID, active)
+	if active != accB.ID {
+		t.Fatalf("expected active cli unchanged (%s) when all candidates usage=0, got %s", accB.ID, active)
 	}
 	prev := active
 
@@ -495,8 +503,246 @@ func TestAutoSwitchCLIIfNeeded_RoundRobinFallbackRotationOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("active cli after #2: %v", err)
 	}
-	if active == prev {
-		t.Fatalf("expected active cli to rotate from %s, got %s", prev, active)
+	if active != prev {
+		t.Fatalf("expected active cli unchanged (%s) when all candidates usage=0, got %s", prev, active)
+	}
+}
+
+func TestAutoSwitchCLIIfNeeded_RoundRobinPrioritizesScore100(t *testing.T) {
+	ctx := context.Background()
+
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "data.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = st.Close()
+	})
+
+	cry, err := icrypto.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatalf("create crypto: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(root, "data")
+	cfg.AuthStoreDir = filepath.Join(root, "auth-accounts")
+	cfg.CodexHome = filepath.Join(root, "codex-home")
+	cfg.CodingCLIStrategy = "round_robin"
+
+	svc := service.New(cfg, st, cry)
+	s := &Server{svc: svc}
+
+	now := time.Now().UTC()
+	seedAccount := func(id string, score int) {
+		t.Helper()
+		tokenID, err := cry.Encrypt([]byte("id-token-" + id))
+		if err != nil {
+			t.Fatalf("encrypt id token: %v", err)
+		}
+		tokenAccess, err := cry.Encrypt([]byte("access-token-" + id))
+		if err != nil {
+			t.Fatalf("encrypt access token: %v", err)
+		}
+		tokenRefresh, err := cry.Encrypt([]byte("refresh-token-" + id))
+		if err != nil {
+			t.Fatalf("encrypt refresh token: %v", err)
+		}
+		account := store.Account{
+			ID:           id,
+			Email:        id + "@example.com",
+			TokenID:      tokenID,
+			TokenAccess:  tokenAccess,
+			TokenRefresh: tokenRefresh,
+			CodexHome:    cfg.CodexHome,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastUsedAt:   now,
+		}
+		if err := st.UpsertAccount(ctx, account); err != nil {
+			t.Fatalf("upsert account %s: %v", id, err)
+		}
+		if err := util.WriteAuthJSON(filepath.Join(cfg.AuthStoreDir, id), "id-token-"+id, "access-token-"+id, "refresh-token-"+id, "acct-"+id); err != nil {
+			t.Fatalf("write auth.json for %s: %v", id, err)
+		}
+		usage := store.UsageSnapshot{
+			AccountID: id,
+			HourlyPct: score,
+			WeeklyPct: score,
+			RawJSON:   "{}",
+			FetchedAt: now,
+		}
+		if err := st.SaveUsage(ctx, usage); err != nil {
+			t.Fatalf("save usage %s: %v", id, err)
+		}
+	}
+
+	seedAccount("acc-a", 100)
+	seedAccount("acc-b", 100)
+	seedAccount("acc-c", 60)
+
+	if _, err := svc.UseAccountCLI(ctx, "acc-a"); err != nil {
+		t.Fatalf("activate cli account a: %v", err)
+	}
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: "acc-a", HourlyPct: 100, WeeklyPct: 100, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: "acc-b", HourlyPct: 100, WeeklyPct: 100, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: "acc-c", HourlyPct: 60, WeeklyPct: 60, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+
+	for i := 0; i < 20; i++ {
+		if err := s.autoSwitchCLIIfNeeded(ctx, 15, "round_robin"); err != nil {
+			t.Fatalf("autoswitch round robin #%d: %v", i+1, err)
+		}
+		active, err := svc.ActiveCLIAccountID(ctx)
+		if err != nil {
+			t.Fatalf("active cli after #%d: %v", i+1, err)
+		}
+		if active == "acc-c" {
+			t.Fatalf("expected score-100 account only (acc-a/acc-b), got %s", active)
+		}
+	}
+}
+
+func TestAutoSwitchCLIIfNeeded_RoundRobinRefreshesActiveAuthWhenSingleScore100(t *testing.T) {
+	ctx := context.Background()
+
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "data.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = st.Close()
+	})
+
+	cry, err := icrypto.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatalf("create crypto: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(root, "data")
+	cfg.AuthStoreDir = filepath.Join(root, "auth-accounts")
+	cfg.CodexHome = filepath.Join(root, "codex-home")
+	cfg.CodingCLIStrategy = "round_robin"
+
+	svc := service.New(cfg, st, cry)
+	s := &Server{svc: svc}
+
+	now := time.Now().UTC()
+	seedAccount := func(id string, score int) {
+		t.Helper()
+		tokenID, err := cry.Encrypt([]byte("id-token-" + id))
+		if err != nil {
+			t.Fatalf("encrypt id token: %v", err)
+		}
+		tokenAccess, err := cry.Encrypt([]byte("access-token-" + id))
+		if err != nil {
+			t.Fatalf("encrypt access token: %v", err)
+		}
+		tokenRefresh, err := cry.Encrypt([]byte("refresh-token-" + id))
+		if err != nil {
+			t.Fatalf("encrypt refresh token: %v", err)
+		}
+		account := store.Account{
+			ID:           id,
+			Email:        id + "@example.com",
+			TokenID:      tokenID,
+			TokenAccess:  tokenAccess,
+			TokenRefresh: tokenRefresh,
+			CodexHome:    cfg.CodexHome,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+			LastUsedAt:   now,
+		}
+		if err := st.UpsertAccount(ctx, account); err != nil {
+			t.Fatalf("upsert account %s: %v", id, err)
+		}
+		if err := util.WriteAuthJSON(filepath.Join(cfg.AuthStoreDir, id), "id-token-"+id, "access-token-"+id, "refresh-token-"+id, "acct-"+id); err != nil {
+			t.Fatalf("write auth.json for %s: %v", id, err)
+		}
+		usage := store.UsageSnapshot{
+			AccountID: id,
+			HourlyPct: score,
+			WeeklyPct: score,
+			RawJSON:   "{}",
+			FetchedAt: now,
+		}
+		if err := st.SaveUsage(ctx, usage); err != nil {
+			t.Fatalf("save usage %s: %v", id, err)
+		}
+	}
+
+	seedAccount("acc-a", 100)
+	seedAccount("acc-b", 60)
+	seedAccount("acc-c", 40)
+
+	if _, err := svc.UseAccountCLI(ctx, "acc-a"); err != nil {
+		t.Fatalf("activate cli account a: %v", err)
+	}
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: "acc-a", HourlyPct: 100, WeeklyPct: 100, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: "acc-b", HourlyPct: 60, WeeklyPct: 60, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+	_ = st.SaveUsage(ctx, store.UsageSnapshot{AccountID: "acc-c", HourlyPct: 40, WeeklyPct: 40, RawJSON: "{}", FetchedAt: time.Now().UTC()})
+
+	// Simulate corrupted/misaligned codex-home auth so round-robin must refresh it.
+	if err := util.WriteAuthJSON(cfg.CodexHome, "id-token-acc-c", "access-token-acc-c", "refresh-token-acc-c", "acct-acc-c"); err != nil {
+		t.Fatalf("seed mismatched codex-home auth.json: %v", err)
+	}
+
+	if err := s.autoSwitchCLIIfNeeded(ctx, 15, "round_robin"); err != nil {
+		t.Fatalf("autoswitch round robin: %v", err)
+	}
+
+	active, err := svc.ActiveCLIAccountID(ctx)
+	if err != nil {
+		t.Fatalf("active cli after autoswitch: %v", err)
+	}
+	if active != "acc-a" {
+		t.Fatalf("expected active cli remain on score-100 acc-a, got %s", active)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(cfg.CodexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("read codex-home auth.json: %v", err)
+	}
+	var f util.AuthFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("decode codex-home auth.json: %v", err)
+	}
+	if got := strings.TrimSpace(f.Tokens.IDToken); got != "id-token-acc-a" {
+		t.Fatalf("expected codex-home auth sync to acc-a id token, got %q", got)
+	}
+	if got := strings.TrimSpace(f.Tokens.AccessToken); got != "access-token-acc-a" {
+		t.Fatalf("expected codex-home auth sync to acc-a access token, got %q", got)
+	}
+}
+
+func TestCurrentUsageSchedulerState_RoundRobinForcesFiveMinutes(t *testing.T) {
+	cfg := config.Default()
+	cfg.CodingCLIStrategy = "round_robin"
+	cfg.UsageSchedulerInterval = 30
+	cfg.UsageAutoSwitchThreshold = 15
+
+	s := &Server{
+		svc: &service.Service{
+			Cfg: cfg,
+		},
+	}
+
+	enabled, threshold, strategy, interval := s.currentUsageSchedulerState()
+	if !enabled {
+		t.Fatalf("expected scheduler enabled")
+	}
+	if threshold != 15 {
+		t.Fatalf("expected threshold 15, got %d", threshold)
+	}
+	if strategy != "round_robin" {
+		t.Fatalf("expected round_robin strategy, got %s", strategy)
+	}
+	if interval != 5 {
+		t.Fatalf("expected interval 5 for round_robin, got %d", interval)
 	}
 }
 

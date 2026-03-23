@@ -6,31 +6,7 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 
 ## [Unreleased]
 
-### Added
-- Added `GET /api/accounts/total` endpoint to efficiently count total stored accounts without loading full records.
-- Background usage scheduler now automatically "delists" accounts that return API 401 or suspended (`account_suspended`) errors; delisted accounts are permanently skipped in future background checks until manually refreshed and restored.
-
-### Changed
-- Refactored all Dashboard filtering (search, account type, token status, usage availability) from Client-Side Svelte to Server-Side SQL query filters, enabling true global search across all paginated pages.
-- Advanced Dashboard sorting algorithm now guarantees that any account reporting under `50%` hourly usage is automatically pushed to the bottom of the active list, while ensuring revoked accounts stay firmly beneath them.
-- Dashboard account listing now uses server-side pagination via `GET /api/accounts?page=1&limit=20` to prevent browser crashes and backend memory spikes when managing very large account pools.
-- Dashboard account list now sorts Revoked accounts to the very bottom automatically.
-- Dashboard sidebar now accurately displays the true total count of all accounts across all pages instead of just the paginated slice length.
-- Dashboard account card now gracefully hides usage progress bars when an account is marked as Revoked, displaying the revoked reason/status clearly instead.
-- Improved revoked token detection logic during background usage refresh to correctly identify API `token_invalidated`, `account_suspended`, and `account_deactivated` errors.
-- Added a one-time backend startup migration to automatically scan and backfill the `Revoked` status for any legacy accounts that were suspended prior to the new revoked schema upgrade.
-
-### Web Coding (`/chat`)
-- Added runtime lifecycle metadata for coding sessions (`runtime_mode`, `runtime_status`, `restart_pending`) across coding session APIs.
-- Added runtime control APIs for chat orchestration: `PUT /api/coding/sessions/runtime`, `GET /api/coding/runtime/status`, and `POST /api/coding/runtime/restart`.
-- Added runtime lifecycle websocket events in `/api/coding/ws` (`runtime_started`, `runtime_status`, `runtime_error`) to improve Codex CLI parity on `/chat`.
-- Added deferred runtime-restart behavior when restart is requested during in-flight coding turns (`restart_scheduled` -> restart after turn finishes).
-- Added dedicated terminal execution bubbles in `/chat` with click-to-open modal for full command output, built from `activity` + raw Codex JSON stream events.
-- Added pagination to `/api/coding/messages` with `limit` + `before_id` cursor and page metadata fields (`has_more`, `oldest_id`, `newest_id`).
-- Improved `/chat` scroll UX during running streams: user scroll position is preserved when reading older messages and auto-follow to bottom is disabled until user jumps back.
-- Added floating `Jump to latest` button in `/chat` when conversation is scrolled away from bottom.
-- Made stale pagination cursors (`before_id`) resolve gracefully as end-of-history instead of returning request errors.
-- Fixed `/review` command argument handling so prompted review no longer sends conflicting `--uncommitted` + prompt flags to Codex CLI.
+- No changes yet.
 
 ## [1.0.3] - 2026-03-22
 
@@ -44,10 +20,22 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Added skill picker integration to insert `$skill_name` hints directly into the composer.
 - Added streaming-focused chat UX updates (in-progress state + progressive assistant output).
 - Added runtime session APIs (`/api/coding/sessions`, `/api/coding/messages`, `/api/coding/chat`) and persistent storage tables for coding sessions/messages.
+- Added runtime lifecycle metadata for coding sessions (`runtime_mode`, `runtime_status`, `restart_pending`) across coding session APIs.
+- Added runtime control APIs for chat orchestration: `PUT /api/coding/sessions/runtime`, `GET /api/coding/runtime/status`, and `POST /api/coding/runtime/restart`.
+- Added runtime lifecycle websocket events in `/api/coding/ws` (`runtime_started`, `runtime_status`, `runtime_error`) to improve Codex CLI parity on `/chat`.
+- Added deferred runtime-restart behavior when restart is requested during in-flight coding turns (`restart_scheduled` -> restart after turn finishes).
+- Added dedicated terminal execution bubbles in `/chat` with click-to-open modal for full command output, built from `activity` + raw Codex JSON stream events.
+- Added pagination to `/api/coding/messages` with `limit` + `before_id` cursor and page metadata fields (`has_more`, `oldest_id`, `newest_id`).
+- Improved `/chat` scroll UX during running streams: user scroll position is preserved when reading older messages and auto-follow to bottom is disabled until user jumps back.
+- Added floating `Jump to latest` button in `/chat` when conversation is scrolled away from bottom.
+- Made stale pagination cursors (`before_id`) resolve gracefully as end-of-history instead of returning request errors.
+- Fixed `/review` command argument handling so prompted review no longer sends conflicting `--uncommitted` + prompt flags to Codex CLI.
 
 ### Added
 - Zo API key management (multi-key add/remove, per-key request counters, last-request info, and OpenAI-compatible Zo endpoint support).
 - System Logs page with database-backed rotation and log detail viewer for account switch/usage events.
+- Added `GET /api/accounts/total` endpoint to efficiently count total stored accounts without loading full records.
+- Background usage scheduler now automatically "delists" accounts that return API 401 or suspended (`account_suspended`) errors; delisted accounts are permanently skipped in future background checks until manually refreshed and restored.
 
 ### Changed
 - Codex CLI Strategy now includes:
@@ -60,6 +48,14 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Installer systemd unit now uses `CODEXSESS_PUBLIC=true` for server mode.
 - README (`EN`/`ID`) was updated to document `CODEXSESS_PUBLIC` and remove old `CODEXSESS_BIND_ADDR` guidance.
 - System Logs filter UI was refined: search/filter row now has proper bottom spacing and full-width control layout.
+- Refactored all Dashboard filtering (search, account type, token status, usage availability) from Client-Side Svelte to Server-Side SQL query filters, enabling true global search across all paginated pages.
+- Advanced Dashboard sorting algorithm now guarantees that any account reporting under `50%` hourly usage is automatically pushed to the bottom of the active list, while ensuring revoked accounts stay firmly beneath them.
+- Dashboard account listing now uses server-side pagination via `GET /api/accounts?page=1&limit=20` to prevent browser crashes and backend memory spikes when managing very large account pools.
+- Dashboard account list now sorts Revoked accounts to the very bottom automatically.
+- Dashboard sidebar now accurately displays the true total count of all accounts across all pages instead of just the paginated slice length.
+- Dashboard account card now gracefully hides usage progress bars when an account is marked as Revoked, displaying the revoked reason/status clearly instead.
+- Improved revoked token detection logic during background usage refresh to correctly identify API `token_invalidated`, `account_suspended`, and `account_deactivated` errors.
+- Added a one-time backend startup migration to automatically scan and backfill the `Revoked` status for any legacy accounts that were suspended prior to the new revoked schema upgrade.
 
 ## [1.0.2] - 2026-03-18
 

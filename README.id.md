@@ -38,12 +38,14 @@
 CodexSess adalah gateway akun berbasis web untuk penggunaan Codex/OpenAI.
 
 Dirancang untuk operator yang membutuhkan:
+
 - perpindahan akun yang cepat
 - pemisahan akun aktif untuk API dan Codex CLI
 - otomasi berbasis usage (alert + auto switch)
 - surface API kompatibel OpenAI untuk penggunaan produksi
 
 Untuk penggunaan normal, unduh binary/package dari halaman rilis terbaru:
+
 - https://github.com/rickicode/CodexSess/releases/latest
 
 ## Pembaruan Besar Terbaru
@@ -71,6 +73,7 @@ Untuk penggunaan normal, unduh binary/package dari halaman rilis terbaru:
 CodexSess dibuat untuk menyederhanakan operasi multi-akun Codex tanpa memecah tool.
 
 Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbeda, CodexSess memusatkan:
+
 - kontrol akun API aktif
 - kontrol akun CLI aktif
 - visibilitas usage akun
@@ -130,11 +133,6 @@ Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbed
       <img src="./screenshots/system-logs.png" alt="System Logs" width="420">
     </td>
   </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="./screenshots/about.png" alt="About" width="420">
-    </td>
-  </tr>
 </table>
 
 ## Autentikasi & Sesi
@@ -169,6 +167,7 @@ Untuk menggunakan review/autofix PR:
   - `review_focus` (opsional, area fokus review)
 
 Catatan:
+
 - `review_scope=full` membuat review mencakup keseluruhan repository (tidak tergantung diff commit saja).
 - `review_focus` dipakai untuk mengarahkan review manual ke area tertentu (contoh: `auth`, `api`, `performance`, `tests`).
 - Run manual akan membuat branch baru otomatis jika ada autofix yang aman untuk di-push.
@@ -180,16 +179,17 @@ Catatan:
 
 ## Variabel Lingkungan
 
-| Variabel | Default | Contoh | Deskripsi |
-|---|---|---|---|
-| `PORT` | `3061` | `PORT=8080` | Port HTTP server. |
-| `CODEXSESS_PUBLIC` | `false` | `CODEXSESS_PUBLIC=true` | Aktifkan bind public (`0.0.0.0:<PORT>`). Jika false, bind hanya lokal (`127.0.0.1:<PORT>`). |
-| `CODEXSESS_NO_OPEN_BROWSER` | `false` | `CODEXSESS_NO_OPEN_BROWSER=true` | Menonaktifkan auto-open browser saat startup. Nilai truthy: `1`, `true`, `yes`. |
-| `CODEXSESS_CODEX_SANDBOX` | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only` | Mode sandbox yang diteruskan ke `codex exec`. |
-| `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Jalankan eksekusi Codex dalam mode isolasi (`true`) atau environment normal (`false`). |
-| `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | `` | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Command opsional saat akun CLI aktif berpindah. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
+| Variabel                          | Default           | Contoh                                                          | Deskripsi                                                                                                                                                                    |
+| --------------------------------- | ----------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                            | `3061`            | `PORT=8080`                                                     | Port HTTP server.                                                                                                                                                            |
+| `CODEXSESS_PUBLIC`                | `false`           | `CODEXSESS_PUBLIC=true`                                         | Aktifkan bind public (`0.0.0.0:<PORT>`). Jika false, bind hanya lokal (`127.0.0.1:<PORT>`).                                                                                  |
+| `CODEXSESS_NO_OPEN_BROWSER`       | `false`           | `CODEXSESS_NO_OPEN_BROWSER=true`                                | Menonaktifkan auto-open browser saat startup. Nilai truthy: `1`, `true`, `yes`.                                                                                              |
+| `CODEXSESS_CODEX_SANDBOX`         | `workspace-write` | `CODEXSESS_CODEX_SANDBOX=read-only`                             | Mode sandbox yang diteruskan ke `codex exec`.                                                                                                                                |
+| `CODEXSESS_CLEAN_EXEC`            | `true`            | `CODEXSESS_CLEAN_EXEC=false`                                    | Jalankan eksekusi Codex dalam mode isolasi (`true`) atau environment normal (`false`).                                                                                       |
+| `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | ``                | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Command opsional saat akun CLI aktif berpindah. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
 
 Catatan:
+
 - Di Windows, direktori data default adalah `%APPDATA%\\codexsess` jika `APPDATA` tersedia.
 - `CODEX_HOME` diatur internal per akun aktif dan bukan switch runtime eksternal untuk CodexSess.
 
@@ -218,12 +218,14 @@ curl -fsSL https://raw.githubusercontent.com/rickicode/CodexSess/main/scripts/in
 ```
 
 Instalasi Windows:
+
 - Unduh file `.exe` langsung dari:
   - https://github.com/rickicode/CodexSess/releases/latest
 
 ## Cakupan Proyek
 
 Fokus CodexSess adalah keandalan operasional untuk penggunaan akun Codex:
+
 - pemilihan akun yang konsisten
 - visibilitas status aktif yang jelas
 - otomasi usage-aware dan fallback

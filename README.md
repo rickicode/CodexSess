@@ -40,12 +40,14 @@
 CodexSess is a web-first account gateway for Codex/OpenAI usage.
 
 It is designed for operators who need:
+
 - fast account switching
 - separate active account targets for API and Codex CLI
 - usage-aware automation (alert + auto switch)
 - OpenAI-compatible API surface in production-friendly form
 
 For normal usage, download binaries/packages from the latest release page:
+
 - https://github.com/rickicode/CodexSess/releases/latest
 
 ## Latest Major Updates
@@ -73,6 +75,7 @@ For normal usage, download binaries/packages from the latest release page:
 CodexSess was built to simplify multi-account Codex operations without splitting tools.
 
 Instead of juggling scripts, manual token edits, and separate dashboards, CodexSess centralizes:
+
 - active API account control
 - active CLI account control
 - account usage visibility
@@ -112,6 +115,7 @@ source ~/.bashrc
 Then restart CodexSess GUI session.
 
 Windows installation:
+
 - Download `.exe` directly from:
   - https://github.com/rickicode/CodexSess/releases/latest
 
@@ -151,6 +155,7 @@ You create a session, choose your workspace folder, then continue coding in that
 Your chat history and workspace context are saved, so you can leave and come back without losing the flow.
 
 The experience is designed to feel practical for daily work:
+
 - You can resume existing sessions from the session list.
 - New session flow includes workspace picker with path suggestions.
 - Assistant responses and activity updates are streamed in real time over WebSocket (`/api/coding/ws`).
@@ -187,11 +192,6 @@ This makes CodexSess useful as a browser-based coding companion for desktop and 
       <img src="./screenshots/system-logs.png" alt="System Logs" width="420">
     </td>
   </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="./screenshots/about.png" alt="About" width="420">
-    </td>
-  </tr>
 </table>
 
 ## Authentication & Session
@@ -226,6 +226,7 @@ To use CodexSess automated PR review/autofix in GitHub:
   - `review_focus` (optional focus area)
 
 Behavior:
+
 - Automatic PR run: posts review to PR and pushes autofix to PR branch when allowed.
 - Manual run: reviews selected `target_ref`; if autofix exists, workflow creates and pushes a new branch automatically.
 - Workflow configures default MCP servers for Codex in CI:
@@ -248,22 +249,24 @@ Behavior:
 
 ## Environment Variables
 
-| Variable | Default | Example | Description |
-|---|---|---|---|
-| `PORT` | `3061` | `PORT=8080` | HTTP server port. |
-| `CODEXSESS_PUBLIC` | `false` | `CODEXSESS_PUBLIC=true` | Enable network/public bind (`0.0.0.0:<PORT>`). When false, bind is local-only (`127.0.0.1:<PORT>`). |
-| `CODEXSESS_NO_OPEN_BROWSER` | `false` | `CODEXSESS_NO_OPEN_BROWSER=true` | Disable automatic browser opening on startup. Truthy values: `1`, `true`, `yes`. |
-| `CODEXSESS_CODEX_SANDBOX` | `full-access` | `CODEXSESS_CODEX_SANDBOX=full-access` | Sandbox mode passed to `codex exec` (`write/workspace-write` is normalized to `full-access`). |
-| `CODEXSESS_CLEAN_EXEC` | `true` | `CODEXSESS_CLEAN_EXEC=false` | Run Codex execution in isolated mode (`true`) or normal environment (`false`). |
-| `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | `` | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Optional command executed when CLI active account changes. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
+| Variable                          | Default       | Example                                                         | Description                                                                                                                                                                             |
+| --------------------------------- | ------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                            | `3061`        | `PORT=8080`                                                     | HTTP server port.                                                                                                                                                                       |
+| `CODEXSESS_PUBLIC`                | `false`       | `CODEXSESS_PUBLIC=true`                                         | Enable network/public bind (`0.0.0.0:<PORT>`). When false, bind is local-only (`127.0.0.1:<PORT>`).                                                                                     |
+| `CODEXSESS_NO_OPEN_BROWSER`       | `false`       | `CODEXSESS_NO_OPEN_BROWSER=true`                                | Disable automatic browser opening on startup. Truthy values: `1`, `true`, `yes`.                                                                                                        |
+| `CODEXSESS_CODEX_SANDBOX`         | `full-access` | `CODEXSESS_CODEX_SANDBOX=full-access`                           | Sandbox mode passed to `codex exec` (`write/workspace-write` is normalized to `full-access`).                                                                                           |
+| `CODEXSESS_CLEAN_EXEC`            | `true`        | `CODEXSESS_CLEAN_EXEC=false`                                    | Run Codex execution in isolated mode (`true`) or normal environment (`false`).                                                                                                          |
+| `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | ``            | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Optional command executed when CLI active account changes. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
 
 Notes:
+
 - On Windows, data directory defaults to `%APPDATA%\\codexsess` when `APPDATA` is available.
 - `CODEX_HOME` is set internally per selected account and is not intended as an external switch for CodexSess itself.
 
 ## Project Scope
 
 CodexSess focuses on operational reliability for Codex account usage:
+
 - predictable account selection
 - clear active-state visibility
 - usage-aware automation and fallback

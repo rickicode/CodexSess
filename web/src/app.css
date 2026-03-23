@@ -83,8 +83,11 @@ textarea {
   background: var(--surface);
   padding: 14px 14px;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto 1fr auto;
   gap: 14px;
+  min-height: 100vh;
+  min-width: 0;
+  overflow-x: hidden;
 }
 
 .brand {
@@ -94,6 +97,7 @@ textarea {
   border-radius: 8px;
   background: #171717;
   padding: 10px;
+  min-width: 0;
 }
 
 .brand strong {
@@ -106,6 +110,12 @@ textarea {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.4;
+  min-width: 0;
+  max-width: 100%;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand .brand-meta {
@@ -135,6 +145,7 @@ textarea {
   display: grid;
   gap: 4px;
   align-content: start;
+  min-width: 0;
 }
 
 .sidebar-footer {
@@ -169,6 +180,15 @@ textarea {
   align-items: center;
   gap: 8px;
   cursor: pointer;
+  width: 100%;
+  min-width: 0;
+}
+
+.nav button span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nav button:hover {
@@ -207,6 +227,10 @@ textarea {
 .app-root.chat-route .content {
   padding: 0;
   gap: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  align-content: stretch;
+  align-items: stretch;
   min-height: 100vh;
   min-height: 100dvh;
   height: 100vh;
@@ -389,7 +413,7 @@ textarea {
 .dashboard-filters {
   margin-top: 10px;
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) 220px 220px;
+  grid-template-columns: minmax(240px, 1fr) 220px 220px 220px;
   align-items: center;
   gap: 8px;
 }
@@ -981,8 +1005,7 @@ input[type='range'].threshold-slider:focus-visible {
   border-radius: 0;
   background: #121212;
   min-height: 0;
-  height: calc(100vh - 52px);
-  height: calc(100dvh - 52px);
+  height: 100%;
   padding: 0;
   grid-template-rows: auto 1fr auto;
   gap: 0;
@@ -1158,6 +1181,20 @@ input[type='range'].threshold-slider:focus-visible {
   border-color: rgba(0, 212, 170, 0.48);
 }
 
+.coding-message.exec {
+  justify-self: start;
+  max-width: min(90%, 1080px);
+  background: #10161b;
+  border-color: rgba(56, 189, 248, 0.5);
+}
+
+.coding-message.subagent {
+  justify-self: start;
+  max-width: min(90%, 1080px);
+  background: #14141f;
+  border-color: rgba(251, 191, 36, 0.52);
+}
+
 .coding-message.activity {
   justify-self: start;
   max-width: min(86%, 980px);
@@ -1235,6 +1272,80 @@ input[type='range'].threshold-slider:focus-visible {
 .coding-message.stderr pre {
   font-family: var(--font-mono);
   font-size: 12px;
+}
+
+.coding-message.exec pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.coding-message.subagent pre {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.coding-exec-summary {
+  display: grid;
+  gap: 8px;
+}
+
+.coding-exec-summary code {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  background: rgba(3, 12, 20, 0.85);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
+.coding-exec-summary pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(71, 85, 105, 0.55);
+  background: rgba(2, 6, 23, 0.75);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 140px;
+  overflow: auto;
+}
+
+.coding-exec-open {
+  justify-self: start;
+}
+
+.coding-subagent-summary {
+  display: grid;
+  gap: 8px;
+}
+
+.coding-subagent-summary code {
+  display: block;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  background: rgba(28, 21, 3, 0.82);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
+.coding-subagent-summary pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(99, 102, 241, 0.38);
+  background: rgba(9, 9, 22, 0.78);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.coding-subagent-open {
+  justify-self: start;
 }
 
 .coding-message-status {
@@ -1451,25 +1562,59 @@ input[type='range'].threshold-slider:focus-visible {
   padding: 7px 12px;
   border-top: 1px solid var(--border);
   background: #121212;
-  display: grid;
-  gap: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 34px;
 }
 
 .coding-status-main {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
 .coding-status-saving {
   color: #9beede;
   font-size: 11px;
+  flex: 0 0 auto;
+}
+
+.coding-status-text {
+  font-size: 11px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.coding-status-ws {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  flex: 0 0 auto;
+}
+
+.coding-status-ws.connected {
+  color: #34ff7a;
+}
+
+.coding-status-ws.connecting {
+  color: #ffd76a;
+}
+
+.coding-status-ws.disconnected {
+  color: #ff8f8f;
 }
 
 .coding-status-command {
   color: #9beede;
   font-size: 11px;
+  flex: 0 1 46%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1481,6 +1626,46 @@ input[type='range'].threshold-slider:focus-visible {
 
 .modal-card-coding {
   width: min(760px, 96vw);
+}
+
+.modal-card-exec-output {
+  width: min(940px, 96vw);
+}
+
+.modal-card-subagent-detail {
+  width: min(980px, 96vw);
+}
+
+.coding-exec-modal-command,
+.coding-exec-modal-output {
+  margin: 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #101216;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.coding-exec-modal-output {
+  max-height: min(55vh, 560px);
+  overflow: auto;
+}
+
+.coding-subagent-modal-block,
+.coding-subagent-modal-raw {
+  margin: 0;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #101216;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.coding-subagent-modal-raw {
+  max-height: min(45vh, 480px);
+  overflow: auto;
 }
 
 .drawer-card {
@@ -1794,6 +1979,10 @@ input[type='range'].threshold-slider:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .app-root.chat-route {
+    min-height: 100dvh;
+  }
+
   .sidebar {
     position: fixed;
     top: 0;
@@ -1939,6 +2128,17 @@ input[type='range'].threshold-slider:focus-visible {
   .coding-chat-area,
   .coding-chat-area.full {
     padding: 8px;
+  }
+
+  .app-root.chat-route .content,
+  .app-root.chat-route .coding-panel,
+  .app-root.chat-route .coding-layout {
+    min-height: 100dvh;
+    height: 100dvh;
+  }
+
+  .coding-status-line {
+    padding-bottom: calc(7px + env(safe-area-inset-bottom));
   }
 }
 

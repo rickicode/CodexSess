@@ -27,8 +27,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	"github.com/ricki/codexsess/internal/config"
 	"github.com/ricki/codexsess/internal/provider"
 	"github.com/ricki/codexsess/internal/service"
@@ -129,6 +129,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/coding/stop", s.handleWebCodingStop)
 	mux.HandleFunc("/api/coding/ws", s.handleWebCodingWS)
 	mux.HandleFunc("/api/coding/chat", s.handleWebCodingChat)
+	mux.HandleFunc("/api/coding/sessions/runtime", s.handleWebCodingSessionRuntime)
+	mux.HandleFunc("/api/coding/runtime/status", s.handleWebCodingRuntimeStatus)
+	mux.HandleFunc("/api/coding/runtime/restart", s.handleWebCodingRuntimeRestart)
 	mux.HandleFunc("/api/coding/path-suggestions", s.handleWebCodingPathSuggestions)
 	mux.HandleFunc("/api/coding/skills", s.handleWebCodingSkills)
 	mux.HandleFunc("/api/auth/browser/start", s.handleWebBrowserStart)
@@ -6740,16 +6743,23 @@ func (s *Server) handleWebCodingStatus(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 400, "bad_request", "session_id is required")
 		return
 	}
-	inFlight, startedAt := s.svc.CodingRunStatus(sessionID)
+	runtime, err := s.svc.CodingRuntimeStatusDetail(r.Context(), sessionID)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
 	startedAtValue := ""
-	if inFlight {
-		startedAtValue = startedAt.UTC().Format(time.RFC3339)
+	if runtime.InFlight {
+		startedAtValue = runtime.StartedAt.UTC().Format(time.RFC3339)
 	}
 	respondJSON(w, 200, map[string]any{
-		"ok":         true,
-		"session_id": sessionID,
-		"in_flight":  inFlight,
-		"started_at": startedAtValue,
+		"ok":              true,
+		"session_id":      sessionID,
+		"in_flight":       runtime.InFlight,
+		"started_at":      startedAtValue,
+		"runtime_mode":    runtime.RuntimeMode,
+		"runtime_status":  runtime.RuntimeStatus,
+		"restart_pending": runtime.RestartPending,
 	})
 }
 
@@ -6855,6 +6865,17 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 			}
 			inFlight.Store(true)
 			_ = writeJSON(map[string]any{"event": "started", "session_id": sessionID})
+			_ = writeJSON(map[string]any{"event": "runtime_started", "session_id": sessionID})
+			if runtime, err := s.svc.CodingRuntimeStatusDetail(context.Background(), sessionID); err == nil {
+				_ = writeJSON(map[string]any{
+					"event":           "runtime_status",
+					"session_id":      sessionID,
+					"runtime_mode":    runtime.RuntimeMode,
+					"runtime_status":  runtime.RuntimeStatus,
+					"restart_pending": runtime.RestartPending,
+					"in_flight":       runtime.InFlight,
+				})
+			}
 			go func(payload codingWSRequest) {
 				defer inFlight.Store(false)
 				bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
@@ -6882,6 +6903,17 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 					},
 				)
 				if runErr != nil {
+					if runtime, err := s.svc.CodingRuntimeStatusDetail(context.Background(), strings.TrimSpace(payload.SessionID)); err == nil {
+						_ = writeJSON(map[string]any{
+							"event":           "runtime_error",
+							"session_id":      payload.SessionID,
+							"runtime_mode":    runtime.RuntimeMode,
+							"runtime_status":  runtime.RuntimeStatus,
+							"restart_pending": runtime.RestartPending,
+							"in_flight":       runtime.InFlight,
+							"message":         runErr.Error(),
+						})
+					}
 					_ = writeJSON(map[string]any{"event": "error", "message": runErr.Error()})
 					return
 				}
@@ -6896,6 +6928,16 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 					"event_messages":     mapCodingMessages(result.EventMessages),
 					"assistant_messages": mapCodingMessages(result.Assistants),
 				})
+				if runtime, err := s.svc.CodingRuntimeStatusDetail(context.Background(), strings.TrimSpace(payload.SessionID)); err == nil {
+					_ = writeJSON(map[string]any{
+						"event":           "runtime_status",
+						"session_id":      payload.SessionID,
+						"runtime_mode":    runtime.RuntimeMode,
+						"runtime_status":  runtime.RuntimeStatus,
+						"restart_pending": runtime.RestartPending,
+						"in_flight":       runtime.InFlight,
+					})
+				}
 			}(req)
 		default:
 			_ = writeJSON(map[string]any{"event": "error", "message": "unsupported request type", "code": "bad_request"})
@@ -6956,6 +6998,91 @@ func (s *Server) handleWebCodingChat(w http.ResponseWriter, r *http.Request) {
 		"assistant":          mapCodingMessage(result.Assistant),
 		"event_messages":     mapCodingMessages(result.EventMessages),
 		"assistant_messages": mapCodingMessages(result.Assistants),
+	})
+}
+
+func (s *Server) handleWebCodingSessionRuntime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		SessionID   string `json:"session_id"`
+		RuntimeMode string `json:"runtime_mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	session, err := s.svc.UpdateCodingSessionRuntimeMode(r.Context(), req.SessionID, req.RuntimeMode)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	respondJSON(w, 200, map[string]any{
+		"ok":      true,
+		"session": mapCodingSession(session),
+	})
+}
+
+func (s *Server) handleWebCodingRuntimeStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	if sessionID == "" {
+		respondErr(w, 400, "bad_request", "session_id is required")
+		return
+	}
+	runtime, err := s.svc.CodingRuntimeStatusDetail(r.Context(), sessionID)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	startedAt := ""
+	if runtime.InFlight {
+		startedAt = runtime.StartedAt.UTC().Format(time.RFC3339)
+	}
+	respondJSON(w, 200, map[string]any{
+		"ok":              true,
+		"session_id":      runtime.SessionID,
+		"runtime_mode":    runtime.RuntimeMode,
+		"runtime_status":  runtime.RuntimeStatus,
+		"restart_pending": runtime.RestartPending,
+		"in_flight":       runtime.InFlight,
+		"started_at":      startedAt,
+	})
+}
+
+func (s *Server) handleWebCodingRuntimeRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	var req struct {
+		SessionID string `json:"session_id"`
+		Force     bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondErr(w, 400, "bad_request", "invalid JSON")
+		return
+	}
+	deferred, err := s.svc.RestartCodingRuntime(r.Context(), req.SessionID, req.Force)
+	if err != nil {
+		respondErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	runtime, _ := s.svc.CodingRuntimeStatusDetail(r.Context(), req.SessionID)
+	respondJSON(w, 200, map[string]any{
+		"ok":              true,
+		"accepted":        true,
+		"deferred":        deferred,
+		"session_id":      strings.TrimSpace(req.SessionID),
+		"runtime_mode":    runtime.RuntimeMode,
+		"runtime_status":  runtime.RuntimeStatus,
+		"restart_pending": runtime.RestartPending,
+		"in_flight":       runtime.InFlight,
 	})
 }
 
@@ -7102,6 +7229,9 @@ func mapCodingSession(item store.CodingSession) map[string]any {
 		"model":           item.Model,
 		"work_dir":        item.WorkDir,
 		"sandbox_mode":    item.SandboxMode,
+		"runtime_mode":    firstNonEmpty(strings.TrimSpace(item.RuntimeMode), "spawn"),
+		"runtime_status":  firstNonEmpty(strings.TrimSpace(item.RuntimeStatus), "idle"),
+		"restart_pending": item.RestartPending,
 		"created_at":      item.CreatedAt.UTC().Format(time.RFC3339),
 		"updated_at":      item.UpdatedAt.UTC().Format(time.RFC3339),
 		"last_message_at": item.LastMessageAt.UTC().Format(time.RFC3339),

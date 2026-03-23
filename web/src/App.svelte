@@ -85,6 +85,7 @@
   let accountSearchQuery = $state('');
   let accountTypeFilter = $state('all');
   let usageAvailabilityFilter = $state('all');
+  let accountStatusFilter = $state('all');
   let dashboardPageSize = $state(20);
   let dashboardPage = $state(1);
   let mobileSidebarOpen = $state(false);
@@ -247,9 +248,13 @@
     const q = String(accountSearchQuery || '').trim().toLowerCase();
     const type = String(accountTypeFilter || 'all').trim().toLowerCase();
     const usageFilter = String(usageAvailabilityFilter || 'all').trim().toLowerCase();
+    const statusFilter = String(accountStatusFilter || 'all').trim().toLowerCase();
     const filtered = accounts.filter((account) => {
       const accountType = String(account?.plan_type || '').trim().toLowerCase();
+      const revoked = account?.revoked === true;
       if (type !== 'all' && accountType !== type) return false;
+      if (statusFilter === 'revoked' && !revoked) return false;
+      if (statusFilter === 'not_revoked' && revoked) return false;
       if (usageFilter === 'exhausted' && !accountHasExhaustedUsage(account)) return false;
       if (usageFilter === 'available' && !accountHasAvailableUsage(account)) return false;
       if (!q) return true;
@@ -355,6 +360,14 @@
     dashboardPage = 1;
   }
 
+  function accountStatusOptions() {
+    return [
+      { value: 'all', label: 'All Token Status' },
+      { value: 'revoked', label: 'Revoked (401)' },
+      { value: 'not_revoked', label: 'Not Revoked' }
+    ];
+  }
+
   function usageAvailabilityOptions() {
     return [
       { value: 'all', label: 'All Usage' },
@@ -386,6 +399,11 @@
 
   function setUsageAvailabilityFilter(value) {
     usageAvailabilityFilter = value;
+    dashboardPage = 1;
+  }
+
+  function setAccountStatusFilter(value) {
+    accountStatusFilter = value;
     dashboardPage = 1;
   }
 
@@ -2466,11 +2484,14 @@
         {accountSearchQuery}
         {accountTypeFilter}
         {usageAvailabilityFilter}
+        {accountStatusFilter}
         accountTypeOptions={accountTypeOptions()}
+        accountStatusOptions={accountStatusOptions()}
         usageAvailabilityOptions={usageAvailabilityOptions()}
         onSetAccountSearchQuery={setAccountSearchQuery}
         onSetAccountTypeFilter={setAccountTypeFilter}
         onSetUsageAvailabilityFilter={setUsageAvailabilityFilter}
+        onSetAccountStatusFilter={setAccountStatusFilter}
         onOpenAddAccountModal={openAddAccountModal}
         onBackupAccounts={backupAllAccounts}
         onRestoreAccounts={restoreAccounts}

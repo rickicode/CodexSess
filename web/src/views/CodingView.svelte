@@ -36,6 +36,14 @@
   let stopRequested = $state(false);
   let activeExecCommand = $state('');
   let wsStreamSocket = $state(null);
+  let wsHealthSocket = $state(null);
+  let wsHealthStatus = $state('disconnected');
+  let wsHealthReconnectTimer = null;
+  let wsHealthKeepAlive = false;
+  let showExecOutputModal = $state(false);
+  let selectedExecEntry = $state(null);
+  let showSubagentDetailModal = $state(false);
+  let selectedSubagentEntry = $state(null);
 
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
   const draftStoragePrefix = 'codexsess.coding.draft.v1:';
@@ -141,6 +149,12 @@
     return String(command || '').trim().replace(/\s+/g, ' ').toLowerCase();
   }
 
+  function normalizeExecStatus(status) {
+    const v = String(status || '').trim().toLowerCase();
+    if (v === 'running' || v === 'done' || v === 'failed') return v;
+    return 'running';
+  }
+
   function parseActivityText(rawText) {
     const text = String(rawText || '').trim();
     if (!text) return { kind: 'other', command: '', exitCode: 0 };
@@ -163,59 +177,1233 @@
     return { kind: 'other', command: '', exitCode: 0 };
   }
 
-  function mergeActivityContent(startText, endText) {
+  function extractLikelyAgentIDs(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return [];
+    const uuidPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+    const out = [];
+    for (const match of text.matchAll(uuidPattern)) {
+      const v = String(match?.[0] || '').trim();
+      if (v) out.push(v);
+    }
+    if (out.length > 0) return [...new Set(out)];
+    const tokens = text.split(/[,\s]+/).map((item) => String(item || '').trim()).filter(Boolean);
+    for (const token of tokens) {
+      if (/^agent-[a-z0-9_-]{4,}$/i.test(token)) {
+        out.push(token);
+        continue;
+      }
+      if (token.length >= 20 && (token.match(/-/g) || []).length >= 2 && /^[a-z0-9_-]+$/i.test(token)) {
+        out.push(token);
+      }
+    }
+    return [...new Set(out)];
+  }
+
+  function extractSubagentIdentityFromText(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return { nickname: '', agentType: '', ids: [] };
+    const ids = extractLikelyAgentIDs(text);
+    const spawnMatch = text.match(/spawned\s+(.+?)(?:\s+\[([^\]]+)\])?(?:$|\n)/i);
+    let nickname = String(spawnMatch?.[1] || '').trim();
+    let agentType = String(spawnMatch?.[2] || '').trim();
+    if (!nickname) {
+      nickname = String(text.match(/(?:^|\n)\s*(?:name|nickname)\s*:\s*([^\n]+)/i)?.[1] || '').trim();
+    }
+    if (!agentType) {
+      agentType = String(text.match(/(?:^|\n)\s*(?:role|agent[_\s-]?type)\s*:\s*([^\n]+)/i)?.[1] || '').trim();
+    }
+    if (/^subagent$/i.test(nickname) || extractLikelyAgentIDs(nickname).length > 0) {
+      nickname = '';
+    }
+    if (!nickname) {
+      const statusName = text.match(/(?:^|\n)\s*([A-Za-z][A-Za-z0-9_-]{2,})\s+status\s*:/i);
+      nickname = String(statusName?.[1] || '').trim();
+    }
+    return { nickname, agentType: normalizeSubagentRole(agentType), ids };
+  }
+
+  function normalizeSubagentRole(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return '';
+    if (extractLikelyAgentIDs(text).length > 0) return '';
+    const low = text.toLowerCase();
+    const blocked = new Set([
+      'collab_tool_call',
+      'tool_call',
+      'command_execution',
+      'exec_command',
+      'spawn_agent',
+      'wait_agent',
+      'wait',
+      'send_input',
+      'resume_agent',
+      'close_agent',
+      'item.started',
+      'item.updated',
+      'item.completed',
+      'tool.started',
+      'tool.completed',
+      'tool.call.started',
+      'tool.call.completed'
+    ]);
+    if (blocked.has(low)) return '';
+    return text;
+  }
+
+  function normalizeSubagentToolFamily(raw) {
+    const tool = String(raw || '').trim().toLowerCase();
+    if (tool === 'wait_agent' || tool === 'wait') return 'wait';
+    if (tool === 'spawn_agent') return 'spawn';
+    if (tool === 'send_input') return 'send_input';
+    if (tool === 'resume_agent') return 'resume_agent';
+    if (tool === 'close_agent') return 'close_agent';
+    return tool;
+  }
+
+  function cleanSubagentDetailText(raw, knownIDs = []) {
+    const text = String(raw || '').trim();
+    if (!text) return '';
+    const idSet = new Set((Array.isArray(knownIDs) ? knownIDs : []).map((item) => String(item || '').trim()).filter(Boolean));
+    const lines = text
+      .split('\n')
+      .map((line) => String(line || '').trim())
+      .filter(Boolean);
+    const filtered = [];
+    for (const line of lines) {
+      if (idSet.has(line)) continue;
+      if (extractLikelyAgentIDs(line).length === 1 && line.split(/\s+/).length === 1) continue;
+      if (filtered.length > 0 && filtered[filtered.length - 1] === line) continue;
+      filtered.push(line);
+    }
+    return filtered.join('\n').trim();
+  }
+
+  function formatSubagentFallbackName(ids = [], targetID = '') {
+    const firstID = [...(Array.isArray(ids) ? ids : []), String(targetID || '').trim()].find((item) => String(item || '').trim());
+    const id = String(firstID || '').trim();
+    if (!id) return '';
+    const fallbackNames = [
+      'Huygens', 'Curie', 'Gauss', 'Noether', 'Lovelace', 'Turing', 'Faraday', 'Kepler',
+      'Hypatia', 'Ramanujan', 'Euler', 'Bohr', 'Fermi', 'Mendel', 'Tesla', 'Darwin',
+      'Sagan', 'Franklin', 'Pasteur', 'Planck', 'Dirac', 'Raman', 'Hopper', 'Shannon'
+    ];
+    const compact = id.includes('-') ? id.replace(/-/g, '') : id;
+    let hash = 0;
+    for (let i = 0; i < compact.length; i += 1) {
+      hash = ((hash * 31) + compact.charCodeAt(i)) >>> 0;
+    }
+    const picked = fallbackNames[hash % fallbackNames.length];
+    return String(picked || '').trim();
+  }
+
+  function isFallbackSubagentName(raw) {
+    const value = String(raw || '').trim();
+    if (!value) return false;
+    if (/^agent-[a-z0-9_-]{4,}$/i.test(value)) return true;
+    const fallbackNames = new Set([
+      'huygens', 'curie', 'gauss', 'noether', 'lovelace', 'turing', 'faraday', 'kepler',
+      'hypatia', 'ramanujan', 'euler', 'bohr', 'fermi', 'mendel', 'tesla', 'darwin',
+      'sagan', 'franklin', 'pasteur', 'planck', 'dirac', 'raman', 'hopper', 'shannon'
+    ]);
+    return fallbackNames.has(value.toLowerCase());
+  }
+
+  function inferSubagentRoleFromText(...inputs) {
+    const text = inputs
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter(Boolean)
+      .join('\n');
+    if (!text) return '';
+
+    const explicitRole = text.match(/\b(frontend-developer|react-specialist|nextjs-developer|vue-expert|svelte-specialist|ui-fixer|backend-developer|api-designer|fullstack-developer|code-mapper|browser-debugger|javascript-pro|typescript-pro|golang-pro|sql-pro|reviewer|debugger|qa-expert|test-automator|security-auditor|performance-engineer|accessibility-tester|api-documenter|seo-specialist|build-engineer|dependency-manager|deployment-engineer|docker-expert|kubernetes-specialist|websocket-engineer)\b/i);
+    if (explicitRole?.[1]) return String(explicitRole[1] || '').trim().toLowerCase();
+
+    if (/\bsvelte|sveltekit\b/i.test(text)) return 'svelte-specialist';
+    if (/\bnext\.?js|app router|pages router\b/i.test(text)) return 'nextjs-developer';
+    if (/\breact|jsx|tsx\b/i.test(text)) return 'react-specialist';
+    if (/\bvue|nuxt\b/i.test(text)) return 'vue-expert';
+    if (/\btypescript|tsc|type\b/i.test(text)) return 'typescript-pro';
+    if (/\bjavascript|node\b/i.test(text)) return 'javascript-pro';
+    if (/\bsql|query|database|migration|postgres|mysql|sqlite\b/i.test(text)) return 'sql-pro';
+    if (/\bgolang|\bgo\b|goroutine|go service\b/i.test(text)) return 'golang-pro';
+    if (/\bsecurity|vuln|owasp|xss|csrf|auth\b/i.test(text)) return 'security-auditor';
+    if (/\btest|qa|e2e|playwright|vitest|regression\b/i.test(text)) return 'qa-expert';
+    if (/\breview|bug|risk|scan|audit|risky assumptions\b/i.test(text)) return 'reviewer';
+    if (/\bapi|backend|service|httpapi\b/i.test(text)) return 'backend-developer';
+    if (/\bui|layout|css|frontend\b/i.test(text)) return 'frontend-developer';
+    return '';
+  }
+
+  function choosePreferredSubagentName(incoming = '', existing = '') {
+    const next = String(incoming || '').trim();
+    const prev = String(existing || '').trim();
+    if (next && !isFallbackSubagentName(next)) return next;
+    if (prev && !isFallbackSubagentName(prev)) return prev;
+    return next || prev;
+  }
+
+  function choosePreferredSubagentRole(incoming = '', existing = '') {
+    const next = String(incoming || '').trim();
+    const prev = String(existing || '').trim();
+    if (next && next.toLowerCase() !== 'subagent') return next;
+    if (prev && prev.toLowerCase() !== 'subagent') return prev;
+    return next || prev;
+  }
+
+  function buildSubagentMergeKey(toolName, details = {}) {
+    const name = String(toolName || '').trim().toLowerCase();
+    const ids = Array.isArray(details?.ids)
+      ? [...new Set(details.ids.map((item) => String(item || '').trim()).filter(Boolean))].sort()
+      : [];
+    const targetID = String(details?.targetID || '').trim();
+    const nickname = String(details?.nickname || '').trim();
+    const prompt = String(details?.prompt || '').trim();
+    const summary = String(details?.summary || '').trim();
+    const callID = String(details?.callID || '').trim();
+    const idSeed = ids[0] || targetID;
+    if (name === 'spawn_agent') {
+      return normalizeActivityCommandKey(`spawn|${idSeed || nickname || prompt || summary || callID}`);
+    }
+    if (name === 'wait_agent' || name === 'wait') {
+      return normalizeActivityCommandKey(`wait|${ids.join(',') || targetID || nickname || prompt || summary || callID}`);
+    }
+    if (name === 'send_input') {
+      return normalizeActivityCommandKey(`send_input|${targetID || ids[0] || prompt || callID}`);
+    }
+    if (name === 'resume_agent') {
+      return normalizeActivityCommandKey(`resume_agent|${targetID || ids[0] || callID}`);
+    }
+    if (name === 'close_agent') {
+      return normalizeActivityCommandKey(`close_agent|${targetID || ids[0] || callID}`);
+    }
+    return normalizeActivityCommandKey(`${name}|${callID || idSeed || prompt || summary}`);
+  }
+
+  function buildSubagentLifecycleKey(details = {}) {
+    const ids = Array.isArray(details?.ids)
+      ? [...new Set(details.ids.map((item) => String(item || '').trim()).filter(Boolean))].sort()
+      : [];
+    const targetID = String(details?.targetID || '').trim();
+    const nickname = String(details?.nickname || '').trim();
+    const callID = String(details?.callID || '').trim();
+    const prompt = String(details?.prompt || '').trim();
+    const summary = String(details?.summary || '').trim();
+    const seed = callID || ids[0] || targetID || nickname || prompt || summary;
+    return normalizeActivityCommandKey(`subagent|${seed}`);
+  }
+
+  function normalizeSubagentPromptKey(raw) {
+    const text = String(raw || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\.{3,}/g, ' ')
+      .replace(/[^\p{L}\p{N}\s_-]+/gu, ' ')
+      .replace(/\s+/g, ' ');
+    return normalizeActivityCommandKey(text);
+  }
+
+  function parseSubagentActivityText(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text || !text.startsWith('•')) return null;
+    const lines = text.split('\n').map((line) => String(line || '').trim()).filter(Boolean);
+    if (lines.length === 0) return null;
+    const head = lines[0];
+    const detailLineRaw = lines.slice(1).join('\n').replace(/^└\s*/i, '').trim();
+    const idMatches = [...new Set([...extractLikelyAgentIDs(detailLineRaw), ...extractLikelyAgentIDs(head)])];
+    const detailLine = cleanSubagentDetailText(detailLineRaw, idMatches);
+
+    if (/^•\s*spawned\s+/i.test(head)) {
+      const m = head.match(/^•\s*spawned\s+(.+?)(?:\s+\[(.+)\])?$/i);
+      const nickname = String(m?.[1] || '').trim().replace(/subagent$/i, '').trim();
+      const role = normalizeSubagentRole(String(m?.[2] || '').trim());
+      const targetID = idMatches[0] || '';
+      return {
+        key: buildSubagentMergeKey('spawn_agent', {
+          ids: idMatches,
+          targetID,
+          nickname,
+          prompt: detailLine,
+          summary: detailLine
+        }),
+        toolName: 'spawn_agent',
+        status: 'done',
+        phase: 'completed',
+        title: nickname ? `Spawned ${nickname}` : 'Spawned subagent',
+        nickname,
+        agentType: role,
+        targetID,
+        ids: idMatches,
+        prompt: detailLine,
+        summary: detailLine,
+        raw: { text }
+      };
+    }
+    if (/^•\s*waiting\s+for\s+\d+\s+agents?/i.test(head)) {
+      const countMatch = head.match(/(\d+)/);
+      const count = Number(countMatch?.[1] || 0) || idMatches.length;
+      const title = idMatches.length === 1 ? `Waiting ${idMatches[0]}` : `Waiting ${count || idMatches.length} agents`;
+      const waitKey = buildSubagentMergeKey('wait_agent', {
+        ids: idMatches,
+        targetID: idMatches[0] || '',
+        summary: detailLine
+      });
+      return {
+        key: waitKey,
+        toolName: 'wait_agent',
+        status: 'running',
+        phase: 'started',
+        title,
+        nickname: '',
+        agentType: '',
+        targetID: idMatches[0] || '',
+        ids: idMatches,
+        prompt: '',
+        summary: detailLine,
+        raw: { text }
+      };
+    }
+    if (/^•\s*waiting\s+/i.test(head)) {
+      const waitTarget = String(head.replace(/^•\s*waiting\s+/i, '') || '').trim();
+      const waitIDs = [...new Set([...idMatches, ...extractLikelyAgentIDs(waitTarget)])];
+      const waitKey = buildSubagentMergeKey('wait_agent', {
+        ids: waitIDs,
+        targetID: waitIDs[0] || waitTarget,
+        summary: detailLine || waitTarget
+      });
+      const title = waitTarget ? `Waiting ${waitTarget}` : 'Waiting for agents';
+      return {
+        key: waitKey,
+        toolName: 'wait_agent',
+        status: 'running',
+        phase: 'started',
+        title,
+        nickname: '',
+        agentType: '',
+        targetID: waitIDs[0] || waitTarget,
+        ids: waitIDs,
+        prompt: '',
+        summary: detailLine || waitTarget,
+        raw: { text }
+      };
+    }
+    if (/^•\s*subagent\s+wait\s+completed/i.test(head)) {
+      const waitKey = buildSubagentMergeKey('wait_agent', {
+        ids: idMatches,
+        targetID: idMatches[0] || '',
+        summary: detailLine
+      });
+      return {
+        key: waitKey,
+        toolName: 'wait_agent',
+        status: 'done',
+        phase: 'completed',
+        title: 'Subagent wait completed',
+        nickname: '',
+        agentType: '',
+        targetID: idMatches[0] || '',
+        ids: idMatches,
+        prompt: '',
+        summary: detailLine,
+        raw: { text }
+      };
+    }
+    if (/^•\s*sent\s+input\s+to\s+subagent/i.test(head)) {
+      return {
+        key: buildSubagentMergeKey('send_input', {
+          ids: idMatches,
+          targetID: detailLine,
+          summary: detailLine
+        }),
+        toolName: 'send_input',
+        status: 'done',
+        phase: 'completed',
+        title: 'Sent input to subagent',
+        nickname: '',
+        agentType: '',
+        targetID: detailLine,
+        ids: idMatches,
+        prompt: '',
+        summary: detailLine,
+        raw: { text }
+      };
+    }
+    if (/^•\s*resumed\s+subagent/i.test(head)) {
+      return {
+        key: buildSubagentMergeKey('resume_agent', {
+          ids: idMatches,
+          targetID: detailLine
+        }),
+        toolName: 'resume_agent',
+        status: 'done',
+        phase: 'completed',
+        title: 'Resumed subagent',
+        nickname: '',
+        agentType: '',
+        targetID: detailLine,
+        ids: idMatches,
+        prompt: '',
+        summary: detailLine,
+        raw: { text }
+      };
+    }
+    if (/^•\s*closed\s+subagent/i.test(head)) {
+      return {
+        key: buildSubagentMergeKey('close_agent', {
+          ids: idMatches,
+          targetID: detailLine
+        }),
+        toolName: 'close_agent',
+        status: 'done',
+        phase: 'completed',
+        title: 'Closed subagent',
+        nickname: '',
+        agentType: '',
+        targetID: detailLine,
+        ids: idMatches,
+        prompt: '',
+        summary: detailLine,
+        raw: { text }
+      };
+    }
+    return null;
+  }
+
+  function parseRawEventPayload(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text || !(text.startsWith('{') || text.startsWith('['))) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
+  function extractExecOutputText(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') return String(value);
+    if (Array.isArray(value)) {
+      return value.map((item) => extractExecOutputText(item)).filter(Boolean).join('\n');
+    }
+    if (typeof value === 'object') {
+      const direct = ['stdout', 'stderr', 'output_text', 'text', 'message', 'result', 'output'];
+      for (const key of direct) {
+        const v = extractExecOutputText(value?.[key]);
+        if (v) return v;
+      }
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return '';
+      }
+    }
+    return String(value);
+  }
+
+  function parseToolArguments(raw) {
+    if (raw == null) return {};
+    if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+    const text = String(raw || '').trim();
+    if (!text || (!text.startsWith('{') && !text.startsWith('['))) return {};
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    } catch {
+    }
+    return {};
+  }
+
+  function extractStringList(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+
+  function extractSummaryFromAny(value) {
+    if (value == null) return '';
+    if (typeof value === 'string') {
+      const text = String(value || '').trim();
+      if (!text) return '';
+      try {
+        return extractSummaryFromAny(JSON.parse(text));
+      } catch {
+        return text;
+      }
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const text = extractSummaryFromAny(item);
+        if (text) return text;
+      }
+      return '';
+    }
+    if (typeof value === 'object') {
+      for (const key of ['final_message', 'message', 'summary', 'text', 'status']) {
+        const text = extractSummaryFromAny(value?.[key]);
+        if (text) return text;
+      }
+      for (const key of ['result', 'output', 'data', 'response', 'agents_states']) {
+        const text = extractSummaryFromAny(value?.[key]);
+        if (text) return text;
+      }
+    }
+    return '';
+  }
+
+  function findFirstTextByKeys(value, keys) {
+    const wanted = new Set((Array.isArray(keys) ? keys : []).map((k) => String(k || '').trim().toLowerCase()).filter(Boolean));
+    if (wanted.size === 0) return '';
+    const seen = new Set();
+    const walk = (node) => {
+      if (node == null) return '';
+      if (typeof node === 'string') {
+        const text = String(node || '').trim();
+        if (!text) return '';
+        if ((text.startsWith('{') || text.startsWith('[')) && !seen.has(text)) {
+          seen.add(text);
+          try {
+            return walk(JSON.parse(text));
+          } catch {
+          }
+        }
+        return '';
+      }
+      if (Array.isArray(node)) {
+        for (const item of node) {
+          const found = walk(item);
+          if (found) return found;
+        }
+        return '';
+      }
+      if (typeof node === 'object') {
+        for (const [k, v] of Object.entries(node)) {
+          if (wanted.has(String(k || '').trim().toLowerCase())) {
+            const text = String(v || '').trim();
+            if (text) return text;
+          }
+        }
+        for (const v of Object.values(node)) {
+          const found = walk(v);
+          if (found) return found;
+        }
+      }
+      return '';
+    };
+    return walk(value);
+  }
+
+  function collectAgentIDsDeep(value) {
+    const out = new Set();
+    const seen = new Set();
+    const walk = (node) => {
+      if (node == null) return;
+      if (typeof node === 'string') {
+        const text = String(node || '').trim();
+        if (!text) return;
+        for (const id of extractLikelyAgentIDs(text)) out.add(id);
+        if ((text.startsWith('{') || text.startsWith('[')) && !seen.has(text)) {
+          seen.add(text);
+          try {
+            walk(JSON.parse(text));
+          } catch {
+          }
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item);
+        return;
+      }
+      if (typeof node === 'object') {
+        for (const v of Object.values(node)) walk(v);
+      }
+    };
+    walk(value);
+    return [...out];
+  }
+
+  function isGenericSubagentTitle(text) {
+    const value = String(text || '').trim().toLowerCase();
+    if (!value) return true;
+    if (value === 'spawned subagent') return true;
+    if (value === 'subagent activity') return true;
+    if (value === 'waiting for agents') return true;
+    if (value === 'subagent wait completed') return true;
+    if (/^waiting\s+[0-9a-f-]{20,}$/i.test(value)) return true;
+    return false;
+  }
+
+  function parseExecEventFromPayload(payload) {
+    const evt = payload && typeof payload === 'object' ? payload : null;
+    if (!evt) return null;
+    const type = String(evt?.type || '').trim().toLowerCase();
+    const item = evt?.item && typeof evt.item === 'object' ? evt.item : {};
+    const itemType = String(item?.type || '').trim().toLowerCase();
+    if (itemType && !['command_execution', 'tool_call', 'exec_command'].includes(itemType)) {
+      return null;
+    }
+    if (itemType === 'collab_tool_call') return null;
+    if (!type.startsWith('item.') && !type.startsWith('tool.')) {
+      return null;
+    }
+
+    const fn = item?.function && typeof item.function === 'object' ? item.function : {};
+    const toolName = String(item?.tool || item?.tool_name || item?.name || fn?.name || '').trim().toLowerCase();
+    const toolArgs = parseToolArguments(item?.arguments || item?.input || item?.params || item?.payload || fn?.arguments || fn?.input);
+    const command = String(
+      item?.command ||
+      item?.cmd ||
+      toolArgs?.command ||
+      toolArgs?.cmd ||
+      toolArgs?.shell_command ||
+      ''
+    ).trim();
+    const isExplicitExec =
+      itemType === 'command_execution' ||
+      itemType === 'exec_command' ||
+      toolName === 'exec_command' ||
+      toolName === 'exec';
+    if (!isExplicitExec) return null;
+    if (!command) return null;
+    let status = '';
+    let exitCode = 0;
+    if (type === 'item.started' || type === 'item.updated' || type === 'tool.started' || type === 'tool.call.started') {
+      status = 'running';
+    } else if (type === 'item.completed' || type === 'tool.completed' || type === 'tool.call.completed') {
+      exitCode = Number(item?.exit_code ?? evt?.exit_code ?? 0) || 0;
+      status = exitCode !== 0 ? 'failed' : 'done';
+    }
+    const output = extractExecOutputText(item?.output || item?.result || item?.text || item?.output_text || '');
+    return {
+      command,
+      status: normalizeExecStatus(status || 'running'),
+      exitCode,
+      output: String(output || '').trim()
+    };
+  }
+
+  function parseSubagentEventFromPayload(payload) {
+    const evt = payload && typeof payload === 'object' ? payload : null;
+    if (!evt) return null;
+    const type = String(evt?.type || '').trim().toLowerCase();
+    const item = evt?.item && typeof evt.item === 'object' ? evt.item : {};
+    const itemType = String(item?.type || '').trim().toLowerCase();
+    if (!itemType || (itemType !== 'tool_call' && itemType !== 'collab_tool_call')) {
+      return null;
+    }
+    if (!type.startsWith('item.') && !type.startsWith('tool.')) return null;
+    const fn = item?.function && typeof item.function === 'object' ? item.function : {};
+    const toolName = String(item?.tool || item?.tool_name || item?.name || fn?.name || '').trim().toLowerCase();
+    if (!['spawn_agent', 'wait_agent', 'wait', 'send_input', 'resume_agent', 'close_agent'].includes(toolName)) {
+      return null;
+    }
+    if (toolName === 'wait' && itemType !== 'collab_tool_call') {
+      return null;
+    }
+    const args = parseToolArguments(item?.arguments || item?.input || item?.params || item?.payload || fn?.arguments || fn?.input);
+    const argAgent = args?.agent && typeof args.agent === 'object' && !Array.isArray(args.agent) ? args.agent : {};
+    const itemAgent = item?.agent && typeof item.agent === 'object' && !Array.isArray(item.agent) ? item.agent : {};
+    const firstText = (...values) => {
+      for (const value of values) {
+        if (value == null) continue;
+        const text = String(value || '').trim();
+        if (text) return text;
+      }
+      return '';
+    };
+    const callID = String(item?.call_id || item?.tool_call_id || item?.id || '').trim();
+    const ids = [
+      ...extractStringList(args?.ids),
+      ...extractStringList(args?.agent_ids),
+      ...extractStringList(args?.subagent_ids),
+      ...extractStringList(args?.receiver_thread_ids),
+      ...extractStringList(item?.receiver_thread_ids)
+    ];
+    const promptRaw = String(args?.message || args?.prompt || item?.prompt || '').trim();
+    const summary = String(
+      extractSummaryFromAny(item?.output_text || item?.text || item?.output || item?.result || item?.response || item?.agents_states)
+    ).trim();
+    const hints = extractSubagentIdentityFromText([summary, promptRaw, String(item?.output_text || ''), String(item?.text || '')].join('\n'));
+    const deepNickname = findFirstTextByKeys(
+      [item?.output, item?.result, item?.response, item?.agents_states, item?.output_text, item?.text],
+      ['nickname', 'name', 'agent_name', 'display_name']
+    );
+    let nickname = firstText(
+      args?.nickname,
+      args?.name,
+      args?.agent_name,
+      args?.agentName,
+      args?.display_name,
+      args?.displayName,
+      argAgent?.nickname,
+      argAgent?.name,
+      argAgent?.display_name,
+      argAgent?.displayName,
+      item?.nickname,
+      item?.name,
+      item?.agent_name,
+      item?.agentName,
+      itemAgent?.nickname,
+      itemAgent?.name,
+      itemAgent?.display_name,
+      itemAgent?.displayName,
+      hints?.nickname,
+      deepNickname
+    );
+    const deepRole = findFirstTextByKeys(
+      [item?.output, item?.result, item?.response, item?.agents_states, item?.output_text, item?.text],
+      ['agent_type', 'agenttype', 'role', 'type']
+    );
+    let agentType = normalizeSubagentRole(firstText(
+      args?.agent_type,
+      args?.agentType,
+      args?.role,
+      args?.type,
+      typeof args?.agent === 'string' ? args.agent : '',
+      argAgent?.agent_type,
+      argAgent?.agentType,
+      argAgent?.role,
+      argAgent?.type,
+      item?.agent_type,
+      item?.agentType,
+      item?.role,
+      item?.type,
+      typeof item?.agent === 'string' ? item.agent : '',
+      itemAgent?.agent_type,
+      itemAgent?.agentType,
+      itemAgent?.role,
+      itemAgent?.type,
+      hints?.agentType,
+      deepRole
+    ));
+    if (!agentType && toolName === 'spawn_agent') {
+      agentType = normalizeSubagentRole(inferSubagentRoleFromText(promptRaw, item?.prompt, args?.message, args?.prompt));
+    }
+    const idsWithHints = [...new Set([
+      ...ids,
+      ...extractLikelyAgentIDs(firstText(args?.id, args?.agent_id, args?.subagent_id, args?.thread_id, args?.receiver_thread_id)),
+      ...extractLikelyAgentIDs(firstText(item?.receiver_thread_id, item?.target_id)),
+      ...(Array.isArray(hints?.ids) ? hints.ids : []),
+      ...collectAgentIDsDeep([item?.output, item?.result, item?.response, item?.agents_states])
+    ])];
+    const targetID = firstText(
+      args?.id,
+      args?.agent_id,
+      args?.subagent_id,
+      args?.thread_id,
+      args?.receiver_thread_id,
+      item?.receiver_thread_id,
+      item?.target_id,
+      idsWithHints[0]
+    );
+    if (!nickname) {
+      nickname = formatSubagentFallbackName(idsWithHints, targetID);
+    }
+    if (!agentType && nickname) {
+      agentType = 'subagent';
+    }
+    const prompt = cleanSubagentDetailText(promptRaw, [targetID, ...idsWithHints]);
+    const summaryClean = cleanSubagentDetailText(summary, [targetID, ...idsWithHints]);
+    const isCompleted = type === 'item.completed' || type === 'tool.completed' || type === 'tool.call.completed';
+    const isStarted = type === 'item.started' || type === 'item.updated' || type === 'tool.started' || type === 'tool.call.started';
+    const hasError = Boolean(item?.error || evt?.error);
+    const status = hasError ? 'failed' : (isCompleted ? 'done' : (isStarted ? 'running' : 'running'));
+    const phase = isCompleted ? 'completed' : (isStarted ? 'started' : 'updated');
+    const key = buildSubagentMergeKey(toolName, {
+      callID,
+      ids: idsWithHints,
+      targetID,
+      nickname,
+      prompt,
+      summary: summaryClean
+    });
+    let title = 'Subagent Activity';
+    if (toolName === 'spawn_agent') {
+      title = nickname ? `Spawned ${nickname}${agentType ? ` [${agentType}]` : ''}` : 'Spawned subagent';
+    } else if (toolName === 'wait_agent' || toolName === 'wait') {
+      title = nickname
+        ? `Waiting ${nickname}${agentType ? ` [${agentType}]` : ''}`
+        : (idsWithHints.length === 1 ? `Waiting ${idsWithHints[0]}` : (idsWithHints.length > 1 ? `Waiting ${idsWithHints.length} agents` : 'Waiting for agents'));
+    } else if (toolName === 'send_input') {
+      title = 'Sent input to subagent';
+    } else if (toolName === 'resume_agent') {
+      title = 'Resumed subagent';
+    } else if (toolName === 'close_agent') {
+      title = 'Closed subagent';
+    }
+    return {
+      key,
+      callID,
+      toolName,
+      status,
+      phase,
+      title,
+      nickname,
+      agentType,
+      targetID,
+      ids: idsWithHints,
+      prompt,
+      summary: summaryClean,
+      raw: evt
+    };
+  }
+
+  function mergeExecOutput(startText, endText) {
     const first = String(startText || '').trim();
     const second = String(endText || '').trim();
-    if (!first) return second || '-';
-    if (!second) return first || '-';
-    if (first === second) return first;
+    if (!first) return second;
+    if (!second) return first;
+    if (first.includes(second)) return first;
     return `${first}\n${second}`;
   }
 
-  function compactActivityMessages(inputMessages) {
+  function buildExecAwareMessages(inputMessages, includeRawEvents) {
     const src = Array.isArray(inputMessages) ? inputMessages : [];
     const out = [];
-    const runningIndexByKey = new Map();
+    const activeExecByKey = new Map();
+    const activeSubagentByKey = new Map();
+    const subagentIdentityByID = new Map();
+    let lastExecKey = '';
+    const normalizeExecOutputSource = (value) => {
+      const v = String(value || '').trim().toLowerCase();
+      if (v === 'live' || v === 'persisted' || v === 'persisted-merge') return v;
+      return 'live';
+    };
+    const mergeExecOutputSource = (existingSource, incomingSource) => {
+      const cur = normalizeExecOutputSource(existingSource);
+      const next = normalizeExecOutputSource(incomingSource);
+      if (cur === next) return cur;
+      return 'persisted-merge';
+    };
+    const detectMetaSource = (id) => {
+      const raw = String(id || '').trim().toLowerCase();
+      if (raw.startsWith('event-') || raw.startsWith('stderr-') || raw.startsWith('activity-')) {
+        return 'live';
+      }
+      return 'persisted';
+    };
+
+    const upsertExecEntry = (entry) => {
+      const command = String(entry?.command || '').trim();
+      if (!command) return null;
+      const key = normalizeActivityCommandKey(command);
+      if (!key) return null;
+      const existingIdx = activeExecByKey.get(key);
+      const nowISO = new Date().toISOString();
+      if (typeof existingIdx === 'number' && out[existingIdx]) {
+        const current = out[existingIdx];
+        const nextStatus = normalizeExecStatus(entry?.status || current?.exec_status || 'running');
+        const nextExitCode = Number(entry?.exitCode ?? current?.exec_exit_code ?? 0) || 0;
+        const nextOutput = mergeExecOutput(current?.exec_output || '', entry?.output || '');
+        const nextSource = mergeExecOutputSource(current?.exec_output_source, entry?.source || 'live');
+        out[existingIdx] = {
+          ...current,
+          content: command,
+          created_at: current?.created_at || nowISO,
+          updated_at: String(entry?.createdAt || nowISO),
+          exec_command: command,
+          exec_status: nextStatus,
+          exec_exit_code: nextExitCode,
+          exec_output: nextOutput,
+          exec_output_source: nextSource
+        };
+        if (nextStatus !== 'running') {
+          activeExecByKey.delete(key);
+          if (normalizeActivityCommandKey(lastExecKey) === key) {
+            lastExecKey = '';
+          }
+        } else {
+          lastExecKey = command;
+        }
+        return out[existingIdx];
+      }
+      const next = {
+        id: `exec-${String(entry?.sourceID || key)}`,
+        role: 'exec',
+        content: command,
+        created_at: String(entry?.createdAt || nowISO),
+        updated_at: String(entry?.createdAt || nowISO),
+        pending: false,
+        exec_command: command,
+        exec_status: normalizeExecStatus(entry?.status || 'running'),
+        exec_exit_code: Number(entry?.exitCode || 0) || 0,
+        exec_output: String(entry?.output || '').trim(),
+        exec_output_source: normalizeExecOutputSource(entry?.source || 'live')
+      };
+      out.push(next);
+      if (next.exec_status === 'running') {
+        activeExecByKey.set(key, out.length - 1);
+        lastExecKey = command;
+      }
+      return next;
+    };
+
+    const upsertSubagentEntry = (entry) => {
+      const key = normalizeActivityCommandKey(entry?.key || '');
+      const incomingToolName = String(entry?.toolName || '').trim().toLowerCase();
+      const incomingToolFamily = normalizeSubagentToolFamily(incomingToolName);
+      const incomingStatus = String(entry?.status || 'running').trim().toLowerCase();
+      const isTransientWaitEvent = (incomingToolName === 'wait_agent' || incomingToolName === 'wait') && incomingStatus !== 'running';
+      const lifecycleKey = buildSubagentLifecycleKey({
+        ids: Array.isArray(entry?.ids) ? entry.ids : [],
+        targetID: entry?.targetID,
+        nickname: entry?.nickname,
+        callID: entry?.callID,
+        prompt: entry?.prompt,
+        summary: entry?.summary
+      });
+      const nowISO = new Date().toISOString();
+      const idsFromEntry = Array.isArray(entry?.ids) ? entry.ids.filter(Boolean) : [];
+      const targetFromEntry = String(entry?.targetID || '').trim();
+      const knownNames = [];
+      for (const id of idsFromEntry) {
+        const known = String(subagentIdentityByID.get(id) || '').trim();
+        if (known) knownNames.push(known);
+      }
+      if (targetFromEntry) {
+        const known = String(subagentIdentityByID.get(targetFromEntry) || '').trim();
+        if (known) knownNames.push(known);
+      }
+      const resolvedNickname = String(entry?.nickname || knownNames[0] || '').trim();
+      const fallbackNickname = resolvedNickname || formatSubagentFallbackName(idsFromEntry, targetFromEntry);
+      const resolvedRoleRaw = String(entry?.agentType || '').trim();
+      const inferredRole = String(entry?.toolName || '').trim().toLowerCase() === 'spawn_agent'
+        ? inferSubagentRoleFromText(entry?.prompt, entry?.title)
+        : '';
+      const resolvedRole = resolvedRoleRaw || (fallbackNickname ? 'subagent' : '');
+      const effectiveRole = normalizeSubagentRole(resolvedRoleRaw || inferredRole || resolvedRole);
+      const resolvedTitle = (() => {
+        const base = String(entry?.title || 'Subagent Activity').trim();
+        const roleTag = effectiveRole ? ` [${effectiveRole}]` : '';
+        if (fallbackNickname && /^spawned\b/i.test(base)) {
+          return `Spawned ${fallbackNickname}${roleTag}`;
+        }
+        if (fallbackNickname && /^waiting\b/i.test(base)) {
+          const hasName = base.toLowerCase().includes(fallbackNickname.toLowerCase());
+          const hasRole = resolvedRole ? base.toLowerCase().includes(resolvedRole.toLowerCase()) : false;
+          if (hasName || hasRole) return base;
+          return `${base} (${fallbackNickname}${effectiveRole ? ` · ${effectiveRole}` : ''})`;
+        }
+        if (effectiveRole && !base.includes('[') && !base.includes('(')) return `${base}${roleTag}`;
+        return base;
+      })();
+      const indexedActive = key ? activeSubagentByKey.get(key) : undefined;
+      const indexedByKey = (() => {
+        if (!key && !lifecycleKey) return undefined;
+        for (let idx = out.length - 1; idx >= 0; idx -= 1) {
+          const row = out[idx];
+          if (!row || String(row?.role || '').trim().toLowerCase() !== 'subagent') continue;
+          const rowKey = normalizeActivityCommandKey(row?.subagent_key || '');
+          const rowLifecycle = normalizeActivityCommandKey(row?.subagent_lifecycle_key || '');
+          if (lifecycleKey && rowLifecycle && rowLifecycle === lifecycleKey) return idx;
+          if (key && rowKey && rowKey === key) return idx;
+        }
+        return undefined;
+      })();
+      const indexedByPrompt = (() => {
+        const toolName = String(entry?.toolName || '').trim().toLowerCase();
+        const status = String(entry?.status || '').trim().toLowerCase();
+        if (toolName !== 'spawn_agent' || status === 'running') return undefined;
+        const incomingPrompt = normalizeSubagentPromptKey(entry?.prompt || entry?.summary || '');
+        if (!incomingPrompt) return undefined;
+        for (let idx = out.length - 1; idx >= 0; idx -= 1) {
+          const row = out[idx];
+          if (!row || String(row?.role || '').trim().toLowerCase() !== 'subagent') continue;
+          if (String(row?.subagent_status || '').trim().toLowerCase() !== 'running') continue;
+          if (String(row?.subagent_tool || '').trim().toLowerCase() !== 'spawn_agent') continue;
+          const rowPrompt = normalizeSubagentPromptKey(row?.subagent_prompt || row?.subagent_summary || '');
+          if (!rowPrompt) continue;
+          if (rowPrompt === incomingPrompt || rowPrompt.includes(incomingPrompt) || incomingPrompt.includes(rowPrompt)) {
+            return idx;
+          }
+        }
+        return undefined;
+      })();
+      const existingIdx = typeof indexedActive === 'number'
+        ? indexedActive
+        : (typeof indexedByKey === 'number' ? indexedByKey : indexedByPrompt);
+      const resolvedExistingIdx = (() => {
+        if (typeof existingIdx !== 'number' || !out[existingIdx]) return undefined;
+        const currentToolFamily = normalizeSubagentToolFamily(String(out[existingIdx]?.subagent_tool || '').trim().toLowerCase());
+        if (!incomingToolFamily || !currentToolFamily || incomingToolFamily === currentToolFamily) {
+          return existingIdx;
+        }
+        return undefined;
+      })();
+      if (typeof resolvedExistingIdx === 'number' && out[resolvedExistingIdx]) {
+        const current = out[resolvedExistingIdx];
+        const nextStatus = String(entry?.status || current?.subagent_status || 'running').trim().toLowerCase();
+        const mergedIDs = [...new Set([...(Array.isArray(current?.subagent_ids) ? current.subagent_ids : []), ...idsFromEntry])];
+        const resolvedTarget = targetFromEntry || String(current?.subagent_target_id || '').trim();
+        const fallbackCurrentTitle = String(current?.subagent_title || 'Subagent Activity').trim();
+        const chosenTitle = (() => {
+          const incoming = String(resolvedTitle || '').trim();
+          if (!incoming) return fallbackCurrentTitle;
+          if (!isGenericSubagentTitle(incoming)) return incoming;
+          if (!isGenericSubagentTitle(fallbackCurrentTitle)) return fallbackCurrentTitle;
+          if (fallbackNickname && /^spawned\b/i.test(incoming)) {
+            return `Spawned ${fallbackNickname}${resolvedRole ? ` [${resolvedRole}]` : ''}`;
+          }
+          if (fallbackNickname && /^waiting\b/i.test(incoming)) {
+            return `Waiting ${fallbackNickname}${effectiveRole ? ` [${effectiveRole}]` : ''}`;
+          }
+          return incoming;
+        })();
+        const preferredNickname = choosePreferredSubagentName(
+          resolvedNickname || fallbackNickname,
+          String(current?.subagent_nickname || '').trim()
+        );
+        const preferredRole = choosePreferredSubagentRole(
+          effectiveRole,
+          String(current?.subagent_role || '').trim()
+        );
+        out[resolvedExistingIdx] = {
+          ...current,
+          updated_at: String(entry?.createdAt || nowISO),
+          subagent_status: nextStatus,
+          subagent_phase: String(entry?.phase || current?.subagent_phase || '').trim().toLowerCase(),
+          subagent_key: key || String(current?.subagent_key || '').trim(),
+          subagent_lifecycle_key: lifecycleKey || String(current?.subagent_lifecycle_key || '').trim(),
+          subagent_title: chosenTitle,
+          subagent_tool: String(entry?.toolName || current?.subagent_tool || '').trim(),
+          subagent_ids: mergedIDs,
+          subagent_target_id: resolvedTarget,
+          subagent_nickname: preferredNickname,
+          subagent_role: preferredRole,
+          subagent_prompt: String(entry?.prompt || current?.subagent_prompt || '').trim(),
+          subagent_summary: String(entry?.summary || current?.subagent_summary || '').trim(),
+          subagent_raw: entry?.raw || current?.subagent_raw || {}
+        };
+        if (preferredNickname) {
+          for (const id of mergedIDs) {
+            subagentIdentityByID.set(id, preferredNickname);
+          }
+          if (resolvedTarget) {
+            subagentIdentityByID.set(resolvedTarget, preferredNickname);
+          }
+        }
+        if (nextStatus !== 'running') {
+          activeSubagentByKey.delete(key);
+        }
+        if (isTransientWaitEvent) {
+          return out[resolvedExistingIdx];
+        }
+        return out[resolvedExistingIdx];
+      }
+      if (isTransientWaitEvent) {
+        if (key) activeSubagentByKey.delete(key);
+        return null;
+      }
+      const finalTitle = (() => {
+        const current = String(resolvedTitle || '').trim();
+        if (!isGenericSubagentTitle(current)) return current || 'Subagent Activity';
+        if (fallbackNickname && /^spawned\b/i.test(current || String(entry?.title || '').trim())) {
+          return `Spawned ${fallbackNickname}${effectiveRole ? ` [${effectiveRole}]` : ''}`;
+        }
+        if (fallbackNickname && /^waiting\b/i.test(current || String(entry?.title || '').trim())) {
+          return `Waiting ${fallbackNickname}${effectiveRole ? ` [${effectiveRole}]` : ''}`;
+        }
+        return current || 'Subagent Activity';
+      })();
+      const next = {
+        id: `subagent-${String(entry?.sourceID || key)}`,
+        role: 'subagent',
+        content: finalTitle,
+        created_at: String(entry?.createdAt || nowISO),
+        updated_at: String(entry?.createdAt || nowISO),
+        pending: false,
+        subagent_status: String(entry?.status || 'running').trim().toLowerCase(),
+        subagent_phase: String(entry?.phase || '').trim().toLowerCase(),
+        subagent_key: key,
+        subagent_lifecycle_key: lifecycleKey,
+        subagent_title: finalTitle,
+        subagent_tool: String(entry?.toolName || '').trim(),
+        subagent_ids: idsFromEntry,
+        subagent_target_id: targetFromEntry,
+        subagent_nickname: choosePreferredSubagentName(resolvedNickname || fallbackNickname, ''),
+        subagent_role: choosePreferredSubagentRole(effectiveRole, ''),
+        subagent_prompt: String(entry?.prompt || '').trim(),
+        subagent_summary: String(entry?.summary || '').trim(),
+        subagent_raw: entry?.raw || {}
+      };
+      out.push(next);
+      if (next.subagent_nickname) {
+        for (const id of idsFromEntry) {
+          subagentIdentityByID.set(id, next.subagent_nickname);
+        }
+        if (targetFromEntry) {
+          subagentIdentityByID.set(targetFromEntry, next.subagent_nickname);
+        }
+      }
+      if (key && next.subagent_status === 'running') {
+        activeSubagentByKey.set(key, out.length - 1);
+      }
+      return next;
+    };
 
     for (const item of src) {
-      if (String(item?.role || '').trim().toLowerCase() !== 'activity') {
+      const role = String(item?.role || '').trim().toLowerCase();
+      if (role === 'activity') {
+        const subagentActivity = parseSubagentActivityText(item?.content || '');
+        if (subagentActivity?.toolName) {
+          upsertSubagentEntry({
+            ...subagentActivity,
+            sourceID: item?.id,
+            createdAt: item?.created_at
+          });
+          continue;
+        }
+        const parsed = parseActivityText(item?.content || '');
+        if (parsed.kind === 'running' && parsed.command) {
+          upsertExecEntry({
+            command: parsed.command,
+            status: 'running',
+            exitCode: 0,
+            sourceID: item?.id,
+            createdAt: item?.created_at,
+            source: detectMetaSource(item?.id)
+          });
+          continue;
+        }
+        if ((parsed.kind === 'done' || parsed.kind === 'failed') && parsed.command) {
+          upsertExecEntry({
+            command: parsed.command,
+            status: parsed.kind === 'failed' ? 'failed' : 'done',
+            exitCode: Number(parsed.exitCode || 0) || 0,
+            sourceID: item?.id,
+            createdAt: item?.created_at,
+            source: detectMetaSource(item?.id)
+          });
+          continue;
+        }
         out.push(item);
         continue;
       }
-      const parsed = parseActivityText(item?.content || '');
-      const key = normalizeActivityCommandKey(parsed.command);
-      if (parsed.kind === 'running' && key) {
-        if (runningIndexByKey.has(key)) {
-          const idx = runningIndexByKey.get(key);
-          if (typeof idx === 'number' && out[idx]) {
-            out[idx] = {
-              ...out[idx],
-              content: item?.content || out[idx].content || '-'
-            };
-            continue;
+      if (role === 'event') {
+        const payload = parseRawEventPayload(item?.content || '');
+        const parsedExec = parseExecEventFromPayload(payload);
+        const parsedSubagent = parseSubagentEventFromPayload(payload);
+        const rawText = String(item?.content || '').trim();
+        let handled = false;
+        if (parsedExec?.command) {
+          const recordExec = upsertExecEntry({
+            ...parsedExec,
+            sourceID: item?.id,
+            createdAt: item?.created_at,
+            source: detectMetaSource(item?.id)
+          });
+          void recordExec;
+          handled = true;
+        }
+        if (parsedSubagent?.toolName) {
+          const recordSubagent = upsertSubagentEntry({
+            ...parsedSubagent,
+            sourceID: item?.id,
+            createdAt: item?.created_at
+          });
+          void recordSubagent;
+          handled = true;
+        }
+        if (!handled && rawText) {
+          const activeKey = normalizeActivityCommandKey(lastExecKey || activeExecCommand);
+          if (activeKey && activeExecByKey.has(activeKey)) {
+            const idx = activeExecByKey.get(activeKey);
+            if (typeof idx === 'number' && out[idx]) {
+              out[idx] = {
+                ...out[idx],
+                exec_output: mergeExecOutput(out[idx]?.exec_output || '', rawText),
+                updated_at: String(item?.created_at || out[idx]?.updated_at || new Date().toISOString()),
+                exec_output_source: mergeExecOutputSource(out[idx]?.exec_output_source, detectMetaSource(item?.id))
+              };
+              handled = true;
+            }
+          }
+        }
+        if (handled && !includeRawEvents) {
+          continue;
+        }
+        out.push(item);
+        continue;
+      }
+      if (role === 'stderr') {
+        const text = String(item?.content || '').trim();
+        if (text) {
+          const activeKey = normalizeActivityCommandKey(lastExecKey || activeExecCommand);
+          if (activeKey && activeExecByKey.has(activeKey)) {
+            const idx = activeExecByKey.get(activeKey);
+            if (typeof idx === 'number' && out[idx]) {
+              out[idx] = {
+                ...out[idx],
+                exec_output: mergeExecOutput(out[idx]?.exec_output || '', text),
+                updated_at: String(item?.created_at || out[idx]?.updated_at || new Date().toISOString()),
+                exec_output_source: mergeExecOutputSource(out[idx]?.exec_output_source, detectMetaSource(item?.id))
+              };
+              if (!includeRawEvents) continue;
+            }
           }
         }
         out.push(item);
-        runningIndexByKey.set(key, out.length - 1);
         continue;
-      }
-      if ((parsed.kind === 'done' || parsed.kind === 'failed') && key) {
-        if (runningIndexByKey.has(key)) {
-          const idx = runningIndexByKey.get(key);
-          if (typeof idx === 'number' && out[idx]) {
-            out[idx] = {
-              ...out[idx],
-              content: mergeActivityContent(out[idx].content || '', item?.content || '')
-            };
-            runningIndexByKey.delete(key);
-            continue;
-          }
-        }
       }
       out.push(item);
     }
+    return out
+      .filter((row) => {
+        if (!row) return false;
+        if (String(row?.role || '').trim().toLowerCase() !== 'subagent') return true;
+        const tool = String(row?.subagent_tool || '').trim().toLowerCase();
+        const status = String(row?.subagent_status || '').trim().toLowerCase();
+        const isRunning = status === 'running';
+        const title = String(row?.subagent_title || row?.content || '').trim().toLowerCase();
+        if ((tool === 'wait_agent' || tool === 'wait') && !isRunning) {
+          return false;
+        }
+        if (title.startsWith('waiting') && !isRunning) {
+          return false;
+        }
+        return true;
+      })
+      .map((row) => {
+      if (String(row?.role || '').trim().toLowerCase() !== 'subagent') return row;
+      const tool = String(row?.subagent_tool || '').trim().toLowerCase();
+      const ids = Array.isArray(row?.subagent_ids) ? row.subagent_ids.filter(Boolean) : [];
+      const target = String(row?.subagent_target_id || '').trim();
+      const knownName = [...ids, target]
+        .map((id) => String(subagentIdentityByID.get(id) || '').trim())
+        .find((value) => value && !isFallbackSubagentName(value)) || '';
+      let nextTitle = String(row?.subagent_title || row?.content || 'Subagent Activity').trim();
+      if (tool && tool !== 'spawn_agent') {
+        nextTitle = nextTitle.replace(/\s+\[[^\]]+\]\s*$/u, '').trim();
+      }
+      if (!knownName) {
+        return {
+          ...row,
+          subagent_title: nextTitle,
+          content: nextTitle
+        };
+      }
 
-    return out;
+      const currentName = String(row?.subagent_nickname || '').trim();
+      const currentRole = String(row?.subagent_role || '').trim();
+      const nextName = choosePreferredSubagentName(knownName, currentName);
+      const nextRole = tool === 'spawn_agent' ? choosePreferredSubagentRole('', currentRole) : '';
+      if (/^spawned\b/i.test(nextTitle) || /^waiting\b/i.test(nextTitle)) {
+        const verb = /^spawned\b/i.test(nextTitle) ? 'Spawned' : 'Waiting';
+        const displayName = nextName || subagentDisplayName({ ...row, subagent_nickname: nextName });
+        const displayRole = tool === 'spawn_agent'
+          ? (nextRole || subagentDisplayRole({ ...row, subagent_nickname: nextName, subagent_role: nextRole }))
+          : '';
+        if (displayName) {
+          nextTitle = `${verb} ${displayName}${displayRole ? ` [${displayRole}]` : ''}`;
+        }
+      }
+      return {
+        ...row,
+        subagent_nickname: nextName,
+        subagent_role: nextRole,
+        subagent_title: nextTitle,
+        content: nextTitle
+      };
+    });
   }
 
   function appendActivityMessage(rawText) {
@@ -236,7 +1424,7 @@
       created_at: new Date().toISOString(),
       pending: false
     };
-    messages = compactActivityMessages([...messages, next]);
+    messages = [...messages, next];
     return String(next.id || '');
   }
 
@@ -253,43 +1441,6 @@
     };
     messages = [...messages, next];
     return String(next.id || '');
-  }
-
-  function groupedMessagesForView() {
-    const src = Array.isArray(messages) ? messages : [];
-    const out = [];
-    let openActivityIndex = -1;
-    for (const item of src) {
-      const role = String(item?.role || '').trim().toLowerCase();
-      if (role !== 'activity') {
-        openActivityIndex = -1;
-        out.push(item);
-        continue;
-      }
-      if (openActivityIndex < 0) {
-        out.push({
-          ...item,
-          id: `activity-group-${String(item?.id || Date.now())}`
-        });
-        openActivityIndex = out.length - 1;
-        continue;
-      }
-      const existing = out[openActivityIndex];
-      if (!existing) {
-        out.push({
-          ...item,
-          id: `activity-group-${String(item?.id || Date.now())}`
-        });
-        openActivityIndex = out.length - 1;
-        continue;
-      }
-      out[openActivityIndex] = {
-        ...existing,
-        content: mergeActivityContent(existing?.content || '', item?.content || ''),
-        created_at: item?.created_at || existing?.created_at
-      };
-    }
-    return out;
   }
 
   function activeSession() {
@@ -334,6 +1485,8 @@
   function messageRoleClass(message) {
     const role = String(message?.role || '').trim().toLowerCase();
     if (role === 'assistant') return 'assistant';
+    if (role === 'exec') return 'exec';
+    if (role === 'subagent') return 'subagent';
     if (role === 'activity') return 'activity';
     if (role === 'event') return 'event';
     if (role === 'stderr') return 'stderr';
@@ -341,11 +1494,230 @@
   }
 
   function renderedMessagesForView() {
-    let rendered = groupedMessagesForView();
+    let rendered = buildExecAwareMessages(messages, true);
+    rendered = dedupeAdjacentSpawnSubagentMessages(rendered);
     if (String(logViewMode || '').trim().toLowerCase() !== 'raw') {
       rendered = rendered.filter((item) => String(item?.role || '').trim().toLowerCase() !== 'event');
     }
     return rendered;
+  }
+
+  function execStatusLabel(status, exitCode) {
+    const normalized = normalizeExecStatus(status);
+    if (normalized === 'running') return 'Running';
+    if (normalized === 'failed') return `Failed${Number(exitCode || 0) ? ` (exit ${Number(exitCode || 0)})` : ''}`;
+    return 'Done';
+  }
+
+  function execOutputPreview(message) {
+    const output = String(message?.exec_output || '').trim();
+    if (!output) return 'No output captured.';
+    const compact = sanitizeSensitiveLogText(output);
+    const lines = compact.split('\n');
+    if (lines.length <= 4 && compact.length <= 360) return compact;
+    return `${lines.slice(0, 4).join('\n')}${compact.length > 360 || lines.length > 4 ? '\n...' : ''}`;
+  }
+
+  function subagentStatusLabel(status) {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (normalized === 'running') return 'Running';
+    if (normalized === 'failed') return 'Failed';
+    return 'Done';
+  }
+
+  function subagentPreview(message) {
+    const parts = [];
+    const nickname = subagentDisplayName(message);
+    const role = subagentDisplayRole(message);
+    const title = String(subagentDisplayTitle(message) || '').trim().toLowerCase();
+    const isWaiting = title.startsWith('waiting');
+    if (isWaiting) return '';
+    const target = String(message?.subagent_target_id || '').trim();
+    const ids = Array.isArray(message?.subagent_ids) ? message.subagent_ids.filter(Boolean) : [];
+    const prompt = String(message?.subagent_prompt || '').trim();
+    const summary = String(message?.subagent_summary || '').trim();
+    if (nickname) parts.push(`Name: ${nickname}`);
+    if (role) parts.push(`Role: ${role}`);
+    if (!isWaiting) {
+      if (target) parts.push(`Target: ${target}`);
+      if (ids.length > 0) parts.push(`IDs: ${ids.slice(0, 3).join(', ')}${ids.length > 3 ? ', ...' : ''}`);
+    }
+    if (prompt) parts.push(`Prompt: ${prompt.slice(0, 180)}${prompt.length > 180 ? '...' : ''}`);
+    if (summary) parts.push(`Summary: ${summary.slice(0, 220)}${summary.length > 220 ? '...' : ''}`);
+    if (parts.length === 0) return 'No subagent details captured.';
+    return parts.join('\n');
+  }
+
+  function subagentDisplayName(message) {
+    const rawNickname = String(message?.subagent_nickname || '').trim();
+    const nickname = (
+      !rawNickname ||
+      rawNickname === '-' ||
+      /^subagent$/i.test(rawNickname) ||
+      extractLikelyAgentIDs(rawNickname).length > 0
+    ) ? '' : rawNickname;
+    const ids = [
+      ...(Array.isArray(message?.subagent_ids) ? message.subagent_ids : []),
+      ...extractLikelyAgentIDs(String(message?.subagent_target_id || '')),
+      ...extractLikelyAgentIDs(String(message?.subagent_prompt || '')),
+      ...extractLikelyAgentIDs(String(message?.subagent_summary || '')),
+      ...extractLikelyAgentIDs(JSON.stringify(message?.subagent_raw || {}))
+    ];
+    return String(
+      nickname ||
+      formatSubagentFallbackName(ids, message?.subagent_target_id || '')
+    ).trim();
+  }
+
+  function subagentDisplayRole(message) {
+    const tool = String(message?.subagent_tool || '').trim().toLowerCase();
+    if (tool && tool !== 'spawn_agent') {
+      return '';
+    }
+    const role = String(message?.subagent_role || '').trim();
+    if (role && role !== '-') return role;
+    return subagentDisplayName(message) ? 'subagent' : '';
+  }
+
+  function subagentDisplayTitle(message) {
+    const base = String(message?.subagent_title || message?.content || 'Subagent Activity').trim();
+    const name = subagentDisplayName(message);
+    const role = subagentDisplayRole(message);
+    if (/^waiting\b/i.test(base)) {
+      const safeName = name || 'subagent';
+      return `Waiting ${safeName}${role ? ` [${role}]` : ''}`;
+    }
+    if (!isGenericSubagentTitle(base)) return base;
+    if (name && /^spawned\b/i.test(base)) return `Spawned ${name}${role ? ` [${role}]` : ''}`;
+    if (name && /^waiting\b/i.test(base)) return `Waiting ${name}${role ? ` [${role}]` : ''}`;
+    return base;
+  }
+
+  function shouldHideRenderedMessage(message) {
+    if (String(message?.role || '').trim().toLowerCase() !== 'subagent') return false;
+    const title = String(subagentDisplayTitle(message) || '').trim().toLowerCase();
+    const status = String(message?.subagent_status || '').trim().toLowerCase();
+    return title.startsWith('waiting') && status !== 'running';
+  }
+
+  function dedupeAdjacentSpawnSubagentMessages(input) {
+    const src = Array.isArray(input) ? input : [];
+    const out = [];
+    for (const row of src) {
+      const current = row || {};
+      const role = String(current?.role || '').trim().toLowerCase();
+      if (role !== 'subagent') {
+        out.push(current);
+        continue;
+      }
+      const prev = out.length > 0 ? out[out.length - 1] : null;
+      const currentTool = String(current?.subagent_tool || '').trim().toLowerCase();
+      const prevTool = String(prev?.subagent_tool || '').trim().toLowerCase();
+      const currentTitle = String(current?.subagent_title || current?.content || '').trim().toLowerCase();
+      const prevTitle = String(prev?.subagent_title || prev?.content || '').trim().toLowerCase();
+      const currentIsSpawn = currentTool === 'spawn_agent' || /^spawned\b/i.test(currentTitle);
+      const prevIsSpawn = prevTool === 'spawn_agent' || /^spawned\b/i.test(prevTitle);
+      const currentStatus = String(current?.subagent_status || '').trim().toLowerCase();
+      const prevStatus = String(prev?.subagent_status || '').trim().toLowerCase();
+      const currentPrompt = normalizeSubagentPromptKey(current?.subagent_prompt || current?.subagent_summary || '');
+      const prevPrompt = normalizeSubagentPromptKey(prev?.subagent_prompt || prev?.subagent_summary || '');
+      const promptMatches = Boolean(
+        currentPrompt &&
+        prevPrompt &&
+        (currentPrompt === prevPrompt || currentPrompt.includes(prevPrompt) || prevPrompt.includes(currentPrompt))
+      );
+      const shouldMerge = Boolean(
+        prev &&
+        String(prev?.role || '').trim().toLowerCase() === 'subagent' &&
+        prevIsSpawn &&
+        currentIsSpawn &&
+        prevStatus === 'running' &&
+        (currentStatus === 'done' || currentStatus === 'failed') &&
+        (promptMatches || !currentPrompt || !prevPrompt)
+      );
+      if (!shouldMerge) {
+        out.push(current);
+        continue;
+      }
+      out[out.length - 1] = {
+        ...prev,
+        updated_at: String(current?.updated_at || prev?.updated_at || ''),
+        subagent_status: currentStatus,
+        subagent_phase: String(current?.subagent_phase || prev?.subagent_phase || '').trim().toLowerCase(),
+        subagent_title: subagentDisplayTitle(current) || subagentDisplayTitle(prev),
+        subagent_tool: String(current?.subagent_tool || prev?.subagent_tool || 'spawn_agent').trim(),
+        subagent_ids: [...new Set([...(Array.isArray(prev?.subagent_ids) ? prev.subagent_ids : []), ...(Array.isArray(current?.subagent_ids) ? current.subagent_ids : [])])],
+        subagent_target_id: String(current?.subagent_target_id || prev?.subagent_target_id || '').trim(),
+        subagent_nickname: choosePreferredSubagentName(
+          String(current?.subagent_nickname || '').trim() || subagentDisplayName(current),
+          String(prev?.subagent_nickname || '').trim() || subagentDisplayName(prev)
+        ),
+        subagent_role: choosePreferredSubagentRole(
+          String(current?.subagent_role || '').trim() || subagentDisplayRole(current),
+          String(prev?.subagent_role || '').trim() || subagentDisplayRole(prev)
+        ),
+        subagent_prompt: String(current?.subagent_prompt || prev?.subagent_prompt || '').trim(),
+        subagent_summary: String(current?.subagent_summary || prev?.subagent_summary || '').trim(),
+        subagent_raw: current?.subagent_raw || prev?.subagent_raw || {}
+      };
+    }
+    return out;
+  }
+
+  function openExecOutputModal(message) {
+    if (!message) return;
+    selectedExecEntry = {
+      command: String(message?.exec_command || message?.content || '-').trim() || '-',
+      status: normalizeExecStatus(message?.exec_status || 'running'),
+      exitCode: Number(message?.exec_exit_code || 0) || 0,
+      output: sanitizeSensitiveLogText(String(message?.exec_output || '').trim() || 'No output captured.'),
+      source: String(message?.exec_output_source || 'live').trim().toLowerCase(),
+      when: String(message?.updated_at || message?.created_at || '')
+    };
+    showExecOutputModal = true;
+  }
+
+  function closeExecOutputModal() {
+    showExecOutputModal = false;
+    selectedExecEntry = null;
+  }
+
+  function openSubagentDetailModal(message) {
+    if (!message) return;
+    const raw = message?.subagent_raw || {};
+    let rawText = '{}';
+    try {
+      rawText = JSON.stringify(raw, null, 2);
+    } catch {
+      rawText = '{}';
+    }
+    selectedSubagentEntry = {
+      title: String(message?.subagent_title || message?.content || 'Subagent Activity').trim(),
+      status: String(message?.subagent_status || 'done').trim().toLowerCase(),
+      tool: String(message?.subagent_tool || '').trim(),
+      nickname: String(message?.subagent_nickname || '').trim(),
+      role: String(message?.subagent_role || '').trim(),
+      targetID: String(message?.subagent_target_id || '').trim(),
+      ids: Array.isArray(message?.subagent_ids) ? message.subagent_ids.filter(Boolean) : [],
+      prompt: String(message?.subagent_prompt || '').trim(),
+      summary: String(message?.subagent_summary || '').trim(),
+      raw: sanitizeSensitiveLogText(rawText),
+      when: String(message?.updated_at || message?.created_at || '')
+    };
+    showSubagentDetailModal = true;
+  }
+
+  function closeSubagentDetailModal() {
+    showSubagentDetailModal = false;
+    selectedSubagentEntry = null;
+  }
+
+  function refreshActiveExecCommandFromMessages() {
+    const enriched = buildExecAwareMessages(messages, false);
+    const running = enriched
+      .filter((item) => String(item?.role || '').trim().toLowerCase() === 'exec' && normalizeExecStatus(item?.exec_status) === 'running');
+    const last = running.length > 0 ? running[running.length - 1] : null;
+    activeExecCommand = String(last?.exec_command || '').trim();
   }
 
   function setLogViewMode(mode) {
@@ -524,7 +1896,8 @@
     }
     try {
       const data = await req(`/api/coding/messages?session_id=${encodeURIComponent(sid)}`);
-      messages = compactActivityMessages(Array.isArray(data.messages) ? data.messages : []);
+      messages = Array.isArray(data.messages) ? data.messages : [];
+      refreshActiveExecCommandFromMessages();
       await tick();
       scrollMessagesToBottom();
     } finally {
@@ -739,6 +2112,8 @@
   async function selectSession(sessionID) {
     const sid = String(sessionID || '').trim();
     if (!sid || sid === activeSessionID) return;
+    closeExecOutputModal();
+    closeSubagentDetailModal();
     activeSessionID = sid;
     syncSessionIDToURL(sid);
     const selected = sessions.find((item) => item.id === sid);
@@ -766,6 +2141,8 @@
     }
     deleting = true;
     try {
+      closeExecOutputModal();
+      closeSubagentDetailModal();
       await req(`/api/coding/sessions?id=${encodeURIComponent(session.id)}`, { method: 'DELETE' });
       viewStatus = 'Session deleted.';
       await loadSessions({ autoSelect: true });
@@ -858,6 +2235,14 @@
         if (eventType === 'raw_event') {
           const text = sanitizeSensitiveLogText(String(evt?.text || '').trim());
           if (!text) return;
+          const parsedExec = parseExecEventFromPayload(parseRawEventPayload(text));
+          if (parsedExec?.command) {
+            if (parsedExec.status === 'running') {
+              activeExecCommand = parsedExec.command;
+            } else if (normalizeActivityCommandKey(parsedExec.command) === normalizeActivityCommandKey(activeExecCommand)) {
+              activeExecCommand = '';
+            }
+          }
           const id = appendStreamMetaMessage('event', text);
           if (id) streamedMetaIDs = [...streamedMetaIDs, id];
           scrollMessagesToBottom();
@@ -903,26 +2288,41 @@
       const assistantMessage = donePayload?.assistant;
       const eventMessages = Array.isArray(donePayload?.event_messages) ? donePayload.event_messages : [];
       const assistantMessages = Array.isArray(donePayload?.assistant_messages) ? donePayload.assistant_messages : [];
+      const hasLiveMeta = streamedMetaIDs.length > 0;
       streamingPending = false;
       messages = messages.filter(
         (item) =>
           item?.id !== pendingID &&
-          !streamedAssistantIDs.includes(item?.id) &&
-          !streamedMetaIDs.includes(item?.id)
+          !streamedAssistantIDs.includes(item?.id)
       );
       if (userMessage) messages = [...messages, userMessage];
       if (eventMessages.length > 0) {
-        messages = [...messages, ...eventMessages.map((item) => ({
+        const normalizedIncoming = eventMessages.map((item) => ({
           ...item,
           content: sanitizeSensitiveLogText(item?.content || '')
-        }))];
+        }));
+        if (!hasLiveMeta) {
+          messages = [...messages, ...normalizedIncoming];
+        } else {
+          const existingMetaKeys = new Set(
+            messages
+              .filter((item) => ['event', 'stderr', 'activity'].includes(String(item?.role || '').trim().toLowerCase()))
+              .map((item) => `${String(item?.role || '').trim().toLowerCase()}|${String(item?.content || '').trim()}`)
+          );
+          const missingFromLive = normalizedIncoming.filter((item) => {
+            const key = `${String(item?.role || '').trim().toLowerCase()}|${String(item?.content || '').trim()}`;
+            return !existingMetaKeys.has(key);
+          });
+          if (missingFromLive.length > 0) {
+            messages = [...messages, ...missingFromLive];
+          }
+        }
       }
       if (assistantMessages.length > 0) {
         messages = [...messages, ...assistantMessages];
       } else if (assistantMessage) {
         messages = [...messages, assistantMessage];
       }
-      messages = compactActivityMessages(messages);
       clearDraftForSession(session.id);
 
       if (donePayload?.session?.id) {
@@ -1171,6 +2571,99 @@
     });
   }
 
+  function wsStatusLabel(status) {
+    const v = String(status || '').trim().toLowerCase();
+    if (v === 'connected') return 'WS Connected';
+    if (v === 'connecting') return 'WS Connecting';
+    return 'WS Disconnected';
+  }
+
+  function closeWSHealthSocket() {
+    wsHealthKeepAlive = false;
+    if (wsHealthReconnectTimer) {
+      clearTimeout(wsHealthReconnectTimer);
+      wsHealthReconnectTimer = null;
+    }
+    if (wsHealthSocket) {
+      try {
+        wsHealthSocket.close();
+      } catch {
+      }
+      wsHealthSocket = null;
+    }
+    wsHealthStatus = 'disconnected';
+  }
+
+  function scheduleWSHealthReconnect(delayMs = 1200) {
+    if (!wsHealthKeepAlive) return;
+    if (wsHealthReconnectTimer) return;
+    wsHealthReconnectTimer = setTimeout(() => {
+      wsHealthReconnectTimer = null;
+      connectWSHealthSocket();
+    }, delayMs);
+  }
+
+  function connectWSHealthSocket() {
+    if (!wsHealthKeepAlive) return;
+    if (wsHealthSocket && (wsHealthSocket.readyState === WebSocket.OPEN || wsHealthSocket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const candidates = buildWSURLCandidates('/api/coding/ws');
+    if (candidates.length === 0) {
+      wsHealthStatus = 'disconnected';
+      scheduleWSHealthReconnect();
+      return;
+    }
+    wsHealthStatus = 'connecting';
+    let attemptIndex = 0;
+
+    const tryConnect = () => {
+      if (!wsHealthKeepAlive) return;
+      if (attemptIndex >= candidates.length) {
+        wsHealthStatus = 'disconnected';
+        scheduleWSHealthReconnect();
+        return;
+      }
+      const socket = new WebSocket(candidates[attemptIndex]);
+      attemptIndex += 1;
+      wsHealthSocket = socket;
+      let opened = false;
+
+      socket.onopen = () => {
+        if (wsHealthSocket !== socket) return;
+        opened = true;
+        wsHealthStatus = 'connected';
+      };
+
+      socket.onmessage = () => {};
+
+      socket.onerror = () => {
+        try {
+          socket.close();
+        } catch {
+        }
+      };
+
+      socket.onclose = () => {
+        if (wsHealthSocket === socket) {
+          wsHealthSocket = null;
+        }
+        if (!wsHealthKeepAlive) {
+          wsHealthStatus = 'disconnected';
+          return;
+        }
+        if (!opened) {
+          tryConnect();
+          return;
+        }
+        wsHealthStatus = 'disconnected';
+        scheduleWSHealthReconnect();
+      };
+    };
+
+    tryConnect();
+  }
+
   onMount(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -1185,12 +2678,24 @@
       viewStatus = String(error?.message || 'Failed to initialize coding sessions.');
     });
     refreshCodexIdentity().catch(() => {});
+    wsHealthKeepAlive = true;
+    connectWSHealthSocket();
   });
 
   $effect(() => {
     const sid = String(activeSessionID || '').trim();
     if (!sid) return;
     saveDraftForSession(sid, draftMessage);
+  });
+
+  $effect(() => {
+    const sid = String(activeSessionID || '').trim();
+    if (!sid) {
+      closeWSHealthSocket();
+      return;
+    }
+    wsHealthKeepAlive = true;
+    connectWSHealthSocket();
   });
 
   onDestroy(() => {
@@ -1210,6 +2715,7 @@
       }
       wsStreamSocket = null;
     }
+    closeWSHealthSocket();
   });
 </script>
 
@@ -1262,11 +2768,16 @@
               <p class="empty-note">Start by sending a coding instruction.</p>
             {:else}
               {#each renderedMessages as message (message.id)}
+                {#if !shouldHideRenderedMessage(message)}
                 <article class="coding-message {messageRoleClass(message)} {message.pending ? 'pending' : ''} {message.failed ? 'failed' : ''}">
                   <div class="coding-message-head">
                     <strong>
                       {#if message.role === 'assistant'}
                         {assistantDisplayName()}
+                      {:else if message.role === 'exec'}
+                        Terminal
+                      {:else if message.role === 'subagent'}
+                        Subagent
                       {:else if message.role === 'activity'}
                         Activity
                       {:else if message.role === 'event'}
@@ -1278,23 +2789,52 @@
                       {/if}
                     </strong>
                     <span>
-                      {#if message.failed}
+                      {#if message.role === 'exec'}
+                        {execStatusLabel(message.exec_status, message.exec_exit_code)}
+                      {:else if message.role === 'subagent'}
+                        {subagentStatusLabel(message.subagent_status)}
+                      {:else if message.failed}
                         Failed to send
                       {:else if !message.pending}
                         {formatWhen(message.created_at)}
                       {/if}
                     </span>
                   </div>
-                  <pre>{isMessageExpanded(message.id) ? (messageDisplayContent(message) || '-') : messagePreviewContent(messageDisplayContent(message) || '-')}</pre>
-                  {#if shouldCollapseContent(messageDisplayContent(message) || '')}
-                    <button class="btn btn-secondary btn-small coding-show-more" type="button" onclick={() => toggleMessageExpanded(message.id)}>
-                      {isMessageExpanded(message.id) ? 'Show less' : 'Show more'}
+                  {#if message.role === 'exec'}
+                    <div class="coding-exec-summary">
+                      <code class="mono" title={message.exec_command || message.content || '-'}>
+                        {message.exec_command || message.content || '-'}
+                      </code>
+                      <pre>{execOutputPreview(message)}</pre>
+                    </div>
+                    <button class="btn btn-secondary btn-small coding-exec-open" type="button" onclick={() => openExecOutputModal(message)}>
+                      View Output
                     </button>
-                  {/if}
-                  {#if message.pending && message.role === 'assistant' && !String(message.content || '').trim()}
-                    <p class="coding-message-status">Coding...</p>
+                  {:else if message.role === 'subagent'}
+                    <div class="coding-subagent-summary">
+                      <code class="mono" title={subagentDisplayTitle(message)}>
+                        {subagentDisplayTitle(message)}
+                      </code>
+                      {#if subagentPreview(message)}
+                        <pre>{subagentPreview(message)}</pre>
+                      {/if}
+                    </div>
+                    <button class="btn btn-secondary btn-small coding-subagent-open" type="button" onclick={() => openSubagentDetailModal(message)}>
+                      View Detail
+                    </button>
+                  {:else}
+                    <pre>{isMessageExpanded(message.id) ? (messageDisplayContent(message) || '-') : messagePreviewContent(messageDisplayContent(message) || '-')}</pre>
+                    {#if shouldCollapseContent(messageDisplayContent(message) || '')}
+                      <button class="btn btn-secondary btn-small coding-show-more" type="button" onclick={() => toggleMessageExpanded(message.id)}>
+                        {isMessageExpanded(message.id) ? 'Show less' : 'Show more'}
+                      </button>
+                    {/if}
+                    {#if message.pending && message.role === 'assistant' && !String(message.content || '').trim()}
+                      <p class="coding-message-status">Coding...</p>
+                    {/if}
                   {/if}
                 </article>
+                {/if}
               {/each}
             {/if}
           {/if}
@@ -1353,7 +2893,10 @@
   </div>
   <div class="coding-status-line" aria-live="polite">
     <div class="coding-status-main">
-      <span>{viewStatus}</span>
+      <span class="coding-status-ws {wsHealthStatus}">
+        [{wsStatusLabel(wsHealthStatus)}]
+      </span>
+      <span class="coding-status-text">{viewStatus}</span>
       {#if persistingSessionPrefs}
         <span class="coding-status-saving">Saving session settings...</span>
       {/if}
@@ -1365,6 +2908,63 @@
     {/if}
   </div>
 </section>
+
+{#if showExecOutputModal && selectedExecEntry}
+  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
+    <div class="modal-card modal-card-coding modal-card-exec-output" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeExecOutputModal()}>
+      <div class="modal-head">
+        <div>
+          <h3>Terminal Output</h3>
+          <p class="modal-subtitle">{execStatusLabel(selectedExecEntry.status, selectedExecEntry.exitCode)}</p>
+          <p class="setting-title">Source: {selectedExecEntry.source || 'live'}</p>
+        </div>
+        <button class="btn btn-secondary btn-small" onclick={closeExecOutputModal}>Close</button>
+      </div>
+      <div class="modal-body">
+        <p class="setting-title">Command</p>
+        <pre class="coding-exec-modal-command mono">{selectedExecEntry.command}</pre>
+        <p class="setting-title">Output</p>
+        <pre class="coding-exec-modal-output mono">{selectedExecEntry.output}</pre>
+        {#if selectedExecEntry.when}
+          <p class="setting-title">{formatWhen(selectedExecEntry.when)}</p>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showSubagentDetailModal && selectedSubagentEntry}
+  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
+    <div class="modal-card modal-card-coding modal-card-subagent-detail" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeSubagentDetailModal()}>
+      <div class="modal-head">
+        <div>
+          <h3>Subagent Detail</h3>
+          <p class="modal-subtitle">{subagentStatusLabel(selectedSubagentEntry.status)}</p>
+        </div>
+        <button class="btn btn-secondary btn-small" onclick={closeSubagentDetailModal}>Close</button>
+      </div>
+      <div class="modal-body">
+        <p class="setting-title">Activity</p>
+        <pre class="coding-subagent-modal-block mono">{selectedSubagentEntry.title}</pre>
+        <p class="setting-title">Tool</p>
+        <pre class="coding-subagent-modal-block mono">{selectedSubagentEntry.tool || '-'}</pre>
+        <p class="setting-title">Role / Target</p>
+        <pre class="coding-subagent-modal-block mono">{subagentDisplayName(selectedSubagentEntry) || '-'}{subagentDisplayRole(selectedSubagentEntry) ? ` [${subagentDisplayRole(selectedSubagentEntry)}]` : ''}{selectedSubagentEntry.targetID ? `\n${selectedSubagentEntry.targetID}` : ''}</pre>
+        <p class="setting-title">IDs</p>
+        <pre class="coding-subagent-modal-block mono">{selectedSubagentEntry.ids.length > 0 ? selectedSubagentEntry.ids.join('\n') : '-'}</pre>
+        <p class="setting-title">Prompt</p>
+        <pre class="coding-subagent-modal-block mono">{selectedSubagentEntry.prompt || '-'}</pre>
+        <p class="setting-title">Summary</p>
+        <pre class="coding-subagent-modal-block mono">{selectedSubagentEntry.summary || '-'}</pre>
+        <p class="setting-title">Raw Event</p>
+        <pre class="coding-subagent-modal-raw mono">{selectedSubagentEntry.raw}</pre>
+        {#if selectedSubagentEntry.when}
+          <p class="setting-title">{formatWhen(selectedSubagentEntry.when)}</p>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if showNewSessionModal}
   <div class="modal-backdrop modal-backdrop-coding" role="presentation">

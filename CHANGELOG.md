@@ -6,12 +6,18 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 
 ## [Unreleased]
 
-- No entries yet.
+### Web Coding (`/chat`)
+- Added runtime lifecycle metadata for coding sessions (`runtime_mode`, `runtime_status`, `restart_pending`) across coding session APIs.
+- Added runtime control APIs for chat orchestration: `PUT /api/coding/sessions/runtime`, `GET /api/coding/runtime/status`, and `POST /api/coding/runtime/restart`.
+- Added runtime lifecycle websocket events in `/api/coding/ws` (`runtime_started`, `runtime_status`, `runtime_error`) to improve Codex CLI parity on `/chat`.
+- Added deferred runtime-restart behavior when restart is requested during in-flight coding turns (`restart_scheduled` -> restart after turn finishes).
+- Added dedicated terminal execution bubbles in `/chat` with click-to-open modal for full command output, built from `activity` + raw Codex JSON stream events.
 
 ## [1.0.3] - 2026-03-22
 
 ### Web Coding (`/chat`)
 - Added dedicated `/chat` web coding workspace with full-screen chat layout and persisted session history.
+- Chat transport on `/chat` uses WebSocket (`/api/coding/ws`) for live event streaming.
 - Added workspace-aware new session flow with folder picker and server-side path suggestions.
 - Added session route targeting via query parameter (`/chat?id=<session_id>`) for direct open/resume behavior.
 - Added coding activity timeline rendering alongside assistant outputs in the web chat UI.

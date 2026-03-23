@@ -16,22 +16,22 @@ const (
 )
 
 type Account struct {
-	ID             string
-	Email          string
-	Alias          string
-	PlanType       string
-	AccountID      string
-	OrganizationID string
-	TokenID        string
-	TokenAccess    string
-	TokenRefresh   string
-	CodexHome      string
-	ActiveAPI      bool
-	ActiveCLI      bool
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	LastUsedAt     time.Time
-	Active         bool
+	ID                   string
+	Email                string
+	Alias                string
+	PlanType             string
+	AccountID            string
+	OrganizationID       string
+	TokenID              string
+	TokenAccess          string
+	TokenRefresh         string
+	CodexHome            string
+	ActiveAPI            bool
+	ActiveCLI            bool
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	LastUsedAt           time.Time
+	Active               bool
 	UsageHourlyPct       int
 	UsageWeeklyPct       int
 	UsageHourlyResetAt   *time.Time
@@ -71,15 +71,18 @@ type AuditRecord struct {
 }
 
 type CodingSession struct {
-	ID            string
-	Title         string
-	Model         string
-	WorkDir       string
-	SandboxMode   string
-	CodexThreadID string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	LastMessageAt time.Time
+	ID             string
+	Title          string
+	Model          string
+	WorkDir        string
+	SandboxMode    string
+	CodexThreadID  string
+	RuntimeMode    string
+	RuntimeStatus  string
+	RestartPending bool
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	LastMessageAt  time.Time
 }
 
 type CodingMessage struct {

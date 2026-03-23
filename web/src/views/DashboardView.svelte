@@ -17,11 +17,14 @@
     accountSearchQuery,
     accountTypeFilter,
     usageAvailabilityFilter,
+    accountStatusFilter,
     accountTypeOptions,
+    accountStatusOptions,
     usageAvailabilityOptions,
     onSetAccountSearchQuery,
     onSetAccountTypeFilter,
     onSetUsageAvailabilityFilter,
+    onSetAccountStatusFilter,
     onOpenAddAccountModal,
     onBackupAccounts,
     onRestoreAccounts,
@@ -68,6 +71,15 @@
       onchange={(event) => onSetAccountTypeFilter(event.currentTarget.value)}
     >
       {#each accountTypeOptions as option}
+        <option value={option.value}>{option.label}</option>
+      {/each}
+    </select>
+    <select
+      aria-label="Filter token status"
+      value={accountStatusFilter}
+      onchange={(event) => onSetAccountStatusFilter(event.currentTarget.value)}
+    >
+      {#each accountStatusOptions as option}
         <option value={option.value}>{option.label}</option>
       {/each}
     </select>

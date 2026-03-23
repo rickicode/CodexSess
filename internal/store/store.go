@@ -87,16 +87,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL
 		);`,
 		`CREATE TABLE IF NOT EXISTS coding_sessions (
-			id TEXT PRIMARY KEY,
-			title TEXT NOT NULL DEFAULT '',
-			model TEXT NOT NULL DEFAULT '',
-			work_dir TEXT NOT NULL DEFAULT '~/',
-			sandbox_mode TEXT NOT NULL DEFAULT 'full-access',
-			codex_thread_id TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			last_message_at TEXT NOT NULL
-		);`,
+				id TEXT PRIMARY KEY,
+				title TEXT NOT NULL DEFAULT '',
+				model TEXT NOT NULL DEFAULT '',
+				work_dir TEXT NOT NULL DEFAULT '~/',
+				sandbox_mode TEXT NOT NULL DEFAULT 'full-access',
+				codex_thread_id TEXT NOT NULL DEFAULT '',
+				runtime_mode TEXT NOT NULL DEFAULT 'spawn',
+				runtime_status TEXT NOT NULL DEFAULT 'idle',
+				restart_pending INTEGER NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				last_message_at TEXT NOT NULL
+			);`,
 		`CREATE TABLE IF NOT EXISTS coding_messages (
 			id TEXT PRIMARY KEY,
 			session_id TEXT NOT NULL,
@@ -171,6 +174,24 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'full-access'`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN runtime_mode TEXT NOT NULL DEFAULT 'spawn'`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN runtime_status TEXT NOT NULL DEFAULT 'idle'`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE coding_sessions ADD COLUMN restart_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
 		msg := strings.ToLower(err.Error())
 		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
 			return err
@@ -487,10 +508,16 @@ func (s *Store) CreateCodingSession(ctx context.Context, session CodingSession) 
 	if strings.TrimSpace(session.WorkDir) == "" {
 		session.WorkDir = "~/"
 	}
+	if strings.TrimSpace(session.RuntimeMode) == "" {
+		session.RuntimeMode = "spawn"
+	}
+	if strings.TrimSpace(session.RuntimeStatus) == "" {
+		session.RuntimeStatus = "idle"
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO coding_sessions(id,title,model,work_dir,sandbox_mode,codex_thread_id,created_at,updated_at,last_message_at)
-		VALUES(?,?,?,?,?,?,?,?,?)
-	`, session.ID, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.CreatedAt.UTC().Format(time.RFC3339), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339))
+		INSERT INTO coding_sessions(id,title,model,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+	`, session.ID, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.RuntimeMode, session.RuntimeStatus, boolToInt(session.RestartPending), session.CreatedAt.UTC().Format(time.RFC3339), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return CodingSession{}, err
 	}
@@ -499,7 +526,7 @@ func (s *Store) CreateCodingSession(ctx context.Context, session CodingSession) 
 
 func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,created_at,updated_at,last_message_at
+		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at
 		FROM coding_sessions
 		ORDER BY last_message_at DESC, updated_at DESC
 	`)
@@ -511,9 +538,11 @@ func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error)
 	for rows.Next() {
 		var session CodingSession
 		var createdAt, updatedAt, lastMessageAt string
-		if err := rows.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &createdAt, &updatedAt, &lastMessageAt); err != nil {
+		var restartPending int
+		if err := rows.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &session.RuntimeMode, &session.RuntimeStatus, &restartPending, &createdAt, &updatedAt, &lastMessageAt); err != nil {
 			return nil, err
 		}
+		session.RestartPending = restartPending != 0
 		session.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		session.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 		session.LastMessageAt, _ = time.Parse(time.RFC3339, lastMessageAt)
@@ -527,19 +556,21 @@ func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error)
 
 func (s *Store) GetCodingSession(ctx context.Context, id string) (CodingSession, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,created_at,updated_at,last_message_at
+		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at
 		FROM coding_sessions
 		WHERE id=?
 		LIMIT 1
 	`, strings.TrimSpace(id))
 	var session CodingSession
+	var restartPending int
 	var createdAt, updatedAt, lastMessageAt string
-	if err := row.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &createdAt, &updatedAt, &lastMessageAt); err != nil {
+	if err := row.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &session.RuntimeMode, &session.RuntimeStatus, &restartPending, &createdAt, &updatedAt, &lastMessageAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return session, fmt.Errorf("coding session not found")
 		}
 		return session, err
 	}
+	session.RestartPending = restartPending != 0
 	session.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	session.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
 	session.LastMessageAt, _ = time.Parse(time.RFC3339, lastMessageAt)
@@ -562,6 +593,12 @@ func (s *Store) UpdateCodingSession(ctx context.Context, session CodingSession) 
 	if strings.TrimSpace(session.SandboxMode) == "" {
 		session.SandboxMode = "full-access"
 	}
+	if strings.TrimSpace(session.RuntimeMode) == "" {
+		session.RuntimeMode = "spawn"
+	}
+	if strings.TrimSpace(session.RuntimeStatus) == "" {
+		session.RuntimeStatus = "idle"
+	}
 	if session.UpdatedAt.IsZero() {
 		session.UpdatedAt = time.Now().UTC()
 	}
@@ -570,9 +607,9 @@ func (s *Store) UpdateCodingSession(ctx context.Context, session CodingSession) 
 	}
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE coding_sessions
-		SET title=?, model=?, work_dir=?, sandbox_mode=?, codex_thread_id=?, updated_at=?, last_message_at=?
+		SET title=?, model=?, work_dir=?, sandbox_mode=?, codex_thread_id=?, runtime_mode=?, runtime_status=?, restart_pending=?, updated_at=?, last_message_at=?
 		WHERE id=?
-	`, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339), session.ID)
+	`, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.RuntimeMode, session.RuntimeStatus, boolToInt(session.RestartPending), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339), session.ID)
 	return err
 }
 

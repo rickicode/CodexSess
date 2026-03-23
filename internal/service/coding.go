@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -31,6 +32,261 @@ type CodingChatResult struct {
 	EventMessages []store.CodingMessage
 }
 
+type subagentIdentity struct {
+	Nickname  string
+	AgentType string
+	Prompt    string
+}
+
+type subagentIdentityState struct {
+	pendingByPrompt map[string]subagentIdentity
+	pendingByCallID map[string]subagentIdentity
+	byID            map[string]subagentIdentity
+}
+
+func normalizeSubagentIdentityKey(raw string) string {
+	return strings.TrimSpace(raw)
+}
+
+func firstStringFromMap(m map[string]any, keys ...string) string {
+	if m == nil {
+		return ""
+	}
+	for _, key := range keys {
+		if v, ok := m[key]; ok {
+			if s := strings.TrimSpace(asString(v)); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func extractToolName(m map[string]any) string {
+	if m == nil {
+		return ""
+	}
+	if fn, _ := m["function"].(map[string]any); fn != nil {
+		if name := strings.TrimSpace(firstStringFromMap(fn, "name", "tool_name")); name != "" {
+			return name
+		}
+	}
+	return strings.TrimSpace(firstStringFromMap(m, "name", "tool_name", "tool"))
+}
+
+func extractToolArguments(m map[string]any) any {
+	if m == nil {
+		return map[string]any{}
+	}
+	if fn, _ := m["function"].(map[string]any); fn != nil {
+		if v, ok := fn["arguments"]; ok {
+			return v
+		}
+		if v, ok := fn["input"]; ok {
+			return v
+		}
+	}
+	for _, key := range []string{"arguments", "input", "params", "payload"} {
+		if v, ok := m[key]; ok {
+			return v
+		}
+	}
+	return map[string]any{}
+}
+
+func extractStringSliceFromAny(v any) []string {
+	switch t := v.(type) {
+	case []string:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s := strings.TrimSpace(item); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, item := range t {
+			if s := strings.TrimSpace(asString(item)); s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func parseJSONStringMap(raw string) (map[string]any, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || (!strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[")) {
+		return nil, false
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &out); err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func parseSubagentIdentityFromToolCall(item map[string]any) (subagentIdentity, string, string, bool) {
+	if item == nil {
+		return subagentIdentity{}, "", "", false
+	}
+	itemType := strings.TrimSpace(strings.ToLower(asString(item["type"])))
+	if !strings.Contains(itemType, "tool_call") {
+		return subagentIdentity{}, "", "", false
+	}
+	toolName := strings.TrimSpace(strings.ToLower(extractToolName(item)))
+	if toolName != "spawn_agent" {
+		return subagentIdentity{}, "", "", false
+	}
+	argsRaw := extractToolArguments(item)
+	args := map[string]any{}
+	switch v := argsRaw.(type) {
+	case map[string]any:
+		args = v
+	case string:
+		if parsed, ok := parseJSONStringMap(v); ok {
+			args = parsed
+		}
+	}
+	nickname := strings.TrimSpace(asString(args["nickname"]))
+	if nickname == "" {
+		nickname = strings.TrimSpace(asString(args["name"]))
+	}
+	agentType := strings.TrimSpace(asString(args["agent_type"]))
+	if agentType == "" {
+		agentType = strings.TrimSpace(asString(args["agentType"]))
+	}
+	prompt := strings.TrimSpace(asString(args["message"]))
+	if prompt == "" {
+		prompt = strings.TrimSpace(asString(args["prompt"]))
+	}
+	if prompt == "" {
+		prompt = strings.TrimSpace(asString(item["prompt"]))
+	}
+	if nickname == "" && agentType == "" {
+		return subagentIdentity{}, prompt, strings.TrimSpace(firstStringFromMap(item, "call_id", "tool_call_id", "id")), false
+	}
+	return subagentIdentity{
+		Nickname:  nickname,
+		AgentType: agentType,
+		Prompt:    prompt,
+	}, prompt, strings.TrimSpace(firstStringFromMap(item, "call_id", "tool_call_id", "id")), true
+}
+
+func enrichSubagentEventRaw(raw string, state *subagentIdentityState) string {
+	if state == nil {
+		return raw
+	}
+	evt, ok := parseJSONStringMap(raw)
+	if !ok || evt == nil {
+		return raw
+	}
+	item, _ := evt["item"].(map[string]any)
+	if item == nil {
+		return raw
+	}
+	itemType := strings.TrimSpace(strings.ToLower(asString(item["type"])))
+	toolName := strings.TrimSpace(strings.ToLower(extractToolName(item)))
+	if toolName == "" {
+		return raw
+	}
+
+	if meta, prompt, callID, ok := parseSubagentIdentityFromToolCall(item); ok {
+		if state.pendingByPrompt == nil {
+			state.pendingByPrompt = map[string]subagentIdentity{}
+		}
+		if state.pendingByCallID == nil {
+			state.pendingByCallID = map[string]subagentIdentity{}
+		}
+		if key := normalizeSubagentIdentityKey(prompt); key != "" {
+			state.pendingByPrompt[key] = meta
+		}
+		if callID != "" {
+			state.pendingByCallID[callID] = meta
+		}
+	}
+
+	if !strings.Contains(itemType, "tool_call") {
+		return raw
+	}
+	if toolName != "spawn_agent" && toolName != "wait" && toolName != "wait_agent" {
+		return raw
+	}
+	ids := extractStringSliceFromAny(item["receiver_thread_ids"])
+	if len(ids) == 0 {
+		return raw
+	}
+	prompt := strings.TrimSpace(asString(item["prompt"]))
+	callID := strings.TrimSpace(firstStringFromMap(item, "call_id", "tool_call_id", "id"))
+
+	if state.byID == nil {
+		state.byID = map[string]subagentIdentity{}
+	}
+	lookupKey := normalizeSubagentIdentityKey(prompt)
+	meta, ok := state.pendingByPrompt[lookupKey]
+	if !ok && callID != "" {
+		meta, ok = state.pendingByCallID[callID]
+	}
+	if ok {
+		for _, id := range ids {
+			if strings.TrimSpace(id) == "" {
+				continue
+			}
+			state.byID[id] = meta
+		}
+	}
+	for _, id := range ids {
+		if _, exists := state.byID[id]; !exists {
+			continue
+		}
+		if state.byID[id].Nickname == "" && state.byID[id].AgentType == "" {
+			continue
+		}
+	}
+
+	agentsStates, _ := item["agents_states"].(map[string]any)
+	if agentsStates == nil {
+		agentsStates = map[string]any{}
+	}
+	updated := false
+	for _, id := range ids {
+		meta, ok := state.byID[id]
+		if !ok {
+			continue
+		}
+		if meta.Nickname == "" && meta.AgentType == "" {
+			continue
+		}
+		entry, _ := agentsStates[id].(map[string]any)
+		if entry == nil {
+			entry = map[string]any{}
+		}
+		if meta.Nickname != "" {
+			if _, exists := entry["nickname"]; !exists {
+				entry["nickname"] = meta.Nickname
+			}
+		}
+		if meta.AgentType != "" {
+			if _, exists := entry["agent_type"]; !exists {
+				entry["agent_type"] = meta.AgentType
+			}
+		}
+		agentsStates[id] = entry
+		updated = true
+	}
+	if updated {
+		item["agents_states"] = agentsStates
+		evt["item"] = item
+		if b, err := json.Marshal(evt); err == nil {
+			return string(b)
+		}
+	}
+	return raw
+}
+
 func (s *Service) ListCodingSessions(ctx context.Context) ([]store.CodingSession, error) {
 	return s.Store.ListCodingSessions(ctx)
 }
@@ -42,6 +298,8 @@ func (s *Service) CreateCodingSession(ctx context.Context, title, model, workDir
 		Model:         normalizeCodingModel(model),
 		WorkDir:       normalizeWorkDir(workDir),
 		SandboxMode:   normalizeCodingSandboxMode(sandboxMode),
+		RuntimeMode:   "spawn",
+		RuntimeStatus: "idle",
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
 		LastMessageAt: time.Now().UTC(),
@@ -129,12 +387,19 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 		}
 		prompt = buildContextHygienePrompt(buildSessionPromptWithIncoming(history, promptInput))
 	}
+	s.setCodingRuntimeState(runCtx, sid, "starting", nil)
 	unlockExec, err := s.acquireCodingExecLock(runCtx)
 	if err != nil {
+		s.setCodingRuntimeState(runCtx, sid, "error", nil)
 		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
 		return CodingChatResult{}, err
 	}
 	defer unlockExec()
+	s.setCodingRuntimeState(runCtx, sid, "running", nil)
+	defer func() {
+		s.setCodingRuntimeState(context.Background(), sid, "idle", nil)
+		s.finalizeDeferredCodingRestart(context.Background(), sid)
+	}()
 	_ = s.ensureCodingCLIAccountForCoding(runCtx)
 	codexHome := strings.TrimSpace(s.Cfg.CodexHome)
 
@@ -160,6 +425,7 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 		})
 	}
 	if err != nil {
+		s.setCodingRuntimeState(runCtx, sid, "error", nil)
 		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
 		return CodingChatResult{}, err
 	}
@@ -177,6 +443,7 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	assistantParts := normalizedAssistantParts(reply.Messages, reply.Text)
 	if len(assistantParts) == 0 {
 		emptyErr := fmt.Errorf("empty response from codex")
+		s.setCodingRuntimeState(runCtx, sid, "error", nil)
 		_ = s.appendCodingRunFailureMessage(runCtx, sid, emptyErr)
 		return CodingChatResult{}, emptyErr
 	}
@@ -210,7 +477,11 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	session.UpdatedAt = time.Now().UTC()
 	session.LastMessageAt = session.UpdatedAt
 	if strings.EqualFold(strings.TrimSpace(session.Title), "new session") {
-		session.Title = deriveSessionTitle(userVisibleContent)
+		titleSource := strings.TrimSpace(assistantMsg.Content)
+		if titleSource == "" {
+			titleSource = userVisibleContent
+		}
+		session.Title = deriveSessionTitle(titleSource)
 	}
 	if err := s.Store.UpdateCodingSession(ctx, session); err != nil {
 		return CodingChatResult{}, err
@@ -295,12 +566,19 @@ func (s *Service) SendCodingMessageStream(
 		}
 		prompt = buildContextHygienePrompt(buildSessionPromptWithIncoming(history, promptInput))
 	}
+	s.setCodingRuntimeState(runCtx, sid, "starting", nil)
 	unlockExec, err := s.acquireCodingExecLock(runCtx)
 	if err != nil {
+		s.setCodingRuntimeState(runCtx, sid, "error", nil)
 		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
 		return CodingChatResult{}, err
 	}
 	defer unlockExec()
+	s.setCodingRuntimeState(runCtx, sid, "running", nil)
+	defer func() {
+		s.setCodingRuntimeState(context.Background(), sid, "idle", nil)
+		s.finalizeDeferredCodingRestart(context.Background(), sid)
+	}()
 	_ = s.ensureCodingCLIAccountForCoding(runCtx)
 	codexHome := strings.TrimSpace(s.Cfg.CodexHome)
 
@@ -308,6 +586,7 @@ func (s *Service) SendCodingMessageStream(
 	var streamedText strings.Builder
 	persistedEvents := make([]store.CodingMessage, 0, codingEventPersistMax+1)
 	droppedEvents := 0
+	subagentState := &subagentIdentityState{}
 	reply, err := s.Codex.StreamChatWithOptions(runCtx, provider.ExecOptions{
 		CodexHome:   codexHome,
 		WorkDir:     resolvedWorkDir,
@@ -327,6 +606,9 @@ func (s *Service) SendCodingMessageStream(
 			return nil
 		}
 		delta := evt.Text
+		if eventType == "raw_event" {
+			delta = enrichSubagentEventRaw(delta, subagentState)
+		}
 		if delta == "" {
 			return nil
 		}
@@ -337,24 +619,24 @@ func (s *Service) SendCodingMessageStream(
 		if eventType == "delta" {
 			streamedText.WriteString(delta)
 		}
-			if role := roleFromCodingStreamEvent(eventType); role != "" {
-				item := store.CodingMessage{
-					ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
-					SessionID: sid,
-					Role:      role,
-					Content:   truncateRunes(delta, codingEventContentMaxRunes),
-					CreatedAt: time.Now().UTC(),
-				}
-				if len(persistedEvents) >= codingEventPersistMax {
-					droppedEvents++
-				} else {
-					saved, saveErr := s.Store.AppendCodingMessage(runCtx, item)
-					if saveErr != nil {
-						return saveErr
-					}
-					persistedEvents = append(persistedEvents, saved)
-				}
+		if role := roleFromCodingStreamEvent(eventType); role != "" {
+			item := store.CodingMessage{
+				ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+				SessionID: sid,
+				Role:      role,
+				Content:   truncateRunes(delta, codingEventContentMaxRunes),
+				CreatedAt: time.Now().UTC(),
 			}
+			if len(persistedEvents) >= codingEventPersistMax {
+				droppedEvents++
+			} else {
+				saved, saveErr := s.Store.AppendCodingMessage(runCtx, item)
+				if saveErr != nil {
+					return saveErr
+				}
+				persistedEvents = append(persistedEvents, saved)
+			}
+		}
 		if onEvent == nil {
 			return nil
 		}
@@ -377,6 +659,7 @@ func (s *Service) SendCodingMessageStream(
 		})
 	}
 	if err != nil {
+		s.setCodingRuntimeState(runCtx, sid, "error", nil)
 		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
 		return CodingChatResult{}, err
 	}
@@ -392,6 +675,7 @@ func (s *Service) SendCodingMessageStream(
 	}
 	if len(assistantParts) == 0 {
 		emptyErr := fmt.Errorf("empty response from codex")
+		s.setCodingRuntimeState(runCtx, sid, "error", nil)
 		_ = s.appendCodingRunFailureMessage(runCtx, sid, emptyErr)
 		return CodingChatResult{}, emptyErr
 	}
@@ -439,7 +723,11 @@ func (s *Service) SendCodingMessageStream(
 	session.UpdatedAt = time.Now().UTC()
 	session.LastMessageAt = session.UpdatedAt
 	if strings.EqualFold(strings.TrimSpace(session.Title), "new session") {
-		session.Title = deriveSessionTitle(userVisibleContent)
+		titleSource := strings.TrimSpace(assistantMsg.Content)
+		if titleSource == "" {
+			titleSource = userVisibleContent
+		}
+		session.Title = deriveSessionTitle(titleSource)
 	}
 	if err := s.Store.UpdateCodingSession(ctx, session); err != nil {
 		return CodingChatResult{}, err

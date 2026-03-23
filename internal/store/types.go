@@ -16,6 +16,8 @@ const (
 	SettingUsageAutoSwitchThreshold = "usage_auto_switch_threshold"
 	SettingUsageSchedulerEnabled    = "usage_scheduler_enabled"
 	SettingUsageSchedulerInterval   = "usage_scheduler_interval_minutes"
+	SettingUsageRefreshTimeoutSec   = "usage_scheduler_refresh_timeout_seconds"
+	SettingUsageSwitchTimeoutSec    = "usage_scheduler_switch_timeout_seconds"
 	SettingUsageCursor              = "usage_scheduler_cursor"
 )
 
@@ -86,6 +88,7 @@ type CodingSession struct {
 	ID             string
 	Title          string
 	Model          string
+	ReasoningLevel string
 	WorkDir        string
 	SandboxMode    string
 	CodexThreadID  string
@@ -105,6 +108,7 @@ type CodingMessage struct {
 	InputTokens  int
 	OutputTokens int
 	CreatedAt    time.Time
+	Sequence     int64
 }
 
 type ZoAPIKey struct {

@@ -31,9 +31,9 @@ type Service struct {
 	Codex  *provider.CodexExec
 
 	cliActiveMu       sync.RWMutex
+	cliAuthStateMu    sync.Mutex
 	cliActiveCachedID string
 	cliActiveCachedAt time.Time
-	codingExecMu      sync.Mutex
 	codingRunMu       sync.Mutex
 	codingRuns        map[string]*codingRunState
 }
@@ -41,6 +41,7 @@ type Service struct {
 type codingRunState struct {
 	startedAt time.Time
 	cancel    context.CancelFunc
+	forceKill func() error
 }
 
 type TokenSet struct {
@@ -79,6 +80,7 @@ type RestoreAccountsResult struct {
 }
 
 const accountsBackupVersion = "codexsess.accounts.backup.v1"
+const cliActiveCacheTTL = 1 * time.Second
 
 type cliSwitchReasonKey struct{}
 type apiSwitchReasonKey struct{}
@@ -266,13 +268,17 @@ func (s *Service) UseAccountCLI(ctx context.Context, selector string) (store.Acc
 	if err := s.ensureAccountUsableForActivation(ctx, a.ID); err != nil {
 		return store.Account{}, err
 	}
-	if err := s.syncAccountAuthToCodexHome(a); err != nil {
+	s.cliAuthStateMu.Lock()
+	if err := s.syncAccountAuthToCodexHomeUnlocked(a); err != nil {
+		s.cliAuthStateMu.Unlock()
 		return store.Account{}, err
 	}
 	if err := s.Store.SetActiveCLIAccount(ctx, a.ID); err != nil {
+		s.cliAuthStateMu.Unlock()
 		return store.Account{}, err
 	}
 	s.setCLIActiveCache(a.ID)
+	s.cliAuthStateMu.Unlock()
 	s.notifyCLISwitch(ctx, prevID, a)
 	if strings.TrimSpace(prevID) != strings.TrimSpace(a.ID) {
 		reason := cliSwitchReason(ctx)
@@ -408,9 +414,9 @@ func usageErrorLooksRevoked(raw string) bool {
 	if msg == "" {
 		return false
 	}
-	if strings.Contains(msg, "token_revoked") || 
-	   strings.Contains(msg, "invalidated oauth token") ||
-	   strings.Contains(msg, "token_invalidated") {
+	if strings.Contains(msg, "token_revoked") ||
+		strings.Contains(msg, "invalidated oauth token") ||
+		strings.Contains(msg, "token_invalidated") {
 		return true
 	}
 	if strings.Contains(msg, "account_suspended") || strings.Contains(msg, "account_deactivated") || strings.Contains(msg, "suspended") {
@@ -774,6 +780,12 @@ func (s *Service) APICodexHome(accountID string) string {
 }
 
 func (s *Service) syncAccountAuthToCodexHome(a store.Account) error {
+	s.cliAuthStateMu.Lock()
+	defer s.cliAuthStateMu.Unlock()
+	return s.syncAccountAuthToCodexHomeUnlocked(a)
+}
+
+func (s *Service) syncAccountAuthToCodexHomeUnlocked(a store.Account) error {
 	src := filepath.Join(s.accountDir(a.ID), "auth.json")
 	b, err := os.ReadFile(src)
 	if err != nil {
@@ -782,14 +794,125 @@ func (s *Service) syncAccountAuthToCodexHome(a store.Account) error {
 	if err := os.MkdirAll(s.Cfg.CodexHome, 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(s.Cfg.CodexHome, "auth.json"), b, 0o600); err != nil {
+	dst := filepath.Join(s.Cfg.CodexHome, "auth.json")
+	tmp, err := os.CreateTemp(s.Cfg.CodexHome, "auth.json.tmp-*")
+	if err != nil {
 		return err
 	}
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		_ = tmp.Close()
+		if !committed {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(b); err != nil {
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	replaced := false
+	var replaceErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		replaceErr = os.Rename(tmpPath, dst)
+		if replaceErr == nil {
+			replaced = true
+			break
+		}
+		if runtime.GOOS == "windows" {
+			replaceErr = replaceFileWindowsPreservingExisting(tmpPath, dst)
+			if replaceErr == nil {
+				replaced = true
+				break
+			}
+		}
+		if replaced {
+			break
+		}
+		if replaceErr == nil {
+			replaceErr = fmt.Errorf("replace auth.json failed")
+		}
+		if !isTransientFileReplaceError(replaceErr) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+	}
+	if !replaced {
+		return replaceErr
+	}
+	if runtime.GOOS != "windows" {
+		if err := syncDir(s.Cfg.CodexHome); err != nil {
+			return err
+		}
+	}
+	committed = true
 	s.setCLIActiveCache(a.ID)
 	return nil
 }
 
+func replaceFileWindowsPreservingExisting(tmpPath, dst string) error {
+	backupPath := fmt.Sprintf("%s.bak-%d-%d", dst, os.Getpid(), time.Now().UnixNano())
+	movedCurrent := false
+	if _, statErr := os.Stat(dst); statErr == nil {
+		if err := os.Rename(dst, backupPath); err != nil {
+			return err
+		}
+		movedCurrent = true
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+
+	replaceErr := os.Rename(tmpPath, dst)
+	if replaceErr == nil {
+		if movedCurrent {
+			_ = os.Remove(backupPath)
+		}
+		return nil
+	}
+	if !movedCurrent {
+		return replaceErr
+	}
+	if restoreErr := restoreFileWithRetry(backupPath, dst, 5); restoreErr != nil {
+		return fmt.Errorf("%w (restore original auth.json: %v)", replaceErr, restoreErr)
+	}
+	return replaceErr
+}
+
+func restoreFileWithRetry(src, dst string, attempts int) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for attempt := 0; attempt < attempts; attempt++ {
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 25 * time.Millisecond)
+	}
+	return err
+}
+
 func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
+	s.cliActiveMu.RLock()
+	if s.cliActiveCachedID != "" && time.Since(s.cliActiveCachedAt) < cliActiveCacheTTL {
+		id := s.cliActiveCachedID
+		s.cliActiveMu.RUnlock()
+		return id, nil
+	}
+	s.cliActiveMu.RUnlock()
+
+	s.cliAuthStateMu.Lock()
+	defer s.cliAuthStateMu.Unlock()
+
 	selected, err := s.Store.ActiveCLIAccount(ctx)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "account not found") {
@@ -803,7 +926,7 @@ func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
 	}
 
 	s.cliActiveMu.RLock()
-	if s.cliActiveCachedID != "" && s.cliActiveCachedID == selectedID && time.Since(s.cliActiveCachedAt) < 5*time.Second {
+	if s.cliActiveCachedID != "" && s.cliActiveCachedID == selectedID && time.Since(s.cliActiveCachedAt) < cliActiveCacheTTL {
 		id := s.cliActiveCachedID
 		s.cliActiveMu.RUnlock()
 		return id, nil
@@ -860,7 +983,7 @@ func (s *Service) ActiveCLIAccountID(ctx context.Context) (string, error) {
 		}
 	}
 	if needsHeal {
-		if err := s.syncAccountAuthToCodexHome(selected); err != nil {
+		if err := s.syncAccountAuthToCodexHomeUnlocked(selected); err != nil {
 			log.Printf("[cli-auth] active cli auth.json heal failed for %s: %v", selectedID, err)
 		}
 	}
@@ -873,6 +996,42 @@ func (s *Service) setCLIActiveCache(id string) {
 	s.cliActiveCachedID = strings.TrimSpace(id)
 	s.cliActiveCachedAt = time.Now()
 	s.cliActiveMu.Unlock()
+}
+
+func isTransientFileReplaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if msg == "" {
+		return false
+	}
+	if strings.Contains(msg, "resource busy") || strings.Contains(msg, "text file busy") {
+		return true
+	}
+	if strings.Contains(msg, "used by another process") {
+		return true
+	}
+	if strings.Contains(msg, "access is denied") {
+		return true
+	}
+	if strings.Contains(msg, "permission denied") {
+		return true
+	}
+	return false
+}
+
+func syncDir(dir string) error {
+	path := strings.TrimSpace(dir)
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 func (s *Service) notifyCLISwitch(ctx context.Context, fromID string, to store.Account) {

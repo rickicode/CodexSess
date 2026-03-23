@@ -291,18 +291,19 @@ func (s *Service) ListCodingSessions(ctx context.Context) ([]store.CodingSession
 	return s.Store.ListCodingSessions(ctx)
 }
 
-func (s *Service) CreateCodingSession(ctx context.Context, title, model, workDir, sandboxMode string) (store.CodingSession, error) {
+func (s *Service) CreateCodingSession(ctx context.Context, title, model, reasoningLevel, workDir, sandboxMode string) (store.CodingSession, error) {
 	session := store.CodingSession{
-		ID:            "sess_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
-		Title:         normalizeSessionTitle(title),
-		Model:         normalizeCodingModel(model),
-		WorkDir:       normalizeWorkDir(workDir),
-		SandboxMode:   normalizeCodingSandboxMode(sandboxMode),
-		RuntimeMode:   "spawn",
-		RuntimeStatus: "idle",
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
-		LastMessageAt: time.Now().UTC(),
+		ID:             "sess_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		Title:          normalizeSessionTitle(title),
+		Model:          normalizeCodingModel(model),
+		ReasoningLevel: normalizeCodingReasoningLevel(reasoningLevel),
+		WorkDir:        normalizeWorkDir(workDir),
+		SandboxMode:    normalizeCodingSandboxMode(sandboxMode),
+		RuntimeMode:    "spawn",
+		RuntimeStatus:  "idle",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+		LastMessageAt:  time.Now().UTC(),
 	}
 	return s.Store.CreateCodingSession(ctx, session)
 }
@@ -311,7 +312,7 @@ func (s *Service) DeleteCodingSession(ctx context.Context, sessionID string) err
 	return s.Store.DeleteCodingSession(ctx, strings.TrimSpace(sessionID))
 }
 
-func (s *Service) UpdateCodingSessionPreferences(ctx context.Context, sessionID, model, workDir, sandboxMode string) (store.CodingSession, error) {
+func (s *Service) UpdateCodingSessionPreferences(ctx context.Context, sessionID, model, reasoningLevel, workDir, sandboxMode string) (store.CodingSession, error) {
 	sid := strings.TrimSpace(sessionID)
 	if sid == "" {
 		return store.CodingSession{}, fmt.Errorf("session_id is required")
@@ -321,6 +322,7 @@ func (s *Service) UpdateCodingSessionPreferences(ctx context.Context, sessionID,
 		return store.CodingSession{}, err
 	}
 	session.Model = normalizeCodingModel(firstNonEmpty(model, session.Model))
+	session.ReasoningLevel = normalizeCodingReasoningLevel(firstNonEmpty(reasoningLevel, session.ReasoningLevel))
 	session.WorkDir = normalizeWorkDir(firstNonEmpty(workDir, session.WorkDir))
 	session.SandboxMode = normalizeCodingSandboxMode(firstNonEmpty(sandboxMode, session.SandboxMode))
 	session.UpdatedAt = time.Now().UTC()
@@ -352,7 +354,7 @@ func (s *Service) GetCodingMessagesPage(ctx context.Context, sessionID string, l
 	return s.Store.ListCodingMessagesPage(ctx, sid, limit, strings.TrimSpace(beforeID))
 }
 
-func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, model, workDirOverride, sandboxModeOverride, command string) (CodingChatResult, error) {
+func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, model, reasoningLevel, workDirOverride, sandboxModeOverride, command string) (CodingChatResult, error) {
 	sid := strings.TrimSpace(sessionID)
 	if sid == "" {
 		return CodingChatResult{}, fmt.Errorf("session_id is required")
@@ -376,6 +378,7 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 		return CodingChatResult{}, err
 	}
 	useModel := normalizeCodingModel(firstNonEmpty(model, session.Model))
+	useReasoningLevel := normalizeCodingReasoningLevel(firstNonEmpty(reasoningLevel, session.ReasoningLevel))
 	useWorkDir := normalizeWorkDir(firstNonEmpty(workDirOverride, session.WorkDir))
 	useSandboxMode := normalizeCodingSandboxMode(firstNonEmpty(sandboxModeOverride, session.SandboxMode))
 	resolvedWorkDir, err := expandWorkDir(useWorkDir)
@@ -402,13 +405,6 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 		prompt = buildContextHygienePrompt(buildSessionPromptWithIncoming(history, promptInput))
 	}
 	s.setCodingRuntimeState(runCtx, sid, "starting", nil)
-	unlockExec, err := s.acquireCodingExecLock(runCtx)
-	if err != nil {
-		s.setCodingRuntimeState(runCtx, sid, "error", nil)
-		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
-		return CodingChatResult{}, err
-	}
-	defer unlockExec()
 	s.setCodingRuntimeState(runCtx, sid, "running", nil)
 	defer func() {
 		s.setCodingRuntimeState(context.Background(), sid, "idle", nil)
@@ -418,24 +414,32 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	codexHome := strings.TrimSpace(s.Cfg.CodexHome)
 
 	reply, err := s.Codex.ChatWithOptions(runCtx, provider.ExecOptions{
-		CodexHome:   codexHome,
-		WorkDir:     resolvedWorkDir,
-		Model:       useModel,
-		Prompt:      prompt,
-		ResumeID:    resumeID,
-		Persist:     true,
-		SandboxMode: useSandboxMode,
-		CommandMode: commandMode,
+		CodexHome:       codexHome,
+		WorkDir:         resolvedWorkDir,
+		Model:           useModel,
+		ReasoningEffort: useReasoningLevel,
+		Prompt:          prompt,
+		ResumeID:        resumeID,
+		Persist:         true,
+		SandboxMode:     useSandboxMode,
+		CommandMode:     commandMode,
+		OnProcessStart: func(_ int, forceKill func() error) {
+			s.setCodingRunForceStop(sid, forceKill)
+		},
 	})
 	if err != nil && resumeID != "" && shouldStartNewThreadFromResumeError(err) {
 		reply, err = s.Codex.ChatWithOptions(runCtx, provider.ExecOptions{
-			CodexHome:   codexHome,
-			WorkDir:     resolvedWorkDir,
-			Model:       useModel,
-			Prompt:      buildCodingPrompt(commandMode, promptInput),
-			Persist:     true,
-			SandboxMode: useSandboxMode,
-			CommandMode: commandMode,
+			CodexHome:       codexHome,
+			WorkDir:         resolvedWorkDir,
+			Model:           useModel,
+			ReasoningEffort: useReasoningLevel,
+			Prompt:          buildCodingPrompt(commandMode, promptInput),
+			Persist:         true,
+			SandboxMode:     useSandboxMode,
+			CommandMode:     commandMode,
+			OnProcessStart: func(_ int, forceKill func() error) {
+				s.setCodingRunForceStop(sid, forceKill)
+			},
 		})
 	}
 	if err != nil {
@@ -483,6 +487,7 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	assistantMsg := assistants[len(assistants)-1]
 
 	session.Model = useModel
+	session.ReasoningLevel = useReasoningLevel
 	session.WorkDir = useWorkDir
 	session.SandboxMode = useSandboxMode
 	if tid := strings.TrimSpace(reply.ThreadID); tid != "" {
@@ -517,6 +522,7 @@ func (s *Service) SendCodingMessageStream(
 	sessionID,
 	content,
 	model,
+	reasoningLevel,
 	workDirOverride string,
 	sandboxModeOverride string,
 	command string,
@@ -545,6 +551,7 @@ func (s *Service) SendCodingMessageStream(
 		return CodingChatResult{}, err
 	}
 	useModel := normalizeCodingModel(firstNonEmpty(model, session.Model))
+	useReasoningLevel := normalizeCodingReasoningLevel(firstNonEmpty(reasoningLevel, session.ReasoningLevel))
 	useWorkDir := normalizeWorkDir(firstNonEmpty(workDirOverride, session.WorkDir))
 	useSandboxMode := normalizeCodingSandboxMode(firstNonEmpty(sandboxModeOverride, session.SandboxMode))
 	resolvedWorkDir, err := expandWorkDir(useWorkDir)
@@ -581,13 +588,6 @@ func (s *Service) SendCodingMessageStream(
 		prompt = buildContextHygienePrompt(buildSessionPromptWithIncoming(history, promptInput))
 	}
 	s.setCodingRuntimeState(runCtx, sid, "starting", nil)
-	unlockExec, err := s.acquireCodingExecLock(runCtx)
-	if err != nil {
-		s.setCodingRuntimeState(runCtx, sid, "error", nil)
-		_ = s.appendCodingRunFailureMessage(runCtx, sid, err)
-		return CodingChatResult{}, err
-	}
-	defer unlockExec()
 	s.setCodingRuntimeState(runCtx, sid, "running", nil)
 	defer func() {
 		s.setCodingRuntimeState(context.Background(), sid, "idle", nil)
@@ -602,14 +602,18 @@ func (s *Service) SendCodingMessageStream(
 	droppedEvents := 0
 	subagentState := &subagentIdentityState{}
 	reply, err := s.Codex.StreamChatWithOptions(runCtx, provider.ExecOptions{
-		CodexHome:   codexHome,
-		WorkDir:     resolvedWorkDir,
-		Model:       useModel,
-		Prompt:      prompt,
-		ResumeID:    resumeID,
-		Persist:     true,
-		SandboxMode: useSandboxMode,
-		CommandMode: commandMode,
+		CodexHome:       codexHome,
+		WorkDir:         resolvedWorkDir,
+		Model:           useModel,
+		ReasoningEffort: useReasoningLevel,
+		Prompt:          prompt,
+		ResumeID:        resumeID,
+		Persist:         true,
+		SandboxMode:     useSandboxMode,
+		CommandMode:     commandMode,
+		OnProcessStart: func(_ int, forceKill func() error) {
+			s.setCodingRunForceStop(sid, forceKill)
+		},
 	}, func(evt provider.ChatEvent) error {
 		eventType := strings.TrimSpace(strings.ToLower(evt.Type))
 		if eventType != "delta" &&
@@ -658,13 +662,17 @@ func (s *Service) SendCodingMessageStream(
 	})
 	if err != nil && resumeID != "" && shouldStartNewThreadFromResumeError(err) {
 		reply, err = s.Codex.StreamChatWithOptions(runCtx, provider.ExecOptions{
-			CodexHome:   codexHome,
-			WorkDir:     resolvedWorkDir,
-			Model:       useModel,
-			Prompt:      buildCodingPrompt(commandMode, promptInput),
-			Persist:     true,
-			SandboxMode: useSandboxMode,
-			CommandMode: commandMode,
+			CodexHome:       codexHome,
+			WorkDir:         resolvedWorkDir,
+			Model:           useModel,
+			ReasoningEffort: useReasoningLevel,
+			Prompt:          buildCodingPrompt(commandMode, promptInput),
+			Persist:         true,
+			SandboxMode:     useSandboxMode,
+			CommandMode:     commandMode,
+			OnProcessStart: func(_ int, forceKill func() error) {
+				s.setCodingRunForceStop(sid, forceKill)
+			},
 		}, func(evt provider.ChatEvent) error {
 			if onEvent == nil {
 				return nil
@@ -729,6 +737,7 @@ func (s *Service) SendCodingMessageStream(
 	assistantMsg := assistants[len(assistants)-1]
 
 	session.Model = useModel
+	session.ReasoningLevel = useReasoningLevel
 	session.WorkDir = useWorkDir
 	session.SandboxMode = useSandboxMode
 	if tid := strings.TrimSpace(reply.ThreadID); tid != "" {
@@ -757,23 +766,6 @@ func (s *Service) SendCodingMessageStream(
 		Assistants:    assistants,
 		EventMessages: persistedEvents,
 	}, nil
-}
-
-func (s *Service) acquireCodingExecLock(ctx context.Context) (func(), error) {
-	for {
-		if s.codingExecMu.TryLock() {
-			return func() { s.codingExecMu.Unlock() }, nil
-		}
-		select {
-		case <-ctx.Done():
-			err := ctx.Err()
-			if err == nil {
-				err = fmt.Errorf("coding execution canceled")
-			}
-			return nil, err
-		case <-time.After(40 * time.Millisecond):
-		}
-	}
 }
 
 func (s *Service) beginCodingRun(sessionID string) (func(), error) {
@@ -814,7 +806,7 @@ func (s *Service) CodingRunStatus(sessionID string) (bool, time.Time) {
 	return true, runState.startedAt
 }
 
-func (s *Service) StopCodingRun(sessionID string) bool {
+func (s *Service) StopCodingRun(sessionID string, force bool) bool {
 	sid := strings.TrimSpace(sessionID)
 	if sid == "" {
 		return false
@@ -822,12 +814,19 @@ func (s *Service) StopCodingRun(sessionID string) bool {
 	s.codingRunMu.Lock()
 	runState := s.codingRuns[sid]
 	cancel := context.CancelFunc(nil)
+	forceKill := func() error { return nil }
 	if runState != nil {
 		cancel = runState.cancel
+		if runState.forceKill != nil {
+			forceKill = runState.forceKill
+		}
 	}
 	s.codingRunMu.Unlock()
 	if cancel == nil {
 		return false
+	}
+	if force {
+		_ = forceKill()
 	}
 	cancel()
 	return true
@@ -845,6 +844,20 @@ func (s *Service) setCodingRunCancel(sessionID string, cancel context.CancelFunc
 		return
 	}
 	runState.cancel = cancel
+}
+
+func (s *Service) setCodingRunForceStop(sessionID string, forceKill func() error) {
+	sid := strings.TrimSpace(sessionID)
+	if sid == "" || forceKill == nil {
+		return
+	}
+	s.codingRunMu.Lock()
+	defer s.codingRunMu.Unlock()
+	runState := s.codingRuns[sid]
+	if runState == nil {
+		return
+	}
+	runState.forceKill = forceKill
 }
 
 func roleFromCodingStreamEvent(eventType string) string {
@@ -884,8 +897,6 @@ func (s *Service) appendCodingRunFailureMessage(ctx context.Context, sessionID s
 	_ = s.Store.UpdateCodingSession(ctx, session)
 	return nil
 }
-
-
 
 func firstSessionID(items []store.CodingMessage) string {
 	for _, item := range items {
@@ -1066,6 +1077,7 @@ func (s *Service) handleLocalStatusCommand(
 	}
 
 	session.Model = normalizeCodingModel(firstNonEmpty(model, session.Model))
+	session.ReasoningLevel = normalizeCodingReasoningLevel(session.ReasoningLevel)
 	session.WorkDir = normalizeWorkDir(firstNonEmpty(workDir, session.WorkDir))
 	session.SandboxMode = normalizeCodingSandboxMode(firstNonEmpty(sandboxMode, session.SandboxMode))
 	session.UpdatedAt = time.Now().UTC()
@@ -1140,6 +1152,7 @@ func (s *Service) persistLocalCommandResponse(
 		return CodingChatResult{}, err
 	}
 	session.Model = normalizeCodingModel(firstNonEmpty(model, session.Model))
+	session.ReasoningLevel = normalizeCodingReasoningLevel(session.ReasoningLevel)
 	session.WorkDir = normalizeWorkDir(firstNonEmpty(workDir, session.WorkDir))
 	session.SandboxMode = normalizeCodingSandboxMode(firstNonEmpty(sandboxMode, session.SandboxMode))
 	session.UpdatedAt = time.Now().UTC()
@@ -1270,6 +1283,16 @@ func normalizeCodingModel(model string) string {
 	return clean
 }
 
+func normalizeCodingReasoningLevel(level string) string {
+	clean := strings.TrimSpace(strings.ToLower(level))
+	switch clean {
+	case "low", "high":
+		return clean
+	default:
+		return "medium"
+	}
+}
+
 func normalizeWorkDir(workDir string) string {
 	clean := strings.TrimSpace(workDir)
 	if clean == "" {
@@ -1321,7 +1344,10 @@ func deriveSessionTitle(firstUserMessage string) string {
 }
 
 func (s *Service) ensureCodingCLIAccountForCoding(ctx context.Context) error {
-	currentID, _ := s.ActiveCLIAccountID(ctx)
+	currentID, err := s.ActiveCLIAccountID(ctx)
+	if err != nil {
+		return err
+	}
 	currentID = strings.TrimSpace(currentID)
 	if currentID != "" {
 		return nil

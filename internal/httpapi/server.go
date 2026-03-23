@@ -74,6 +74,8 @@ const (
 	usageSchedulerParallelWorkers  = 2
 	usageSchedulerLoopPollInterval = 1 * time.Minute
 	usageSchedulerRetryCooldown    = 2 * time.Minute
+	cliRoundRobinRecentReuseWindow = 15 * time.Minute
+	cliRoundRobinSmallPoolSize     = 2
 	autoSwitchUsageFreshness       = 5 * time.Minute
 	invalidToolCacheTTL            = 20 * time.Minute
 	claudeTokenSoftLimitDefault    = 14000
@@ -215,24 +217,23 @@ func (s *Server) runUsageSchedulerTickIfDue(parent context.Context) {
 }
 
 func (s *Server) runUsageSchedulerTick(parent context.Context) {
-	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
-	defer cancel()
-
 	enabled, threshold, cliStrategy, intervalMinutes := s.currentUsageSchedulerState()
 	if !enabled {
 		return
 	}
+	refreshTimeout, switchTimeout := s.currentUsageSchedulerTimeouts()
 	nowMS := time.Now().UTC().UnixMilli()
 	s.lastAllAttemptAt.Store(nowMS)
 	s.lastActiveCheckAt.Store(nowMS)
 
 	var tickErr bool
-	refreshed, total, nextCursor, err := s.refreshUsageBatchedByCursor(ctx, usageSchedulerWorkerPercent, usageSchedulerParallelWorkers)
+	refreshCtx, refreshCancel := context.WithTimeout(parent, refreshTimeout)
+	refreshed, total, nextCursor, err := s.refreshUsageBatchedByCursor(refreshCtx, usageSchedulerWorkerPercent, usageSchedulerParallelWorkers)
 	if err != nil {
 		tickErr = true
 		log.Printf("[usage-scheduler] refresh tick failed: %v", err)
 	} else {
-		s.svc.AddSystemLog(ctx, "usage_refresh", "Scheduled usage refresh", map[string]any{
+		s.svc.AddSystemLog(refreshCtx, "usage_refresh", "Scheduled usage refresh", map[string]any{
 			"all":          false,
 			"source":       "auto",
 			"refreshed":    refreshed,
@@ -243,12 +244,16 @@ func (s *Server) runUsageSchedulerTick(parent context.Context) {
 			"tick_seconds": intervalMinutes * 60,
 		})
 	}
+	refreshCancel()
 
-	if err := s.autoSwitchAPIIfNeeded(ctx, threshold); err != nil {
+	switchCtx, switchCancel := context.WithTimeout(parent, switchTimeout)
+	defer switchCancel()
+
+	if err := s.autoSwitchAPIIfNeeded(switchCtx, threshold); err != nil {
 		tickErr = true
 		log.Printf("[autoswitch] api check failed: %v", err)
 	}
-	if err := s.autoSwitchCLIIfNeeded(ctx, threshold, cliStrategy); err != nil {
+	if err := s.autoSwitchCLIIfNeeded(switchCtx, threshold, cliStrategy); err != nil {
 		tickErr = true
 		log.Printf("[autoswitch] cli check failed: %v", err)
 	}
@@ -408,7 +413,7 @@ func (s *Server) saveUsageSchedulerCursor(ctx context.Context, cursor int) error
 func (s *Server) currentUsageSchedulerState() (bool, int, string, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	enabled := true
+	enabled := s.svc.Cfg.UsageSchedulerEnabled
 	threshold := s.svc.Cfg.UsageAutoSwitchThreshold
 	cliStrategy := config.NormalizeCodingCLIStrategy(s.svc.Cfg.CodingCLIStrategy)
 	intervalMinutes := config.NormalizeUsageSchedulerIntervalMinutes(s.svc.Cfg.UsageSchedulerInterval)
@@ -424,6 +429,14 @@ func (s *Server) currentUsageSchedulerState() (bool, int, string, int) {
 		threshold = 100
 	}
 	return enabled, threshold, cliStrategy, intervalMinutes
+}
+
+func (s *Server) currentUsageSchedulerTimeouts() (time.Duration, time.Duration) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	refreshSec := config.NormalizeUsageRefreshTimeoutSeconds(s.svc.Cfg.UsageRefreshTimeoutSec)
+	switchSec := config.NormalizeUsageSwitchTimeoutSeconds(s.svc.Cfg.UsageSwitchTimeoutSec)
+	return time.Duration(refreshSec) * time.Second, time.Duration(switchSec) * time.Second
 }
 
 func (s *Server) runUsageAutoSwitchActiveOnce(parent context.Context) {
@@ -495,48 +508,121 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 		if loadErr != nil {
 			return loadErr
 		}
+		if len(candidates) == 0 && !hasActive {
+			fallback, fallbackErr := s.listCLINonRevokedAccounts(ctx)
+			if fallbackErr != nil {
+				return fallbackErr
+			}
+			if len(fallback) == 0 {
+				s.setCLISwitchStatus(cliSwitchStatus{
+					At:         time.Now().UTC().UnixMilli(),
+					From:       "",
+					Reason:     "skip",
+					Strategy:   "round_robin",
+					Error:      "no_fallback_accounts",
+					Candidates: 0,
+				})
+				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin skipped", map[string]any{
+					"from":       "",
+					"reason":     "no_fallback_accounts",
+					"strategy":   "round_robin",
+					"candidates": 0,
+				})
+				log.Printf("[autoswitch] cli round_robin skipped: no fallback accounts")
+				return nil
+			}
+			var (
+				targetID     string
+				attemptedIDs []string
+				recoverErr   error
+			)
+			for _, fb := range fallback {
+				id := strings.TrimSpace(fb.ID)
+				if id == "" {
+					continue
+				}
+				attemptedIDs = append(attemptedIDs, id)
+				targetID = id
+				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), id); err == nil {
+					recoverErr = nil
+					break
+				} else {
+					recoverErr = err
+					log.Printf("[autoswitch] cli round_robin fallback attempt failed for %s: %v", id, err)
+					if !isRetryableCLIRecoveryError(err) {
+						break
+					}
+				}
+			}
+			attemptedText := strings.Join(attemptedIDs, ",")
+			if recoverErr == nil && targetID != "" {
+				s.setCLISwitchStatus(cliSwitchStatus{
+					At:         time.Now().UTC().UnixMilli(),
+					From:       "",
+					To:         targetID,
+					Reason:     "recover_empty_active_cli",
+					Strategy:   "round_robin",
+					Candidates: 0,
+				})
+				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI active recovered", map[string]any{
+					"from":       "",
+					"to":         targetID,
+					"reason":     "recover_empty_active_cli",
+					"strategy":   "round_robin",
+					"candidates": 0,
+					"attempted":  attemptedIDs,
+				})
+				log.Printf("[autoswitch] cli active recovered via fallback: to=%s attempted=%s", targetID, attemptedText)
+			} else {
+				errMsg := "recover_failed"
+				if recoverErr != nil {
+					errMsg = recoverErr.Error()
+				}
+				if attemptedText != "" {
+					errMsg = fmt.Sprintf("attempted=%s last_error=%s", attemptedText, errMsg)
+				}
+				s.setCLISwitchStatus(cliSwitchStatus{
+					At:         time.Now().UTC().UnixMilli(),
+					From:       "",
+					To:         targetID,
+					Reason:     "recover_empty_active_cli",
+					Strategy:   "round_robin",
+					Error:      errMsg,
+					Candidates: 0,
+				})
+				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI active recovery failed", map[string]any{
+					"from":       "",
+					"to":         targetID,
+					"reason":     "recover_empty_active_cli",
+					"strategy":   "round_robin",
+					"error":      errMsg,
+					"candidates": 0,
+					"attempted":  attemptedIDs,
+				})
+				log.Printf("[autoswitch] cli active recovery failed: attempted=%s err=%s", attemptedText, errMsg)
+			}
+			return nil
+		}
 		if len(candidates) <= 1 {
 			if hasActive && len(candidates) == 1 && strings.TrimSpace(candidates[0].account.ID) == strings.TrimSpace(activeID) {
 				targetID := strings.TrimSpace(candidates[0].account.ID)
-				targetScore := candidates[0].score
-				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), targetID); err == nil {
-					s.setCLISwitchStatus(cliSwitchStatus{
-						At:         time.Now().UTC().UnixMilli(),
-						From:       targetID,
-						To:         targetID,
-						Reason:     "refresh_current_single",
-						Strategy:   "round_robin",
-						Candidates: 1,
-					})
-					s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI active refreshed", map[string]any{
-						"from":       targetID,
-						"to":         targetID,
-						"reason":     "refresh_current_single",
-						"strategy":   "round_robin",
-						"score":      targetScore,
-						"candidates": 1,
-					})
-					log.Printf("[autoswitch] cli active refreshed on %s (strategy=round_robin score=%d single-candidate)", targetID, targetScore)
-				} else {
-					s.setCLISwitchStatus(cliSwitchStatus{
-						At:         time.Now().UTC().UnixMilli(),
-						From:       targetID,
-						To:         targetID,
-						Reason:     "refresh_current_single",
-						Strategy:   "round_robin",
-						Error:      err.Error(),
-						Candidates: 1,
-					})
-					s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI active refresh failed", map[string]any{
-						"from":       targetID,
-						"to":         targetID,
-						"reason":     "refresh_current_single",
-						"strategy":   "round_robin",
-						"score":      targetScore,
-						"error":      err.Error(),
-						"candidates": 1,
-					})
-				}
+				s.setCLISwitchStatus(cliSwitchStatus{
+					At:         time.Now().UTC().UnixMilli(),
+					From:       targetID,
+					To:         targetID,
+					Reason:     "skip",
+					Strategy:   "round_robin",
+					Error:      "single_candidate_active",
+					Candidates: 1,
+				})
+				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin skipped", map[string]any{
+					"from":       targetID,
+					"to":         targetID,
+					"reason":     "single_candidate_active",
+					"strategy":   "round_robin",
+					"candidates": 1,
+				})
+				log.Printf("[autoswitch] cli round_robin skipped: single candidate already active (%s)", targetID)
 				return nil
 			}
 			if !hasActive && len(candidates) == 1 && strings.TrimSpace(candidates[0].account.ID) != "" {
@@ -597,47 +683,20 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 		}
 		if len(candidates) > 1 {
 			log.Printf("[autoswitch] cli round_robin candidates: %s", formatCLICandidates(candidates))
+			now := time.Now().UTC()
+			selectionPool, recentApplied := selectRoundRobinCLIPool(candidates, activeID, now, cliRoundRobinRecentReuseWindow)
+
 			tried := map[string]struct{}{}
 			var lastErr error
 			switched := false
-			for len(tried) < len(candidates) {
-				target, ok := pickWeightedRandomCLICandidateExcluding(candidates, "", tried)
+			for len(tried) < len(selectionPool) {
+				target, ok := pickWeightedRandomCLICandidateExcluding(selectionPool, activeID, tried)
 				if !ok || strings.TrimSpace(target.ID) == "" {
 					break
 				}
-				tried[strings.TrimSpace(target.ID)] = struct{}{}
 				targetID := strings.TrimSpace(target.ID)
+				tried[targetID] = struct{}{}
 				targetScore := findCLICandidateScore(candidates, targetID)
-				if hasActive && targetID == strings.TrimSpace(active.ID) {
-					// Keep auth.json synchronized every cycle when current account
-					// still has top availability (100% usage score).
-					if targetScore >= 100 {
-						if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), targetID); err != nil {
-							lastErr = err
-							continue
-						}
-						s.setCLISwitchStatus(cliSwitchStatus{
-							At:         time.Now().UTC().UnixMilli(),
-							From:       strings.TrimSpace(activeID),
-							To:         targetID,
-							Reason:     "refresh_current_100",
-							Strategy:   "round_robin",
-							Candidates: len(candidates),
-						})
-						s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin refreshed active auth", map[string]any{
-							"from":       strings.TrimSpace(activeID),
-							"to":         targetID,
-							"reason":     "refresh_current_100",
-							"strategy":   "round_robin",
-							"score":      targetScore,
-							"candidates": len(candidates),
-						})
-						log.Printf("[autoswitch] cli active refreshed on %s (strategy=round_robin score=%d)", targetID, targetScore)
-						switched = true
-						break
-					}
-					continue
-				}
 				if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), targetID); err != nil {
 					lastErr = err
 					continue
@@ -655,14 +714,16 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 					Candidates: len(candidates),
 				})
 				s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI round robin switched", map[string]any{
-					"from":       strings.TrimSpace(activeID),
-					"to":         targetID,
-					"reason":     reason,
-					"strategy":   "round_robin",
-					"score":      targetScore,
-					"candidates": len(candidates),
+					"from":           strings.TrimSpace(activeID),
+					"to":             targetID,
+					"reason":         reason,
+					"strategy":       "round_robin",
+					"score":          targetScore,
+					"candidates":     len(candidates),
+					"recent_window":  int(cliRoundRobinRecentReuseWindow.Seconds()),
+					"recent_applied": recentApplied,
 				})
-				log.Printf("[autoswitch] cli active switched from %s to %s (strategy=round_robin score=%d)", activeID, targetID, targetScore)
+				log.Printf("[autoswitch] cli active switched from %s to %s (strategy=round_robin score=%d recent_applied=%t)", activeID, targetID, targetScore, recentApplied)
 				switched = true
 				break
 			}
@@ -812,6 +873,16 @@ func (s *Server) autoSwitchCLIIfNeeded(ctx context.Context, threshold int, cliSt
 	return nil
 }
 
+func isRetryableCLIRecoveryError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return true
+}
+
 type cliUsageCandidate struct {
 	account store.Account
 	score   int
@@ -907,6 +978,72 @@ func (s *Server) listCLICandidatesForRoundRobin(ctx context.Context) ([]cliUsage
 		return strings.TrimSpace(a.ID) < strings.TrimSpace(b.ID)
 	})
 	return candidates, nil
+}
+
+func (s *Server) listCLINonRevokedAccounts(ctx context.Context) ([]store.Account, error) {
+	accounts, err := s.svc.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]store.Account, 0, len(accounts))
+	for _, account := range accounts {
+		id := strings.TrimSpace(account.ID)
+		if id == "" || account.Revoked {
+			continue
+		}
+		usage, usageErr := s.loadUsageForDecision(ctx, id)
+		if usageErr != nil {
+			continue
+		}
+		if strings.TrimSpace(usage.LastError) != "" {
+			continue
+		}
+		// Rule #1: never select CLI account with weekly usage == 0.
+		if usage.WeeklyPct <= 0 {
+			continue
+		}
+		out = append(out, account)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a := out[i]
+		b := out[j]
+		if !a.CreatedAt.IsZero() && !b.CreatedAt.IsZero() && !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.Before(b.CreatedAt)
+		}
+		return strings.TrimSpace(a.ID) < strings.TrimSpace(b.ID)
+	})
+	return out, nil
+}
+
+func filterCLICandidatesAvoidingRecent(candidates []cliUsageCandidate, currentID string, now time.Time, window time.Duration) []cliUsageCandidate {
+	current := strings.TrimSpace(currentID)
+	if window <= 0 {
+		window = cliRoundRobinRecentReuseWindow
+	}
+	cutoff := now.Add(-window)
+	filtered := make([]cliUsageCandidate, 0, len(candidates))
+	for _, item := range candidates {
+		id := strings.TrimSpace(item.account.ID)
+		if id == "" || id == current {
+			continue
+		}
+		if !item.account.LastUsedAt.IsZero() && item.account.LastUsedAt.After(cutoff) {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func selectRoundRobinCLIPool(candidates []cliUsageCandidate, currentID string, now time.Time, window time.Duration) ([]cliUsageCandidate, bool) {
+	if len(candidates) <= cliRoundRobinSmallPoolSize {
+		return candidates, false
+	}
+	filtered := filterCLICandidatesAvoidingRecent(candidates, currentID, now, window)
+	if len(filtered) == 0 {
+		return candidates, false
+	}
+	return filtered, true
 }
 
 func pickNextRoundRobinCLICandidate(candidates []cliUsageCandidate, currentID string) (store.Account, bool) {
@@ -1951,10 +2088,10 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	
+
 	qPage := r.URL.Query().Get("page")
 	qLimit := r.URL.Query().Get("limit")
-	
+
 	filter := store.AccountFilter{
 		Query:    r.URL.Query().Get("q"),
 		PlanType: r.URL.Query().Get("type"),
@@ -1975,7 +2112,7 @@ func (s *Server) handleWebAccounts(w http.ResponseWriter, r *http.Request) {
 		accounts, err = s.svc.ListAccounts(r.Context())
 		totalFiltered = len(accounts)
 	}
-	
+
 	if err != nil {
 		respondErr(w, 500, "internal_error", err.Error())
 		return
@@ -2318,11 +2455,14 @@ func (s *Server) handleWebUsageAutomationStatus(w http.ResponseWriter, r *http.R
 		return
 	}
 	enabled, threshold, cliStrategy, intervalMinutes := s.currentUsageSchedulerState()
+	refreshTimeout, switchTimeout := s.currentUsageSchedulerTimeouts()
 	status := s.getCLISwitchStatus()
 	respondJSON(w, http.StatusOK, map[string]any{
 		"usage_scheduler_enabled":          enabled,
 		"usage_auto_switch_threshold":      threshold,
 		"usage_scheduler_interval_minutes": intervalMinutes,
+		"usage_refresh_timeout_seconds":    int(refreshTimeout.Seconds()),
+		"usage_switch_timeout_seconds":     int(switchTimeout.Seconds()),
 		"retry_cooldown_seconds":           int(usageSchedulerRetryCooldown.Seconds()),
 		"coding_cli_strategy":              cliStrategy,
 		"active_check_interval_seconds":    intervalMinutes * 60,
@@ -5890,12 +6030,47 @@ func (s *Server) bootstrapSettingsFromStore(ctx context.Context) error {
 	usageSchedulerEnabled, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageSchedulerEnabled)
 	if err != nil {
 		errs = append(errs, err.Error())
-	} else if ok && strings.EqualFold(strings.TrimSpace(usageSchedulerEnabled), "false") {
-		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageSchedulerEnabled, "true"); err != nil {
+	} else if ok {
+		cfg.UsageSchedulerEnabled = strings.EqualFold(strings.TrimSpace(usageSchedulerEnabled), "true")
+	} else {
+		if cfg.UsageSchedulerEnabled {
+			if err := s.svc.Store.SetSetting(ctx, store.SettingUsageSchedulerEnabled, "true"); err != nil {
+				errs = append(errs, err.Error())
+			}
+		} else {
+			if err := s.svc.Store.SetSetting(ctx, store.SettingUsageSchedulerEnabled, "false"); err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
+	}
+
+	usageRefreshTimeoutSec, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageRefreshTimeoutSec)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if ok {
+		if parsed, parseErr := strconv.Atoi(strings.TrimSpace(usageRefreshTimeoutSec)); parseErr == nil {
+			cfg.UsageRefreshTimeoutSec = config.NormalizeUsageRefreshTimeoutSeconds(parsed)
+		}
+	} else {
+		cfg.UsageRefreshTimeoutSec = config.NormalizeUsageRefreshTimeoutSeconds(cfg.UsageRefreshTimeoutSec)
+		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageRefreshTimeoutSec, strconv.Itoa(cfg.UsageRefreshTimeoutSec)); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
-	cfg.UsageSchedulerEnabled = true
+
+	usageSwitchTimeoutSec, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingUsageSwitchTimeoutSec)
+	if err != nil {
+		errs = append(errs, err.Error())
+	} else if ok {
+		if parsed, parseErr := strconv.Atoi(strings.TrimSpace(usageSwitchTimeoutSec)); parseErr == nil {
+			cfg.UsageSwitchTimeoutSec = config.NormalizeUsageSwitchTimeoutSeconds(parsed)
+		}
+	} else {
+		cfg.UsageSwitchTimeoutSec = config.NormalizeUsageSwitchTimeoutSeconds(cfg.UsageSwitchTimeoutSec)
+		if err := s.svc.Store.SetSetting(ctx, store.SettingUsageSwitchTimeoutSec, strconv.Itoa(cfg.UsageSwitchTimeoutSec)); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
 
 	codexHome, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingCodexHome)
 	if err != nil {
@@ -6000,10 +6175,18 @@ func (s *Server) saveSetting(ctx context.Context, key string, value string) erro
 			cfg.UsageAutoSwitchThreshold = parsed
 		}
 	case store.SettingUsageSchedulerEnabled:
-		cfg.UsageSchedulerEnabled = true
+		cfg.UsageSchedulerEnabled = strings.EqualFold(strings.TrimSpace(value), "true")
 	case store.SettingUsageSchedulerInterval:
 		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
 			cfg.UsageSchedulerInterval = config.NormalizeUsageSchedulerIntervalMinutes(parsed)
+		}
+	case store.SettingUsageRefreshTimeoutSec:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			cfg.UsageRefreshTimeoutSec = config.NormalizeUsageRefreshTimeoutSeconds(parsed)
+		}
+	case store.SettingUsageSwitchTimeoutSec:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			cfg.UsageSwitchTimeoutSec = config.NormalizeUsageSwitchTimeoutSeconds(parsed)
 		}
 	case store.SettingModelMappings:
 		mappings := map[string]string{}
@@ -6140,8 +6323,10 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		usageAlertThreshold := s.svc.Cfg.UsageAlertThreshold
 		usageAutoSwitchThreshold := s.svc.Cfg.UsageAutoSwitchThreshold
-		usageSchedulerEnabled := true
+		usageSchedulerEnabled := s.svc.Cfg.UsageSchedulerEnabled
 		usageSchedulerInterval := config.NormalizeUsageSchedulerIntervalMinutes(s.svc.Cfg.UsageSchedulerInterval)
+		usageRefreshTimeoutSec := config.NormalizeUsageRefreshTimeoutSeconds(s.svc.Cfg.UsageRefreshTimeoutSec)
+		usageSwitchTimeoutSec := config.NormalizeUsageSwitchTimeoutSeconds(s.svc.Cfg.UsageSwitchTimeoutSec)
 		directAPIStrategy := config.NormalizeDirectAPIStrategy(s.svc.Cfg.DirectAPIStrategy)
 		codingCLIStrategy := config.NormalizeCodingCLIStrategy(s.svc.Cfg.CodingCLIStrategy)
 		zoStrategy := config.NormalizeZoAPIStrategy(s.svc.Cfg.ZoAPIStrategy)
@@ -6166,6 +6351,8 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			"usage_auto_switch_threshold":      usageAutoSwitchThreshold,
 			"usage_scheduler_enabled":          usageSchedulerEnabled,
 			"usage_scheduler_interval_minutes": usageSchedulerInterval,
+			"usage_refresh_timeout_seconds":    usageRefreshTimeoutSec,
+			"usage_switch_timeout_seconds":     usageSwitchTimeoutSec,
 			"direct_api_strategy":              directAPIStrategy,
 			"coding_cli_strategy":              codingCLIStrategy,
 			"zo_api_strategy":                  zoStrategy,
@@ -6188,6 +6375,8 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			UsageAutoSwitchThreshold *int    `json:"usage_auto_switch_threshold"`
 			UsageSchedulerEnabled    *bool   `json:"usage_scheduler_enabled"`
 			UsageSchedulerInterval   *int    `json:"usage_scheduler_interval_minutes"`
+			UsageRefreshTimeoutSec   *int    `json:"usage_refresh_timeout_seconds"`
+			UsageSwitchTimeoutSec    *int    `json:"usage_switch_timeout_seconds"`
 			DirectAPIStrategy        *string `json:"direct_api_strategy"`
 			CodingCLIStrategy        *string `json:"coding_cli_strategy"`
 			ZoAPIStrategy            *string `json:"zo_api_strategy"`
@@ -6223,11 +6412,17 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			cfg.UsageAutoSwitchThreshold = v
 		}
 		if req.UsageSchedulerEnabled != nil {
-			cfg.UsageSchedulerEnabled = true
+			cfg.UsageSchedulerEnabled = *req.UsageSchedulerEnabled
 		}
 		if req.UsageSchedulerInterval != nil {
 			v := config.NormalizeUsageSchedulerIntervalMinutes(*req.UsageSchedulerInterval)
 			cfg.UsageSchedulerInterval = v
+		}
+		if req.UsageRefreshTimeoutSec != nil {
+			cfg.UsageRefreshTimeoutSec = config.NormalizeUsageRefreshTimeoutSeconds(*req.UsageRefreshTimeoutSec)
+		}
+		if req.UsageSwitchTimeoutSec != nil {
+			cfg.UsageSwitchTimeoutSec = config.NormalizeUsageSwitchTimeoutSeconds(*req.UsageSwitchTimeoutSec)
 		}
 		if req.DirectAPIStrategy != nil {
 			cfg.DirectAPIStrategy = config.NormalizeDirectAPIStrategy(strings.TrimSpace(*req.DirectAPIStrategy))
@@ -6250,7 +6445,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			adminPasswordChanged = true
 		}
 		cfg.DirectAPIInjectPrompt = true
-		cfg.UsageSchedulerEnabled = true
 		s.svc.Cfg = cfg
 		s.adminPasswordHash = strings.TrimSpace(cfg.AdminPasswordHash)
 		s.mu.Unlock()
@@ -6291,13 +6485,25 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if req.UsageSchedulerEnabled != nil {
-			if err := s.saveSetting(r.Context(), store.SettingUsageSchedulerEnabled, "true"); err != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageSchedulerEnabled, strconv.FormatBool(cfg.UsageSchedulerEnabled)); err != nil {
 				respondErr(w, 500, "internal_error", err.Error())
 				return
 			}
 		}
 		if req.UsageSchedulerInterval != nil {
 			if err := s.saveSetting(r.Context(), store.SettingUsageSchedulerInterval, strconv.Itoa(cfg.UsageSchedulerInterval)); err != nil {
+				respondErr(w, 500, "internal_error", err.Error())
+				return
+			}
+		}
+		if req.UsageRefreshTimeoutSec != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageRefreshTimeoutSec, strconv.Itoa(cfg.UsageRefreshTimeoutSec)); err != nil {
+				respondErr(w, 500, "internal_error", err.Error())
+				return
+			}
+		}
+		if req.UsageSwitchTimeoutSec != nil {
+			if err := s.saveSetting(r.Context(), store.SettingUsageSwitchTimeoutSec, strconv.Itoa(cfg.UsageSwitchTimeoutSec)); err != nil {
 				respondErr(w, 500, "internal_error", err.Error())
 				return
 			}
@@ -6324,6 +6530,12 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if before.UsageSchedulerInterval != cfg.UsageSchedulerInterval {
 			changed["usage_scheduler_interval_minutes"] = map[string]any{"from": before.UsageSchedulerInterval, "to": cfg.UsageSchedulerInterval}
+		}
+		if before.UsageRefreshTimeoutSec != cfg.UsageRefreshTimeoutSec {
+			changed["usage_refresh_timeout_seconds"] = map[string]any{"from": before.UsageRefreshTimeoutSec, "to": cfg.UsageRefreshTimeoutSec}
+		}
+		if before.UsageSwitchTimeoutSec != cfg.UsageSwitchTimeoutSec {
+			changed["usage_switch_timeout_seconds"] = map[string]any{"from": before.UsageSwitchTimeoutSec, "to": cfg.UsageSwitchTimeoutSec}
 		}
 		if before.DirectAPIStrategy != cfg.DirectAPIStrategy {
 			changed["direct_api_strategy"] = map[string]any{"from": before.DirectAPIStrategy, "to": cfg.DirectAPIStrategy}
@@ -6355,6 +6567,8 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			"usage_auto_switch_threshold":      cfg.UsageAutoSwitchThreshold,
 			"usage_scheduler_enabled":          cfg.UsageSchedulerEnabled,
 			"usage_scheduler_interval_minutes": config.NormalizeUsageSchedulerIntervalMinutes(cfg.UsageSchedulerInterval),
+			"usage_refresh_timeout_seconds":    config.NormalizeUsageRefreshTimeoutSeconds(cfg.UsageRefreshTimeoutSec),
+			"usage_switch_timeout_seconds":     config.NormalizeUsageSwitchTimeoutSeconds(cfg.UsageSwitchTimeoutSec),
 		})
 		return
 	default:
@@ -7020,16 +7234,17 @@ func (s *Server) handleWebCodingSessions(w http.ResponseWriter, r *http.Request)
 		return
 	case http.MethodPost:
 		var req struct {
-			Title       string `json:"title"`
-			Model       string `json:"model"`
-			WorkDir     string `json:"work_dir"`
-			SandboxMode string `json:"sandbox_mode"`
+			Title          string `json:"title"`
+			Model          string `json:"model"`
+			ReasoningLevel string `json:"reasoning_level"`
+			WorkDir        string `json:"work_dir"`
+			SandboxMode    string `json:"sandbox_mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			respondErr(w, 400, "bad_request", "invalid JSON")
 			return
 		}
-		session, err := s.svc.CreateCodingSession(r.Context(), req.Title, req.Model, req.WorkDir, req.SandboxMode)
+		session, err := s.svc.CreateCodingSession(r.Context(), req.Title, req.Model, req.ReasoningLevel, req.WorkDir, req.SandboxMode)
 		if err != nil {
 			respondErr(w, 400, "bad_request", err.Error())
 			return
@@ -7041,16 +7256,17 @@ func (s *Server) handleWebCodingSessions(w http.ResponseWriter, r *http.Request)
 		return
 	case http.MethodPut:
 		var req struct {
-			SessionID   string `json:"session_id"`
-			Model       string `json:"model"`
-			WorkDir     string `json:"work_dir"`
-			SandboxMode string `json:"sandbox_mode"`
+			SessionID      string `json:"session_id"`
+			Model          string `json:"model"`
+			ReasoningLevel string `json:"reasoning_level"`
+			WorkDir        string `json:"work_dir"`
+			SandboxMode    string `json:"sandbox_mode"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			respondErr(w, 400, "bad_request", "invalid JSON")
 			return
 		}
-		session, err := s.svc.UpdateCodingSessionPreferences(r.Context(), req.SessionID, req.Model, req.WorkDir, req.SandboxMode)
+		session, err := s.svc.UpdateCodingSessionPreferences(r.Context(), req.SessionID, req.Model, req.ReasoningLevel, req.WorkDir, req.SandboxMode)
 		if err != nil {
 			respondErr(w, 400, "bad_request", err.Error())
 			return
@@ -7161,6 +7377,7 @@ func (s *Server) handleWebCodingStop(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		SessionID string `json:"session_id"`
+		Force     bool   `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondErr(w, 400, "bad_request", "invalid JSON")
@@ -7171,11 +7388,12 @@ func (s *Server) handleWebCodingStop(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 400, "bad_request", "session_id is required")
 		return
 	}
-	stopped := s.svc.StopCodingRun(sessionID)
+	stopped := s.svc.StopCodingRun(sessionID, req.Force)
 	respondJSON(w, 200, map[string]any{
 		"ok":         true,
 		"session_id": sessionID,
 		"stopped":    stopped,
+		"force":      req.Force,
 	})
 }
 
@@ -7212,13 +7430,15 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type codingWSRequest struct {
-		Type        string `json:"type"`
-		SessionID   string `json:"session_id"`
-		Content     string `json:"content"`
-		Model       string `json:"model"`
-		WorkDir     string `json:"work_dir"`
-		SandboxMode string `json:"sandbox_mode"`
-		Command     string `json:"command"`
+		Type           string `json:"type"`
+		SessionID      string `json:"session_id"`
+		Content        string `json:"content"`
+		Model          string `json:"model"`
+		ReasoningLevel string `json:"reasoning_level"`
+		WorkDir        string `json:"work_dir"`
+		SandboxMode    string `json:"sandbox_mode"`
+		Command        string `json:"command"`
+		Force          bool   `json:"force"`
 	}
 
 	inFlight := atomic.Bool{}
@@ -7238,12 +7458,16 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 				_ = writeJSON(map[string]any{"event": "error", "message": "session_id is required", "code": "bad_request"})
 				continue
 			}
-			stopped := s.svc.StopCodingRun(sessionID)
+			stopped := s.svc.StopCodingRun(sessionID, req.Force)
 			if !stopped {
 				_ = writeJSON(map[string]any{"event": "error", "message": "session not running", "code": "not_running"})
 				continue
 			}
-			_ = writeJSON(map[string]any{"event": "activity", "text": "stop requested", "session_id": sessionID})
+			if req.Force {
+				_ = writeJSON(map[string]any{"event": "activity", "text": "force stop requested", "session_id": sessionID})
+			} else {
+				_ = writeJSON(map[string]any{"event": "activity", "text": "stop requested", "session_id": sessionID})
+			}
 		case "send":
 			if inFlight.Load() {
 				_ = writeJSON(map[string]any{"event": "error", "message": service.ErrCodingSessionBusy.Error(), "code": "session_busy"})
@@ -7276,6 +7500,7 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 					payload.SessionID,
 					payload.Content,
 					payload.Model,
+					payload.ReasoningLevel,
 					payload.WorkDir,
 					payload.SandboxMode,
 					payload.Command,
@@ -7362,18 +7587,19 @@ func (s *Server) handleWebCodingChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		SessionID   string `json:"session_id"`
-		Content     string `json:"content"`
-		Model       string `json:"model"`
-		WorkDir     string `json:"work_dir"`
-		SandboxMode string `json:"sandbox_mode"`
-		Command     string `json:"command"`
+		SessionID      string `json:"session_id"`
+		Content        string `json:"content"`
+		Model          string `json:"model"`
+		ReasoningLevel string `json:"reasoning_level"`
+		WorkDir        string `json:"work_dir"`
+		SandboxMode    string `json:"sandbox_mode"`
+		Command        string `json:"command"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondErr(w, 400, "bad_request", "invalid JSON")
 		return
 	}
-	result, err := s.svc.SendCodingMessage(r.Context(), req.SessionID, req.Content, req.Model, req.WorkDir, req.SandboxMode, req.Command)
+	result, err := s.svc.SendCodingMessage(r.Context(), req.SessionID, req.Content, req.Model, req.ReasoningLevel, req.WorkDir, req.SandboxMode, req.Command)
 	if err != nil {
 		if errors.Is(err, service.ErrCodingSessionBusy) {
 			respondErr(w, 409, "conflict", err.Error())
@@ -7618,6 +7844,7 @@ func mapCodingSession(item store.CodingSession) map[string]any {
 		"codex_thread_id": item.CodexThreadID,
 		"title":           item.Title,
 		"model":           item.Model,
+		"reasoning_level": item.ReasoningLevel,
 		"work_dir":        item.WorkDir,
 		"sandbox_mode":    item.SandboxMode,
 		"runtime_mode":    firstNonEmpty(strings.TrimSpace(item.RuntimeMode), "spawn"),
@@ -7646,6 +7873,7 @@ func mapCodingMessage(item store.CodingMessage) map[string]any {
 		"input_tokens":  item.InputTokens,
 		"output_tokens": item.OutputTokens,
 		"created_at":    item.CreatedAt.UTC().Format(time.RFC3339),
+		"sequence":      item.Sequence,
 	}
 }
 

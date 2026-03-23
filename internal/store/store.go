@@ -192,6 +192,7 @@ func (s *Store) migrate(ctx context.Context) error {
 				id TEXT PRIMARY KEY,
 				title TEXT NOT NULL DEFAULT '',
 				model TEXT NOT NULL DEFAULT '',
+				reasoning_level TEXT NOT NULL DEFAULT 'medium',
 				work_dir TEXT NOT NULL DEFAULT '~/',
 				sandbox_mode TEXT NOT NULL DEFAULT 'full-access',
 				codex_thread_id TEXT NOT NULL DEFAULT '',
@@ -313,6 +314,18 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.execWithRetry(ctx, `ALTER TABLE coding_sessions ADD COLUMN restart_pending INTEGER NOT NULL DEFAULT 0`); err != nil {
 		msg := strings.ToLower(err.Error())
 		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.execWithRetry(ctx, `ALTER TABLE coding_sessions ADD COLUMN reasoning_level TEXT NOT NULL DEFAULT 'medium'`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	if _, err := s.execWithRetry(ctx, `UPDATE coding_sessions SET reasoning_level='medium' WHERE TRIM(COALESCE(reasoning_level,''))=''`); err != nil {
+		msg := strings.ToLower(err.Error())
+		if !strings.Contains(msg, "no such column") {
 			return err
 		}
 	}
@@ -550,7 +563,7 @@ func (s *Store) ListAccountsPaginated(ctx context.Context, page, limit int, filt
 	case "not_revoked":
 		whereClause += " AND revoked = 0"
 	}
-	
+
 	switch filter.Usage {
 	case "exhausted":
 		whereClause += " AND usage_fetched_at != '' AND (usage_hourly_pct <= 0 OR usage_weekly_pct <= 0) AND revoked = 0"
@@ -718,6 +731,7 @@ func (s *Store) CreateCodingSession(ctx context.Context, session CodingSession) 
 	if strings.TrimSpace(session.Model) == "" {
 		session.Model = "gpt-5.2-codex"
 	}
+	session.ReasoningLevel = normalizeCodingReasoningLevelStore(session.ReasoningLevel)
 	if strings.TrimSpace(session.WorkDir) == "" {
 		session.WorkDir = "~/"
 	}
@@ -728,9 +742,9 @@ func (s *Store) CreateCodingSession(ctx context.Context, session CodingSession) 
 		session.RuntimeStatus = "idle"
 	}
 	_, err := s.execWithRetry(ctx, `
-		INSERT INTO coding_sessions(id,title,model,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-	`, session.ID, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.RuntimeMode, session.RuntimeStatus, boolToInt(session.RestartPending), session.CreatedAt.UTC().Format(time.RFC3339), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339))
+		INSERT INTO coding_sessions(id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+	`, session.ID, session.Title, session.Model, session.ReasoningLevel, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.RuntimeMode, session.RuntimeStatus, boolToInt(session.RestartPending), session.CreatedAt.UTC().Format(time.RFC3339), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return CodingSession{}, err
 	}
@@ -739,7 +753,7 @@ func (s *Store) CreateCodingSession(ctx context.Context, session CodingSession) 
 
 func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at
+		SELECT id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at
 		FROM coding_sessions
 		ORDER BY last_message_at DESC, updated_at DESC
 	`)
@@ -752,9 +766,10 @@ func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error)
 		var session CodingSession
 		var createdAt, updatedAt, lastMessageAt string
 		var restartPending int
-		if err := rows.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &session.RuntimeMode, &session.RuntimeStatus, &restartPending, &createdAt, &updatedAt, &lastMessageAt); err != nil {
+		if err := rows.Scan(&session.ID, &session.Title, &session.Model, &session.ReasoningLevel, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &session.RuntimeMode, &session.RuntimeStatus, &restartPending, &createdAt, &updatedAt, &lastMessageAt); err != nil {
 			return nil, err
 		}
+		session.ReasoningLevel = normalizeCodingReasoningLevelStore(session.ReasoningLevel)
 		session.RestartPending = restartPending != 0
 		session.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 		session.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -769,7 +784,7 @@ func (s *Store) ListCodingSessions(ctx context.Context) ([]CodingSession, error)
 
 func (s *Store) GetCodingSession(ctx context.Context, id string) (CodingSession, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id,title,model,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at
+		SELECT id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,runtime_mode,runtime_status,restart_pending,created_at,updated_at,last_message_at
 		FROM coding_sessions
 		WHERE id=?
 		LIMIT 1
@@ -777,12 +792,13 @@ func (s *Store) GetCodingSession(ctx context.Context, id string) (CodingSession,
 	var session CodingSession
 	var restartPending int
 	var createdAt, updatedAt, lastMessageAt string
-	if err := row.Scan(&session.ID, &session.Title, &session.Model, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &session.RuntimeMode, &session.RuntimeStatus, &restartPending, &createdAt, &updatedAt, &lastMessageAt); err != nil {
+	if err := row.Scan(&session.ID, &session.Title, &session.Model, &session.ReasoningLevel, &session.WorkDir, &session.SandboxMode, &session.CodexThreadID, &session.RuntimeMode, &session.RuntimeStatus, &restartPending, &createdAt, &updatedAt, &lastMessageAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return session, fmt.Errorf("coding session not found")
 		}
 		return session, err
 	}
+	session.ReasoningLevel = normalizeCodingReasoningLevelStore(session.ReasoningLevel)
 	session.RestartPending = restartPending != 0
 	session.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
 	session.UpdatedAt, _ = time.Parse(time.RFC3339, updatedAt)
@@ -800,6 +816,7 @@ func (s *Store) UpdateCodingSession(ctx context.Context, session CodingSession) 
 	if strings.TrimSpace(session.Model) == "" {
 		session.Model = "gpt-5.2-codex"
 	}
+	session.ReasoningLevel = normalizeCodingReasoningLevelStore(session.ReasoningLevel)
 	if strings.TrimSpace(session.WorkDir) == "" {
 		session.WorkDir = "~/"
 	}
@@ -820,9 +837,9 @@ func (s *Store) UpdateCodingSession(ctx context.Context, session CodingSession) 
 	}
 	_, err := s.execWithRetry(ctx, `
 		UPDATE coding_sessions
-		SET title=?, model=?, work_dir=?, sandbox_mode=?, codex_thread_id=?, runtime_mode=?, runtime_status=?, restart_pending=?, updated_at=?, last_message_at=?
+		SET title=?, model=?, reasoning_level=?, work_dir=?, sandbox_mode=?, codex_thread_id=?, runtime_mode=?, runtime_status=?, restart_pending=?, updated_at=?, last_message_at=?
 		WHERE id=?
-	`, session.Title, session.Model, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.RuntimeMode, session.RuntimeStatus, boolToInt(session.RestartPending), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339), session.ID)
+	`, session.Title, session.Model, session.ReasoningLevel, session.WorkDir, session.SandboxMode, session.CodexThreadID, session.RuntimeMode, session.RuntimeStatus, boolToInt(session.RestartPending), session.UpdatedAt.UTC().Format(time.RFC3339), session.LastMessageAt.UTC().Format(time.RFC3339), session.ID)
 	return err
 }
 
@@ -855,22 +872,25 @@ func (s *Store) AppendCodingMessage(ctx context.Context, msg CodingMessage) (Cod
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = time.Now().UTC()
 	}
-	_, err := s.execWithRetry(ctx, `
+	res, err := s.execWithRetry(ctx, `
 		INSERT INTO coding_messages(id,session_id,role,content,input_tokens,output_tokens,created_at)
 		VALUES(?,?,?,?,?,?,?)
 	`, msg.ID, msg.SessionID, msg.Role, msg.Content, msg.InputTokens, msg.OutputTokens, msg.CreatedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return CodingMessage{}, err
 	}
+	if seq, seqErr := res.LastInsertId(); seqErr == nil {
+		msg.Sequence = seq
+	}
 	return msg, nil
 }
 
 func (s *Store) ListCodingMessages(ctx context.Context, sessionID string) ([]CodingMessage, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id,session_id,role,content,input_tokens,output_tokens,created_at
+		SELECT rowid,id,session_id,role,content,input_tokens,output_tokens,created_at
 		FROM coding_messages
 		WHERE session_id=?
-		ORDER BY created_at ASC
+		ORDER BY created_at ASC, rowid ASC
 	`, strings.TrimSpace(sessionID))
 	if err != nil {
 		return nil, err
@@ -879,11 +899,13 @@ func (s *Store) ListCodingMessages(ctx context.Context, sessionID string) ([]Cod
 	var out []CodingMessage
 	for rows.Next() {
 		var msg CodingMessage
+		var sequence int64
 		var createdAt string
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.Role, &msg.Content, &msg.InputTokens, &msg.OutputTokens, &createdAt); err != nil {
+		if err := rows.Scan(&sequence, &msg.ID, &msg.SessionID, &msg.Role, &msg.Content, &msg.InputTokens, &msg.OutputTokens, &createdAt); err != nil {
 			return nil, err
 		}
 		msg.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		msg.Sequence = sequence
 		out = append(out, msg)
 	}
 	if err := rows.Err(); err != nil {
@@ -902,14 +924,15 @@ func (s *Store) ListCodingMessagesPage(ctx context.Context, sessionID string, li
 	}
 	cursorID := strings.TrimSpace(beforeID)
 	var cursorCreatedAt string
+	var cursorRowID int64
 	if cursorID != "" {
 		row := s.db.QueryRowContext(ctx, `
-			SELECT created_at
+			SELECT created_at, rowid
 			FROM coding_messages
 			WHERE session_id=? AND id=?
 			LIMIT 1
 		`, sid, cursorID)
-		if err := row.Scan(&cursorCreatedAt); err != nil {
+		if err := row.Scan(&cursorCreatedAt, &cursorRowID); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				// Cursor can become stale when history is refreshed/deleted while user scrolls.
 				// Treat as end-of-history instead of failing the whole request.
@@ -924,19 +947,19 @@ func (s *Store) ListCodingMessagesPage(ctx context.Context, sessionID string, li
 	)
 	if cursorID != "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT id,session_id,role,content,input_tokens,output_tokens,created_at
+			SELECT rowid,id,session_id,role,content,input_tokens,output_tokens,created_at
 			FROM coding_messages
 			WHERE session_id=?
-				AND (created_at < ? OR (created_at = ? AND id < ?))
-			ORDER BY created_at DESC, id DESC
+				AND (created_at < ? OR (created_at = ? AND rowid < ?))
+			ORDER BY created_at DESC, rowid DESC
 			LIMIT ?
-		`, sid, cursorCreatedAt, cursorCreatedAt, cursorID, limit)
+		`, sid, cursorCreatedAt, cursorCreatedAt, cursorRowID, limit)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT id,session_id,role,content,input_tokens,output_tokens,created_at
+			SELECT rowid,id,session_id,role,content,input_tokens,output_tokens,created_at
 			FROM coding_messages
 			WHERE session_id=?
-			ORDER BY created_at DESC, id DESC
+			ORDER BY created_at DESC, rowid DESC
 			LIMIT ?
 		`, sid, limit)
 	}
@@ -946,32 +969,38 @@ func (s *Store) ListCodingMessagesPage(ctx context.Context, sessionID string, li
 	defer rows.Close()
 
 	out := make([]CodingMessage, 0, limit)
+	rowIDs := make([]int64, 0, limit)
 	for rows.Next() {
 		var msg CodingMessage
+		var rowID int64
 		var createdAt string
-		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.Role, &msg.Content, &msg.InputTokens, &msg.OutputTokens, &createdAt); err != nil {
+		if err := rows.Scan(&rowID, &msg.ID, &msg.SessionID, &msg.Role, &msg.Content, &msg.InputTokens, &msg.OutputTokens, &createdAt); err != nil {
 			return nil, false, err
 		}
 		msg.CreatedAt, _ = time.Parse(time.RFC3339, createdAt)
+		msg.Sequence = rowID
 		out = append(out, msg)
+		rowIDs = append(rowIDs, rowID)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 		out[i], out[j] = out[j], out[i]
+		rowIDs[i], rowIDs[j] = rowIDs[j], rowIDs[i]
 	}
 	hasMore := false
 	if len(out) == limit && len(out) > 0 {
 		oldest := out[0]
 		oldestCreatedAt := oldest.CreatedAt.UTC().Format(time.RFC3339)
+		oldestRowID := rowIDs[0]
 		row := s.db.QueryRowContext(ctx, `
 			SELECT 1
 			FROM coding_messages
 			WHERE session_id=?
-				AND (created_at < ? OR (created_at = ? AND id < ?))
+				AND (created_at < ? OR (created_at = ? AND rowid < ?))
 			LIMIT 1
-		`, sid, oldestCreatedAt, oldestCreatedAt, oldest.ID)
+		`, sid, oldestCreatedAt, oldestCreatedAt, oldestRowID)
 		var exists int
 		if err := row.Scan(&exists); err == nil {
 			hasMore = true
@@ -1094,6 +1123,16 @@ func intBool(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func normalizeCodingReasoningLevelStore(v string) string {
+	level := strings.TrimSpace(strings.ToLower(v))
+	switch level {
+	case "low", "high":
+		return level
+	default:
+		return "medium"
+	}
 }
 
 func nextUsageCheckAt(u UsageSnapshot) time.Time {

@@ -6,6 +6,7 @@
   let messages = $state([]);
   let draftMessage = $state('');
   let selectedModel = $state('gpt-5.2-codex');
+  let selectedReasoningLevel = $state('medium');
   let selectedWorkDir = $state('~/');
   let selectedSandboxMode = $state('write');
   let loadingSessions = $state(false);
@@ -21,6 +22,7 @@
   let streamingPending = $state(false);
   let messagesViewport = $state(null);
   let autoFollowBottom = $state(true);
+  let lastMessagesScrollTop = $state(0);
   let showScrollBottomButton = $state(false);
   let showNewSessionModal = $state(false);
   let newSessionPath = $state('~/');
@@ -40,6 +42,7 @@
   let logViewMode = $state('compact');
   let backgroundProcessing = $state(false);
   let stopRequested = $state(false);
+  let forceStopArmed = $state(false);
   let activeExecCommand = $state('');
   let wsStreamSocket = $state(null);
   let wsHealthSocket = $state(null);
@@ -49,8 +52,6 @@
   let wsHealthReady = false;
   let showExecOutputModal = $state(false);
   let selectedExecEntry = $state(null);
-  let showExecBatchModal = $state(false);
-  let selectedExecBatchEntry = $state(null);
   let showSubagentDetailModal = $state(false);
   let selectedSubagentEntry = $state(null);
   const initialMessagesPageSize = 50;
@@ -60,12 +61,34 @@
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
   const draftStoragePrefix = 'codexsess.coding.draft.v1:';
   const viewModeStorageKey = 'codexsess.coding.view_mode.v1';
+  const reasoningLevelStorageKey = 'codexsess.coding.reasoning_level.v1';
   const enableSkillHintWrap = ['1', 'true', 'yes', 'on'].includes(
     String(import.meta.env.VITE_CODEXSESS_SKILL_HINT_WRAP || '').trim().toLowerCase()
   );
   const jsonHeaders = { 'Content-Type': 'application/json' };
   const models = ['gpt-5.2-codex', 'gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.4'];
+  const reasoningLevels = [
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' }
+  ];
   const slashCommands = ['/status', '/review [optional focus]'];
+
+  function normalizeReasoningLevel(value) {
+    const v = String(value || '').trim().toLowerCase();
+    if (v === 'low' || v === 'high') return v;
+    return 'medium';
+  }
+
+  function onReasoningLevelChange() {
+    selectedReasoningLevel = normalizeReasoningLevel(selectedReasoningLevel);
+    if (typeof window === 'undefined') return;
+    try {
+      localStorage.setItem(reasoningLevelStorageKey, selectedReasoningLevel);
+    } catch {
+    }
+    queuePersistSessionPreferences();
+  }
 
   function isLoopbackHost(hostname) {
     const host = String(hostname || '').trim().toLowerCase();
@@ -154,7 +177,131 @@
   function formatWhen(value) {
     const d = new Date(String(value || ''));
     if (Number.isNaN(d.getTime())) return '-';
-    return d.toLocaleString();
+    try {
+      return d.toLocaleString(undefined, {
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        second: '2-digit',
+        fractionalSecondDigits: 3
+      });
+    } catch {
+      return d.toLocaleString();
+    }
+  }
+
+  function timestampFromMessage(message) {
+    const raw = String(message?.created_at || '');
+    const ms = Date.parse(raw);
+    if (!Number.isNaN(ms)) return ms;
+    return 0;
+  }
+
+  function sequenceFromMessage(message) {
+    const value = Number(message?.sequence ?? 0);
+    if (Number.isFinite(value) && value > 0) return value;
+    return 0;
+  }
+
+  function sortMessagesChronologically(input) {
+    const src = Array.isArray(input) ? input : [];
+    return src
+      .map((item, idx) => ({ item, idx }))
+      .sort((a, b) => {
+        const sa = sequenceFromMessage(a.item);
+        const sb = sequenceFromMessage(b.item);
+        if (sa > 0 && sb > 0 && sa !== sb) return sa - sb;
+        const ta = timestampFromMessage(a.item);
+        const tb = timestampFromMessage(b.item);
+        if (ta !== tb) return ta - tb;
+        return a.idx - b.idx;
+      })
+      .map((entry) => entry.item);
+  }
+
+  function mergeMessagesChronologically(currentMessages, incomingMessages) {
+    const existing = Array.isArray(currentMessages) ? currentMessages : [];
+    const incoming = Array.isArray(incomingMessages) ? incomingMessages : [];
+    if (incoming.length === 0) return existing;
+    const merged = [...existing];
+    const known = new Set(
+      existing.map((item) => String(item?.id || '').trim()).filter(Boolean)
+    );
+    for (const item of incoming) {
+      const id = String(item?.id || '').trim();
+      if (id && known.has(id)) continue;
+      if (id) known.add(id);
+      merged.push(item);
+    }
+    return sortMessagesChronologically(merged);
+  }
+
+  function messageMatchKey(item) {
+    const role = String(item?.role || '').trim().toLowerCase();
+    const content = String(item?.content || '').trim();
+    return `${role}|${content}`;
+  }
+
+  function reconcileLiveMessagesWithPersisted(currentMessages, persistedMessages, liveMessageIDs = []) {
+    const current = Array.isArray(currentMessages) ? [...currentMessages] : [];
+    const persisted = Array.isArray(persistedMessages) ? persistedMessages : [];
+    if (persisted.length === 0) return current;
+    const liveSet = new Set((Array.isArray(liveMessageIDs) ? liveMessageIDs : []).map((id) => String(id || '').trim()).filter(Boolean));
+    if (liveSet.size === 0) {
+      return mergeMessagesChronologically(current, persisted);
+    }
+
+    const liveIndexByKey = new Map();
+    const matchWindowMs = 4000;
+    for (let idx = 0; idx < current.length; idx += 1) {
+      const row = current[idx];
+      const id = String(row?.id || '').trim();
+      if (!id || !liveSet.has(id)) continue;
+      const key = messageMatchKey(row);
+      if (!key) continue;
+      const bucket = liveIndexByKey.get(key) || [];
+      bucket.push({ idx, ts: timestampFromMessage(row) });
+      liveIndexByKey.set(key, bucket);
+    }
+
+    const unmatchedPersisted = [];
+    for (const row of persisted) {
+      const key = messageMatchKey(row);
+      const bucket = liveIndexByKey.get(key) || [];
+      if (bucket.length > 0) {
+        const persistedTS = timestampFromMessage(row);
+        let pickAt = 0;
+        if (persistedTS > 0) {
+          // Prefer stable queue order; only pick later candidate when it is clearly within time window.
+          for (let i = 0; i < bucket.length; i += 1) {
+            const candidateTS = Number(bucket[i]?.ts || 0);
+            if (candidateTS <= 0) continue;
+            if (Math.abs(candidateTS - persistedTS) <= matchWindowMs) {
+              pickAt = i;
+              break;
+            }
+          }
+          const firstTS = Number(bucket[0]?.ts || 0);
+          if (firstTS > 0 && Math.abs(firstTS - persistedTS) > matchWindowMs && pickAt === 0) {
+            // No safe live match in window; keep persisted row for chronological merge path.
+            unmatchedPersisted.push(row);
+            continue;
+          }
+        }
+        const [picked] = bucket.splice(pickAt, 1);
+        const idx = Number(picked?.idx ?? -1);
+        if (idx >= 0 && idx < current.length) {
+          current[idx] = row;
+          continue;
+        }
+        unmatchedPersisted.push(row);
+        continue;
+      }
+      unmatchedPersisted.push(row);
+    }
+    return mergeMessagesChronologically(current, unmatchedPersisted);
   }
 
   function normalizeActivityCommandKey(command) {
@@ -187,6 +334,20 @@
       };
     }
     return { kind: 'other', command: '', exitCode: 0 };
+  }
+
+  function parseFileOperationText(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return '';
+    // Examples:
+    // [Edited internal/service/coding.go (+34 -1)]
+    // [Read web/src/views/CodingView.svelte]
+    const m = text.match(/^\[(Edited|Read|Created|Deleted|Moved|Renamed)\s+(.+)\]$/i);
+    if (!m) return '';
+    const action = String(m[1] || '').trim();
+    const target = String(m[2] || '').trim();
+    if (!action || !target) return '';
+    return `${action}: ${target}`;
   }
 
   function extractLikelyAgentIDs(raw) {
@@ -589,6 +750,17 @@
     } catch {
       return null;
     }
+  }
+
+  function isRedundantAssistantRawEvent(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const eventType = String(payload?.type || '').trim().toLowerCase();
+    if (eventType !== 'item.completed' && eventType !== 'item.updated') return false;
+    const item = payload?.item;
+    const itemType = String(item?.type || '').trim().toLowerCase();
+    if (itemType !== 'agent_message') return false;
+    const text = String(item?.text || '').trim();
+    return text.length > 0;
   }
 
   function extractExecOutputText(value) {
@@ -1026,52 +1198,46 @@
       if (!command) return null;
       const key = normalizeActivityCommandKey(command);
       if (!key) return null;
-      const existingIdx = activeExecByKey.get(key);
       const nowISO = new Date().toISOString();
-      if (typeof existingIdx === 'number' && out[existingIdx]) {
-        const current = out[existingIdx];
-        const nextStatus = normalizeExecStatus(entry?.status || current?.exec_status || 'running');
-        const nextExitCode = Number(entry?.exitCode ?? current?.exec_exit_code ?? 0) || 0;
-        const nextOutput = mergeExecOutput(current?.exec_output || '', entry?.output || '');
-        const nextSource = mergeExecOutputSource(current?.exec_output_source, entry?.source || 'live');
-        out[existingIdx] = {
-          ...current,
-          content: command,
-          created_at: current?.created_at || nowISO,
-          updated_at: String(entry?.createdAt || nowISO),
-          exec_command: command,
-          exec_status: nextStatus,
-          exec_exit_code: nextExitCode,
-          exec_output: nextOutput,
-          exec_output_source: nextSource
-        };
-        if (nextStatus !== 'running') {
-          activeExecByKey.delete(key);
-          if (normalizeActivityCommandKey(lastExecKey) === key) {
-            lastExecKey = '';
-          }
-        } else {
-          lastExecKey = command;
-        }
-        return out[existingIdx];
+      const nextStatus = normalizeExecStatus(entry?.status || 'running');
+      const nextExitCode = Number(entry?.exitCode || 0) || 0;
+      const nextOutput = String(entry?.output || '').trim();
+      const nextCreatedAt = String(entry?.createdAt || nowISO);
+      const nextCreatedAtMs = Date.parse(nextCreatedAt);
+      for (let i = out.length - 1; i >= 0 && i >= out.length - 8; i -= 1) {
+        const prev = out[i];
+        if (String(prev?.role || '').trim().toLowerCase() !== 'exec') continue;
+        if (String(prev?.exec_command || '').trim() !== command) continue;
+        if (normalizeExecStatus(prev?.exec_status) !== nextStatus) continue;
+        if ((Number(prev?.exec_exit_code || 0) || 0) !== nextExitCode) continue;
+        const prevOutput = String(prev?.exec_output || '').trim();
+        if (prevOutput !== nextOutput) continue;
+        const prevMs = Date.parse(String(prev?.updated_at || prev?.created_at || ''));
+        if (!Number.isNaN(nextCreatedAtMs) && !Number.isNaN(prevMs) && Math.abs(nextCreatedAtMs - prevMs) > 1800) continue;
+        return prev;
       }
       const next = {
         id: `exec-${String(entry?.sourceID || key)}`,
         role: 'exec',
         content: command,
-        created_at: String(entry?.createdAt || nowISO),
-        updated_at: String(entry?.createdAt || nowISO),
+        created_at: nextCreatedAt,
+        updated_at: nextCreatedAt,
         pending: false,
         exec_command: command,
-        exec_status: normalizeExecStatus(entry?.status || 'running'),
-        exec_exit_code: Number(entry?.exitCode || 0) || 0,
-        exec_output: String(entry?.output || '').trim(),
+        exec_status: nextStatus,
+        exec_exit_code: nextExitCode,
+        exec_output: nextOutput,
         exec_output_source: normalizeExecOutputSource(entry?.source || 'live')
       };
       out.push(next);
       if (next.exec_status === 'running') {
         activeExecByKey.set(key, out.length - 1);
         lastExecKey = command;
+      } else {
+        activeExecByKey.delete(key);
+        if (normalizeActivityCommandKey(lastExecKey) === key) {
+          lastExecKey = '';
+        }
       }
       return next;
     };
@@ -1319,9 +1485,14 @@
       }
       if (role === 'event') {
         const payload = parseRawEventPayload(item?.content || '');
+        if (isRedundantAssistantRawEvent(payload)) {
+          // Assistant text is rendered as assistant bubble; hide duplicate raw event row.
+          continue;
+        }
         const parsedExec = parseExecEventFromPayload(payload);
         const parsedSubagent = parseSubagentEventFromPayload(payload);
         const rawText = String(item?.content || '').trim();
+        const fileOpText = parseFileOperationText(rawText);
         let handled = false;
         if (parsedExec?.command) {
           const recordExec = upsertExecEntry({
@@ -1355,6 +1526,19 @@
               };
               handled = true;
             }
+          }
+        }
+        if (fileOpText) {
+          out.push({
+            id: `fileop-${String(item?.id || Date.now())}`,
+            role: 'activity',
+            content: fileOpText,
+            created_at: String(item?.created_at || new Date().toISOString()),
+            updated_at: String(item?.created_at || new Date().toISOString()),
+            pending: false
+          });
+          if (!includeRawEvents) {
+            continue;
           }
         }
         if (handled && !includeRawEvents) {
@@ -1524,7 +1708,6 @@
   function messageRoleClass(message) {
     const role = String(message?.role || '').trim().toLowerCase();
     if (role === 'assistant') return 'assistant';
-    if (role === 'exec_group') return 'exec-group';
     if (role === 'exec') return 'exec';
     if (role === 'subagent') return 'subagent';
     if (role === 'activity') return 'activity';
@@ -1534,7 +1717,8 @@
   }
 
   function renderedMessagesForView() {
-    let rendered = buildExecAwareMessages(messages, true);
+    const rawMode = String(logViewMode || '').trim().toLowerCase() === 'raw';
+    let rendered = buildExecAwareMessages(messages, rawMode);
     rendered = dedupeAdjacentSpawnSubagentMessages(rendered);
     rendered = rendered.filter((item) => {
       const role = String(item?.role || '').trim().toLowerCase();
@@ -1543,135 +1727,12 @@
       if (!parsed?.command) return true;
       return parsed.kind === 'other';
     });
-    if (String(logViewMode || '').trim().toLowerCase() !== 'raw') {
+    if (!rawMode) {
       rendered = rendered.filter((item) => String(item?.role || '').trim().toLowerCase() !== 'event');
     }
-    return groupTerminalMessages(rendered, 3);
-  }
-
-  function toExecBatchEntry(message) {
-    const command = String(message?.exec_command || message?.content || '-').trim() || '-';
-    const normalizeOutput = (value) => {
-      const text = sanitizeSensitiveLogText(String(value || '').trim());
-      if (!text) return 'No output captured.';
-      if (text === 'No output captured.') return text;
-      const stripped = text.replace(/^No output captured\.\s*/i, '').trim();
-      return stripped || text;
-    };
-    return {
-      id: String(message?.id || '').trim(),
-      command,
-      status: normalizeExecStatus(message?.exec_status || 'running'),
-      exitCode: Number(message?.exec_exit_code || 0) || 0,
-      output: normalizeOutput(message?.exec_output || ''),
-      source: String(message?.exec_output_source || 'live').trim().toLowerCase(),
-      when: String(message?.updated_at || message?.created_at || '')
-    };
-  }
-
-  function compareExecStatusPriority(a, b) {
-    const weight = (value) => {
-      const v = normalizeExecStatus(value);
-      if (v === 'failed') return 3;
-      if (v === 'done') return 2;
-      return 1;
-    };
-    return weight(a) - weight(b);
-  }
-
-  function compressExecBatchEntries(entries) {
-    const src = Array.isArray(entries) ? entries : [];
-    if (src.length <= 1) return src;
-    const out = [];
-    for (const entry of src) {
-      const command = String(entry?.command || '').trim();
-      if (!command) continue;
-      const prevIdx = out.length - 1;
-      const prev = prevIdx >= 0 ? out[prevIdx] : null;
-      if (prev && String(prev.command || '').trim() === command) {
-        const nextStatus = compareExecStatusPriority(prev.status, entry?.status) >= 0 ? prev.status : normalizeExecStatus(entry?.status || prev.status);
-        out[prevIdx] = {
-          ...prev,
-          status: nextStatus,
-          exitCode: Number(entry?.exitCode ?? prev.exitCode ?? 0) || 0,
-          output: sanitizeSensitiveLogText(
-            mergeExecOutput(String(prev.output || '').trim(), String(entry?.output || '').trim()) || 'No output captured.'
-          ),
-          when: String(entry?.when || prev.when || '')
-        };
-        continue;
-      }
-      out.push({
-        ...entry,
-        status: normalizeExecStatus(entry?.status || 'running'),
-        output: sanitizeSensitiveLogText(String(entry?.output || '').trim() || 'No output captured.')
-      });
-    }
-    return out;
-  }
-
-  function groupTerminalMessages(input, threshold = 3) {
-    const src = Array.isArray(input) ? input : [];
-    const out = [];
-    let buffer = [];
-    let deferredMeta = [];
-    const canKeepExecBufferOnRole = (role) => {
-      const v = String(role || '').trim().toLowerCase();
-      return v === 'activity' || v === 'event' || v === 'stderr';
-    };
-
-    const flush = () => {
-      if (buffer.length === 0) return;
-      if (buffer.length <= threshold) {
-        out.push(...buffer);
-        if (deferredMeta.length > 0) {
-          out.push(...deferredMeta);
-        }
-        buffer = [];
-        deferredMeta = [];
-        return;
-      }
-      const entries = compressExecBatchEntries(buffer.map((item) => toExecBatchEntry(item)));
-      const latest = entries[entries.length - 1] || null;
-      out.push({
-        id: `exec-group-${String(buffer[0]?.id || Date.now())}`,
-        role: 'exec_group',
-        content: `${entries.length} terminal commands`,
-        created_at: String(buffer[0]?.created_at || new Date().toISOString()),
-        updated_at: String(latest?.when || buffer[buffer.length - 1]?.updated_at || new Date().toISOString()),
-        pending: false,
-        exec_group_entries: entries,
-        exec_group_count: entries.length,
-        exec_group_meta: deferredMeta.map((item) => ({
-          id: String(item?.id || '').trim(),
-          role: String(item?.role || '').trim().toLowerCase(),
-          content: sanitizeSensitiveLogText(String(item?.content || '').trim()),
-          when: String(item?.updated_at || item?.created_at || '')
-        })).filter((item) => item.content)
-      });
-      buffer = [];
-      deferredMeta = [];
-    };
-
-    for (const item of src) {
-      const role = String(item?.role || '').trim().toLowerCase();
-      if (role === 'exec') {
-        buffer.push(item);
-        continue;
-      }
-      if (canKeepExecBufferOnRole(role)) {
-        if (buffer.length > 0) {
-          deferredMeta.push(item);
-          continue;
-        }
-        out.push(item);
-        continue;
-      }
-      flush();
-      out.push(item);
-    }
-    flush();
-    return out;
+    // Keep strict bubble-by-bubble chronology in both modes.
+    // Grouping can hide boundaries when upstream event ordering is dense.
+    return rendered;
   }
 
   function execStatusLabel(status, exitCode) {
@@ -1679,15 +1740,6 @@
     if (normalized === 'running') return 'Running';
     if (normalized === 'failed') return `Failed${Number(exitCode || 0) ? ` (exit ${Number(exitCode || 0)})` : ''}`;
     return 'Done';
-  }
-
-  function execOutputPreview(message) {
-    const output = String(message?.exec_output || '').trim();
-    if (!output) return 'No output captured.';
-    const compact = sanitizeSensitiveLogText(output);
-    const lines = compact.split('\n');
-    if (lines.length <= 4 && compact.length <= 360) return compact;
-    return `${lines.slice(0, 4).join('\n')}${compact.length > 360 || lines.length > 4 ? '\n...' : ''}`;
   }
 
   function subagentStatusLabel(status) {
@@ -1852,23 +1904,6 @@
   function closeExecOutputModal() {
     showExecOutputModal = false;
     selectedExecEntry = null;
-  }
-
-  function openExecBatchModal(message) {
-    const entries = Array.isArray(message?.exec_group_entries) ? message.exec_group_entries : [];
-    if (entries.length === 0) return;
-    selectedExecBatchEntry = {
-      count: entries.length,
-      entries,
-      meta: Array.isArray(message?.exec_group_meta) ? message.exec_group_meta : [],
-      when: String(message?.updated_at || message?.created_at || '')
-    };
-    showExecBatchModal = true;
-  }
-
-  function closeExecBatchModal() {
-    showExecBatchModal = false;
-    selectedExecBatchEntry = null;
   }
 
   function openSubagentDetailModal(message) {
@@ -2038,6 +2073,7 @@
       const active = activeSession();
       if (active) {
         selectedModel = String(active.model || selectedModel).trim() || selectedModel;
+        selectedReasoningLevel = normalizeReasoningLevel(active.reasoning_level || selectedReasoningLevel);
         selectedWorkDir = String(active.work_dir || '~/').trim() || '~/';
         selectedSandboxMode = String(active.sandbox_mode || 'write').trim() || 'write';
       }
@@ -2056,6 +2092,7 @@
         body: JSON.stringify({
           session_id: session.id,
           model: selectedModel,
+          reasoning_level: normalizeReasoningLevel(selectedReasoningLevel),
           work_dir: selectedWorkDir || '~/',
           sandbox_mode: selectedSandboxMode || 'write'
         })
@@ -2115,7 +2152,7 @@
         const existingIDs = new Set(messages.map((item) => String(item?.id || '').trim()).filter(Boolean));
         const missingFromTail = incomingMessages.filter((item) => !existingIDs.has(String(item?.id || '').trim()));
         if (missingFromTail.length > 0) {
-          messages = [...messages, ...missingFromTail];
+          messages = mergeMessagesChronologically(messages, missingFromTail);
         }
         hasMoreMessages = hasMoreMessages || Boolean(data?.has_more);
         oldestLoadedMessageID = String(messages?.[0]?.id || oldestLoadedMessageID || '').trim();
@@ -2136,6 +2173,9 @@
       } else {
         autoFollowBottom = true;
         scrollMessagesToBottom(true);
+      }
+      if (messagesViewport) {
+        lastMessagesScrollTop = messagesViewport.scrollTop;
       }
       refreshScrollAffordance();
     } finally {
@@ -2173,6 +2213,7 @@
       if (messagesViewport) {
         const nextScrollHeight = messagesViewport.scrollHeight;
         messagesViewport.scrollTop = Math.max(0, nextScrollHeight - prevScrollHeight + prevScrollTop);
+        lastMessagesScrollTop = messagesViewport.scrollTop;
       }
       refreshScrollAffordance();
     } finally {
@@ -2182,7 +2223,15 @@
 
   function onMessagesScroll() {
     if (!messagesViewport) return;
-    autoFollowBottom = isMessagesViewportNearBottom();
+    const currentTop = messagesViewport.scrollTop;
+    const nearBottom = isMessagesViewportNearBottom();
+    const scrolledUp = currentTop < (lastMessagesScrollTop - 2);
+    if (scrolledUp) {
+      autoFollowBottom = false;
+    } else if (nearBottom) {
+      autoFollowBottom = true;
+    }
+    lastMessagesScrollTop = currentTop;
     refreshScrollAffordance();
     if (messagesViewport.scrollTop <= 80 && hasMoreMessages && !loadingOlderMessages && !loadingMessages) {
       loadOlderMessages().catch(() => {});
@@ -2203,17 +2252,9 @@
       if (!sending) {
         viewStatus = 'Streaming...';
       }
-      // Avoid replacing live WS-rendered messages while actively streaming in this tab.
-      if (syncMessages && !loadingMessages && !sending) {
-        await loadMessages(sid, { silent: true, preserveViewport: true });
-      }
       return true;
     }
-    if (syncMessages && !loadingMessages) {
-      await loadMessages(sid, { silent: true, preserveViewport: true });
-    }
     if (becameDone) {
-      await loadMessages(sid, { silent: true, preserveViewport: true });
       viewStatus = 'Background processing finished.';
     }
     return false;
@@ -2258,17 +2299,20 @@
     if (!messagesViewport) return;
     if (!force && !autoFollowBottom) return;
     messagesViewport.scrollTop = messagesViewport.scrollHeight;
+    lastMessagesScrollTop = messagesViewport.scrollTop;
     if (typeof window !== 'undefined') {
       window.requestAnimationFrame(() => {
         if (!messagesViewport) return;
         if (!force && !autoFollowBottom) return;
         messagesViewport.scrollTop = messagesViewport.scrollHeight;
+        lastMessagesScrollTop = messagesViewport.scrollTop;
         refreshScrollAffordance();
       });
       setTimeout(() => {
         if (!messagesViewport) return;
         if (!force && !autoFollowBottom) return;
         messagesViewport.scrollTop = messagesViewport.scrollHeight;
+        lastMessagesScrollTop = messagesViewport.scrollTop;
         refreshScrollAffordance();
       }, 60);
     }
@@ -2341,6 +2385,7 @@
       body: JSON.stringify({
         title: '',
         model: selectedModel,
+        reasoning_level: normalizeReasoningLevel(selectedReasoningLevel),
         work_dir: String(workDir || '~/').trim() || '~/',
         sandbox_mode: selectedSandboxMode || 'write'
       })
@@ -2352,6 +2397,7 @@
       activeSessionID = created.id;
       syncSessionIDToURL(created.id);
       selectedModel = String(created.model || selectedModel).trim() || selectedModel;
+      selectedReasoningLevel = normalizeReasoningLevel(created.reasoning_level || selectedReasoningLevel);
       selectedWorkDir = String(created.work_dir || '~/').trim() || '~/';
       selectedSandboxMode = String(created.sandbox_mode || 'write').trim() || 'write';
       await loadMessages(created.id);
@@ -2394,6 +2440,7 @@
     const active = activeSession();
     if (active) {
       selectedModel = String(active.model || selectedModel).trim() || selectedModel;
+      selectedReasoningLevel = normalizeReasoningLevel(active.reasoning_level || selectedReasoningLevel);
       selectedWorkDir = String(active.work_dir || '~/').trim() || '~/';
       selectedSandboxMode = String(active.sandbox_mode || 'write').trim() || 'write';
     }
@@ -2411,6 +2458,7 @@
     syncSessionIDToURL(sid);
     const selected = sessions.find((item) => item.id === sid);
     if (selected?.model) selectedModel = selected.model;
+    selectedReasoningLevel = normalizeReasoningLevel(selected?.reasoning_level || selectedReasoningLevel);
     selectedWorkDir = String(selected?.work_dir || '~/').trim() || '~/';
     selectedSandboxMode = String(selected?.sandbox_mode || 'write').trim() || 'write';
     await loadMessages(sid);
@@ -2498,6 +2546,7 @@
     autoFollowBottom = true;
     sending = true;
     stopRequested = false;
+    forceStopArmed = false;
     backgroundProcessing = false;
     await tick();
     scrollMessagesToBottom(true);
@@ -2515,6 +2564,7 @@
         session_id: session.id,
         content: slashMeta.contentOverride ?? prepared,
         model: selectedModel,
+        reasoning_level: normalizeReasoningLevel(selectedReasoningLevel),
         work_dir: selectedWorkDir || '~/',
         sandbox_mode: selectedSandboxMode || 'write',
         command: slashMeta.commandMode || 'chat'
@@ -2602,39 +2652,46 @@
       const eventMessages = Array.isArray(donePayload?.event_messages) ? donePayload.event_messages : [];
       const assistantMessages = Array.isArray(donePayload?.assistant_messages) ? donePayload.assistant_messages : [];
       const hasLiveMeta = streamedMetaIDs.length > 0;
+      const hasLiveAssistant = streamedAssistantIDs.length > 0;
       streamingPending = false;
-      messages = messages.filter(
-        (item) =>
-          item?.id !== pendingID &&
-          !streamedAssistantIDs.includes(item?.id)
-      );
-      if (userMessage) messages = [...messages, userMessage];
-      if (eventMessages.length > 0) {
+      if (userMessage) {
+        messages = messages.map((item) => (item?.id === pendingID ? userMessage : item));
+      } else {
+        messages = messages.filter((item) => item?.id !== pendingID);
+      }
+      if (!hasLiveMeta && eventMessages.length > 0) {
         const normalizedIncoming = eventMessages.map((item) => ({
           ...item,
           content: sanitizeSensitiveLogText(item?.content || '')
         }));
-        if (!hasLiveMeta) {
-          messages = [...messages, ...normalizedIncoming];
+        messages = mergeMessagesChronologically(messages, normalizedIncoming);
+      }
+      const persistedAssistant = assistantMessages.length > 0
+        ? assistantMessages
+        : (assistantMessage ? [assistantMessage] : []);
+      if (!hasLiveAssistant && persistedAssistant.length > 0) {
+        const assistantDedupSet = new Set(
+          messages
+            .filter((item) => String(item?.role || '').trim().toLowerCase() === 'assistant')
+            .map((item) => String(item?.content || '').trim())
+            .filter(Boolean)
+        );
+        const dedupedPersistedAssistant = persistedAssistant.filter((item) => {
+          const key = String(item?.content || '').trim();
+          if (!key) return true;
+          if (assistantDedupSet.has(key)) return false;
+          assistantDedupSet.add(key);
+          return true;
+        });
+        if (hasLiveMeta) {
+          // Preserve live terminal chronology; avoid global re-sort on assistant finalize.
+          messages = [...messages, ...dedupedPersistedAssistant];
         } else {
-          const existingMetaKeys = new Set(
-            messages
-              .filter((item) => ['event', 'stderr', 'activity'].includes(String(item?.role || '').trim().toLowerCase()))
-              .map((item) => `${String(item?.role || '').trim().toLowerCase()}|${String(item?.content || '').trim()}`)
-          );
-          const missingFromLive = normalizedIncoming.filter((item) => {
-            const key = `${String(item?.role || '').trim().toLowerCase()}|${String(item?.content || '').trim()}`;
-            return !existingMetaKeys.has(key);
-          });
-          if (missingFromLive.length > 0) {
-            messages = [...messages, ...missingFromLive];
-          }
+          messages = mergeMessagesChronologically(messages, dedupedPersistedAssistant);
         }
       }
-      if (assistantMessages.length > 0) {
-        messages = [...messages, ...assistantMessages];
-      } else if (assistantMessage) {
-        messages = [...messages, assistantMessage];
+      if (!(hasLiveMeta || hasLiveAssistant)) {
+        messages = sortMessagesChronologically(messages);
       }
       clearDraftForSession(session.id);
 
@@ -2697,25 +2754,32 @@
         backgroundProcessing = false;
       }
       stopRequested = false;
+      forceStopArmed = false;
     }
   }
 
   async function cancelStreaming() {
     if (!sending && !backgroundProcessing) return;
+    const force = forceStopArmed;
     stopRequested = true;
-    viewStatus = 'Stopping...';
+    if (force) {
+      viewStatus = 'Force stopping...';
+    } else {
+      forceStopArmed = true;
+      viewStatus = 'Stopping... press Force Stop to kill immediately.';
+    }
     const session = activeSession();
     if (session?.id) {
       try {
         await req('/api/coding/stop', {
           method: 'POST',
-          body: JSON.stringify({ session_id: session.id })
+          body: JSON.stringify({ session_id: session.id, force })
         });
       } catch {
       }
     }
     try {
-      if (wsStreamSocket) {
+      if (force && wsStreamSocket) {
         wsStreamSocket.close();
       }
     } catch {
@@ -2723,15 +2787,12 @@
   }
 
   function onComposerKeydown(event) {
-    if (event.shiftKey && event.key === 'Enter') {
-      event.preventDefault();
-      sendMessage();
-      return;
-    }
-    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-      event.preventDefault();
-      sendMessage();
-    }
+    if (event.key !== 'Enter') return;
+    if (event.isComposing) return;
+    if (event.shiftKey) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    event.preventDefault();
+    sendMessage();
   }
 
   function normalizePathInput(raw) {
@@ -2828,6 +2889,7 @@
               session_id: payload.session_id,
               content: payload.content,
               model: payload.model,
+              reasoning_level: payload.reasoning_level,
               work_dir: payload.work_dir,
               sandbox_mode: payload.sandbox_mode,
               command: payload.command
@@ -3005,6 +3067,7 @@
         if (persisted === 'raw' || persisted === 'compact') {
           logViewMode = persisted;
         }
+        selectedReasoningLevel = normalizeReasoningLevel(localStorage.getItem(reasoningLevelStorageKey));
       } catch {
       }
     }
@@ -3078,11 +3141,18 @@
       </div>
     </div>
     <div class="coding-topbar-right">
-      <select bind:value={selectedModel} onchange={queuePersistSessionPreferences} aria-label="Model for coding session">
-        {#each models as model}
-          <option value={model}>{model}</option>
-        {/each}
-      </select>
+      <div class="coding-topbar-selects">
+        <select class="coding-model-select" bind:value={selectedModel} onchange={queuePersistSessionPreferences} aria-label="Model for coding session">
+          {#each models as model}
+            <option value={model}>{model}</option>
+          {/each}
+        </select>
+        <select class="coding-reasoning-select" bind:value={selectedReasoningLevel} onchange={onReasoningLevelChange} aria-label="Reasoning level for coding session">
+          {#each reasoningLevels as level}
+            <option value={level.value}>Reasoning: {level.label}</option>
+          {/each}
+        </select>
+      </div>
       <div class="coding-view-mode-toggle" role="group" aria-label="coding output mode">
         <button
           class="btn topbar-icon-btn coding-view-toggle-btn {logViewMode === 'raw' ? 'mode-raw' : 'mode-compact'}"
@@ -3139,8 +3209,6 @@
                     <strong>
                       {#if message.role === 'assistant'}
                         {assistantDisplayName()}
-                      {:else if message.role === 'exec_group'}
-                        Terminal
                       {:else if message.role === 'exec'}
                         Terminal
                       {:else if message.role === 'subagent'}
@@ -3156,9 +3224,7 @@
                       {/if}
                     </strong>
                     <span>
-                      {#if message.role === 'exec_group'}
-                        {message.exec_group_count || (Array.isArray(message.exec_group_entries) ? message.exec_group_entries.length : 0)} commands
-                      {:else if message.role === 'exec'}
+                      {#if message.role === 'exec'}
                         {execStatusLabel(message.exec_status, message.exec_exit_code)}
                       {:else if message.role === 'subagent'}
                         {subagentStatusLabel(message.subagent_status)}
@@ -3169,23 +3235,14 @@
                       {/if}
                     </span>
                   </div>
-                  {#if message.role === 'exec_group'}
-                    <div class="coding-exec-summary">
-                      <code class="mono">{message.exec_group_count || (Array.isArray(message.exec_group_entries) ? message.exec_group_entries.length : 0)} terminal commands captured</code>
-                      <pre>{Array.isArray(message.exec_group_entries) ? message.exec_group_entries.slice(0, 3).map((entry) => `${execStatusLabel(entry.status, entry.exitCode)} · ${entry.command}`).join('\n') : '-'}</pre>
-                    </div>
-                    <button class="btn btn-secondary btn-small coding-exec-open" type="button" onclick={() => openExecBatchModal(message)}>
-                      View All Output
-                    </button>
-                  {:else if message.role === 'exec'}
+                  {#if message.role === 'exec'}
                     <div class="coding-exec-summary">
                       <code class="mono" title={message.exec_command || message.content || '-'}>
                         {message.exec_command || message.content || '-'}
                       </code>
-                      <pre>{execOutputPreview(message)}</pre>
                     </div>
                     <button class="btn btn-secondary btn-small coding-exec-open" type="button" onclick={() => openExecOutputModal(message)}>
-                      View Output
+                      Output
                     </button>
                   {:else if message.role === 'subagent'}
                     <div class="coding-subagent-summary">
@@ -3239,7 +3296,7 @@
 
         <div class="coding-composer">
           <textarea
-            placeholder="Write coding task here... (Shift+Enter to send). Supports /status, /review, and $skill"
+            placeholder="Write coding task here... (Enter to send, Shift+Enter for newline). Supports /status, /review, and $skill"
             bind:value={draftMessage}
             rows="4"
             onkeydown={onComposerKeydown}
@@ -3266,7 +3323,7 @@
               onclick={(sending || backgroundProcessing) ? cancelStreaming : sendMessage}
               disabled={(!(sending || backgroundProcessing) && !draftMessage.trim())}
             >
-              <span>{(sending || backgroundProcessing) ? 'Stop' : 'Send'}</span>
+              <span>{(sending || backgroundProcessing) ? (forceStopArmed ? 'Force Stop' : 'Stop') : 'Send'}</span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12l18-9-6 9 6 9-18-9z"></path></svg>
             </button>
           </div>
@@ -3279,7 +3336,15 @@
       <span class="coding-status-ws {wsHealthStatus}">
         [{wsStatusLabel(wsHealthStatus)}]
       </span>
-      <span class="coding-status-text">{viewStatus}</span>
+      <span class="coding-status-text {String(viewStatus || '').toLowerCase().startsWith('streaming') ? 'is-streaming' : ''}">
+        {#if String(viewStatus || '').toLowerCase().startsWith('streaming')}
+          <span class="status-streaming-pulse" aria-hidden="true"></span>
+          <span class="status-streaming-label">Streaming</span>
+          <span class="status-streaming-dots" aria-hidden="true"></span>
+        {:else}
+          {viewStatus}
+        {/if}
+      </span>
       {#if persistingSessionPrefs}
         <span class="coding-status-saving">Saving session settings...</span>
       {/if}
@@ -3310,36 +3375,6 @@
         <pre class="coding-exec-modal-output mono">{selectedExecEntry.output}</pre>
         {#if selectedExecEntry.when}
           <p class="setting-title">{formatWhen(selectedExecEntry.when)}</p>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if showExecBatchModal && selectedExecBatchEntry}
-  <div class="modal-backdrop modal-backdrop-coding" role="presentation">
-    <div class="modal-card modal-card-coding modal-card-exec-batch-output" role="dialog" aria-modal="true" tabindex="0" onkeydown={(event) => event.key === 'Escape' && closeExecBatchModal()}>
-      <div class="modal-head">
-        <div>
-          <h3>Terminal Output</h3>
-          <p class="modal-subtitle">{selectedExecBatchEntry.count} commands</p>
-        </div>
-        <button class="btn btn-secondary btn-small" onclick={closeExecBatchModal}>Close</button>
-      </div>
-      <div class="modal-body">
-        {#each selectedExecBatchEntry.entries as entry}
-          <div class="coding-exec-batch-item">
-            <p class="setting-title">{execStatusLabel(entry.status, entry.exitCode)}</p>
-            <pre class="coding-exec-modal-command mono">{entry.command}</pre>
-            <pre class="coding-exec-modal-output mono">{entry.output}</pre>
-          </div>
-        {/each}
-        {#if Array.isArray(selectedExecBatchEntry.meta) && selectedExecBatchEntry.meta.length > 0}
-          <p class="setting-title">Metadata Logs</p>
-          <pre class="coding-exec-batch-meta mono">{selectedExecBatchEntry.meta.map((item) => `[${item.role}] ${item.content}`).join('\n\n')}</pre>
-        {/if}
-        {#if selectedExecBatchEntry.when}
-          <p class="setting-title">{formatWhen(selectedExecBatchEntry.when)}</p>
         {/if}
       </div>
     </div>

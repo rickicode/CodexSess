@@ -29,6 +29,8 @@ type Config struct {
 	UsageAutoSwitchThreshold int               `yaml:"usage_auto_switch_threshold"`
 	UsageSchedulerEnabled    bool              `yaml:"usage_scheduler_enabled"`
 	UsageSchedulerInterval   int               `yaml:"usage_scheduler_interval_minutes"`
+	UsageRefreshTimeoutSec   int               `yaml:"usage_scheduler_refresh_timeout_seconds"`
+	UsageSwitchTimeoutSec    int               `yaml:"usage_scheduler_switch_timeout_seconds"`
 	DirectAPIStrategy        string            `yaml:"direct_api_strategy"`
 	CodingCLIStrategy        string            `yaml:"-"`
 	ZoAPIStrategy            string            `yaml:"zo_api_strategy"`
@@ -83,6 +85,8 @@ func Default() Config {
 		UsageAutoSwitchThreshold: 15,
 		UsageSchedulerEnabled:    true,
 		UsageSchedulerInterval:   5,
+		UsageRefreshTimeoutSec:   120,
+		UsageSwitchTimeoutSec:    45,
 		DirectAPIStrategy:        "round_robin",
 		CodingCLIStrategy:        "manual",
 		ZoAPIStrategy:            "round_robin",
@@ -184,6 +188,8 @@ func LoadOrInit() (Config, error) {
 		cfg.UsageAutoSwitchThreshold = def.UsageAutoSwitchThreshold
 	}
 	cfg.UsageSchedulerInterval = NormalizeUsageSchedulerIntervalMinutes(cfg.UsageSchedulerInterval)
+	cfg.UsageRefreshTimeoutSec = normalizeUsageRefreshTimeoutSecondsWithEnv(cfg.UsageRefreshTimeoutSec)
+	cfg.UsageSwitchTimeoutSec = normalizeUsageSwitchTimeoutSecondsWithEnv(cfg.UsageSwitchTimeoutSec)
 	if _, ok := raw["system_log_max_rows"]; !ok {
 		cfg.SystemLogMaxRows = def.SystemLogMaxRows
 	}
@@ -198,6 +204,12 @@ func LoadOrInit() (Config, error) {
 	}
 	if _, ok := raw["usage_scheduler_interval_minutes"]; !ok {
 		cfg.UsageSchedulerInterval = def.UsageSchedulerInterval
+	}
+	if _, ok := raw["usage_scheduler_refresh_timeout_seconds"]; !ok {
+		cfg.UsageRefreshTimeoutSec = def.UsageRefreshTimeoutSec
+	}
+	if _, ok := raw["usage_scheduler_switch_timeout_seconds"]; !ok {
+		cfg.UsageSwitchTimeoutSec = def.UsageSwitchTimeoutSec
 	}
 	if _, ok := raw["direct_api_inject_prompt"]; !ok {
 		cfg.DirectAPIInjectPrompt = def.DirectAPIInjectPrompt
@@ -324,6 +336,48 @@ func NormalizeUsageSchedulerIntervalMinutes(v int) int {
 		return 120
 	}
 	return v
+}
+
+func NormalizeUsageRefreshTimeoutSeconds(v int) int {
+	sec := v
+	if sec < 30 {
+		sec = 30
+	}
+	if sec > 600 {
+		sec = 600
+	}
+	return sec
+}
+
+func NormalizeUsageSwitchTimeoutSeconds(v int) int {
+	sec := v
+	if sec < 10 {
+		sec = 10
+	}
+	if sec > 300 {
+		sec = 300
+	}
+	return sec
+}
+
+func normalizeUsageRefreshTimeoutSecondsWithEnv(current int) int {
+	sec := current
+	if raw := strings.TrimSpace(os.Getenv("CODEXSESS_USAGE_SCHEDULER_REFRESH_TIMEOUT_SECONDS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			sec = parsed
+		}
+	}
+	return NormalizeUsageRefreshTimeoutSeconds(sec)
+}
+
+func normalizeUsageSwitchTimeoutSecondsWithEnv(current int) int {
+	sec := current
+	if raw := strings.TrimSpace(os.Getenv("CODEXSESS_USAGE_SCHEDULER_SWITCH_TIMEOUT_SECONDS")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			sec = parsed
+		}
+	}
+	return NormalizeUsageSwitchTimeoutSeconds(sec)
 }
 
 func resolveCLISwitchNotifyCmd(v string) string {

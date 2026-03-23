@@ -40,14 +40,16 @@ type ToolCall struct {
 }
 
 type ExecOptions struct {
-	CodexHome   string
-	WorkDir     string
-	Model       string
-	Prompt      string
-	ResumeID    string
-	Persist     bool
-	SandboxMode string
-	CommandMode string
+	CodexHome       string
+	WorkDir         string
+	Model           string
+	ReasoningEffort string
+	Prompt          string
+	ResumeID        string
+	Persist         bool
+	SandboxMode     string
+	CommandMode     string
+	OnProcessStart  func(pid int, forceKill func() error)
 }
 
 func NewCodexExec(binary string) *CodexExec {
@@ -92,6 +94,11 @@ func (c *CodexExec) ChatWithOptions(ctx context.Context, opts ExecOptions) (Chat
 	}
 	if err := cmd.Start(); err != nil {
 		return ChatResult{}, err
+	}
+	if opts.OnProcessStart != nil && cmd.Process != nil {
+		opts.OnProcessStart(cmd.Process.Pid, func() error {
+			return cmd.Process.Kill()
+		})
 	}
 	stderrBuf, stderrDone := drainPipe(stderr)
 
@@ -193,6 +200,11 @@ func (c *CodexExec) StreamChatWithOptions(ctx context.Context, opts ExecOptions,
 	}
 	if err := cmd.Start(); err != nil {
 		return ChatResult{}, err
+	}
+	if opts.OnProcessStart != nil && cmd.Process != nil {
+		opts.OnProcessStart(cmd.Process.Pid, func() error {
+			return cmd.Process.Kill()
+		})
 	}
 	stderrBuf, stderrDone := drainPipeWithLine(stderr, func(line string) {
 		if onEvent == nil {
@@ -908,6 +920,7 @@ func number(v any) float64 {
 
 func (c *CodexExec) buildExecArgs(opts ExecOptions, clean bool) []string {
 	model := strings.TrimSpace(opts.Model)
+	reasoningEffort := normalizeReasoningEffort(opts.ReasoningEffort)
 	prompt := strings.TrimSpace(opts.Prompt)
 	resumeID := strings.TrimSpace(opts.ResumeID)
 	sandboxMode := normalizeSandboxMode(opts.SandboxMode)
@@ -951,6 +964,7 @@ func (c *CodexExec) buildExecArgs(opts ExecOptions, clean bool) []string {
 			args = append(args, "-m", model)
 		}
 	}
+	args = append(args, "-c", fmt.Sprintf(`model_reasoning_effort="%s"`, reasoningEffort))
 	if prompt != "" {
 		// Use stdin prompt mode to avoid "argument list too long" when prompt/context is large.
 		args = append(args, "-")
@@ -959,6 +973,16 @@ func (c *CodexExec) buildExecArgs(opts ExecOptions, clean bool) []string {
 		args = append(args, "--ephemeral")
 	}
 	return args
+}
+
+func normalizeReasoningEffort(v string) string {
+	effort := strings.TrimSpace(strings.ToLower(v))
+	switch effort {
+	case "low", "high":
+		return effort
+	default:
+		return "medium"
+	}
 }
 
 func normalizeCommandMode(v string) string {

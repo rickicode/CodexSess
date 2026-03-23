@@ -96,7 +96,7 @@ func (s *Service) RestartCodingRuntime(ctx context.Context, sessionID string, fo
 	}
 
 	if inFlight && force {
-		s.StopCodingRun(sid)
+		s.StopCodingRun(sid, true)
 	}
 
 	session.RuntimeStatus = "restarting"

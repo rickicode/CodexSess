@@ -56,6 +56,10 @@ For normal usage, download binaries/packages from the latest release page:
   - persistent sessions and message history
   - workspace picker + path suggestions
   - WebSocket-based live activity stream (`/api/coding/ws`) with auto reconnect and connection status indicator (`[WS Connected/Connecting/Disconnected]`)
+  - chronological mixed timeline rendering (assistant + terminal + activity) with stable ordering for same-second events
+  - compact terminal grouping for contiguous command bursts, while preserving chat boundaries between groups
+  - file operation activity bubbles (`Edited`, `Read`, `Created`, `Deleted`, `Moved`, `Renamed`)
+  - two-step stop control (`Stop` then `Force Stop`) for running coding turns
   - slash commands (`/status`, `/review`) and skill picker
 - Zo OpenAI-compatible integration:
   - multi Zo API key management in dashboard
@@ -131,6 +135,8 @@ Windows installation:
   - CLI (Codex) active account
 - Multi-account routing strategy:
   - CLI `round_robin` rotation (default scheduler interval: 5 minutes)
+  - round-robin avoids immediate account reuse and prefers accounts that were not used in the recent window, while still falling back when options are limited
+  - round-robin never activates a CLI account with `weekly` usage equal to `0`
   - CLI `manual` auto-switch when remaining usage is below threshold
 - Usage refresh and automation:
   - threshold alerts
@@ -159,7 +165,11 @@ The experience is designed to feel practical for daily work:
 - You can resume existing sessions from the session list.
 - New session flow includes workspace picker with path suggestions.
 - Assistant responses and activity updates are streamed in real time over WebSocket (`/api/coding/ws`).
+- Timeline order is preserved across mixed bubble types (assistant, terminal, activity, subagent).
+- In compact mode, terminal bubbles are grouped only for contiguous command sequences; chat/activity barriers split groups.
+- File operation events appear as dedicated activity bubbles (`Edited`, `Read`, `Created`, `Deleted`, `Moved`, `Renamed`) instead of being hidden in raw logs.
 - The status line shows runtime connection state (`[WS Connected]`, `[WS Connecting]`, `[WS Disconnected]`) and reconnects automatically when connection drops.
+- Stop behavior is two-step for safety: first click requests graceful stop, second click escalates to force kill.
 - Helpful commands like `/status` and `/review` are available in chat.
 - Skill hints can be inserted quickly using `$skill_name`.
 
@@ -256,6 +266,8 @@ Behavior:
 | `CODEXSESS_NO_OPEN_BROWSER`       | `false`       | `CODEXSESS_NO_OPEN_BROWSER=true`                                | Disable automatic browser opening on startup. Truthy values: `1`, `true`, `yes`.                                                                                                        |
 | `CODEXSESS_CODEX_SANDBOX`         | `full-access` | `CODEXSESS_CODEX_SANDBOX=full-access`                           | Sandbox mode passed to `codex exec` (`write/workspace-write` is normalized to `full-access`).                                                                                           |
 | `CODEXSESS_CLEAN_EXEC`            | `true`        | `CODEXSESS_CLEAN_EXEC=false`                                    | Run Codex execution in isolated mode (`true`) or normal environment (`false`).                                                                                                          |
+| `CODEXSESS_USAGE_SCHEDULER_REFRESH_TIMEOUT_SECONDS` | `120` | `CODEXSESS_USAGE_SCHEDULER_REFRESH_TIMEOUT_SECONDS=240` | Timeout for scheduled usage refresh tick. Bounded to `30..600` seconds. |
+| `CODEXSESS_USAGE_SCHEDULER_SWITCH_TIMEOUT_SECONDS`  | `45`  | `CODEXSESS_USAGE_SCHEDULER_SWITCH_TIMEOUT_SECONDS=90`   | Timeout for autoswitch check phase (API/CLI) in scheduler tick. Bounded to `10..300` seconds. |
 | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD` | ``            | `CODEXSESS_CLI_SWITCH_NOTIFY_CMD="peon preview resource.limit"` | Optional command executed when CLI active account changes. Env: `CODEXSESS_CLI_SWITCH_FROM`, `CODEXSESS_CLI_SWITCH_TO`, `CODEXSESS_CLI_SWITCH_REASON`, `CODEXSESS_CLI_SWITCH_TO_EMAIL`. |
 
 Notes:

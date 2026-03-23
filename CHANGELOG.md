@@ -6,11 +6,23 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 
 ## [Unreleased]
 
-- No changes yet.
+### Changed
+- Usage scheduler now respects `usage_scheduler_enabled` and isolates refresh/autoswitch deadlines, so a refresh timeout no longer cascades into `autoswitch cli check failed: context deadline exceeded` in the same tick.
+- Usage scheduler timeout is now configurable via settings keys `usage_scheduler_refresh_timeout_seconds` and `usage_scheduler_switch_timeout_seconds` (with env overrides `CODEXSESS_USAGE_SCHEDULER_REFRESH_TIMEOUT_SECONDS` and `CODEXSESS_USAGE_SCHEDULER_SWITCH_TIMEOUT_SECONDS`).
+- CLI `round_robin` autoswitch now rotates `auth.json` with random weighted selection that excludes the current account and avoids recently-used accounts first, reducing near-term account reuse.
+- CLI `round_robin` autoswitch now enforces weekly-usage gating: accounts with `weekly=0` are excluded from CLI activation candidates (including fallback paths).
+- Coding sessions now persist `reasoning_level` across create/update/list/get flows, defaulting to `medium` when unset.
+- Web Coding runtime now allows concurrent `/chat` runs across different sessions by removing the global coding execution lock, while preserving per-session `session busy` protection to block only duplicate in-flight requests in the same session.
+- CLI round-robin auto-switch now recovers empty active CLI state even when usage-based candidates are unavailable (`usage=0/unknown`) by falling back to the earliest non-revoked account.
+- Web Chat message ordering now uses deterministic backend sequence (`rowid`) for same-timestamp events and frontend sequence-aware merge sorting to prevent bubble reordering during streaming.
+- Web Chat timeline rendering now preserves strict chronological order across roles (assistant, exec, activity, subagent) and no longer regroups terminal bubbles by category.
+- Web Chat compact mode now surfaces Codex file-operation events (`Edited`, `Read`, `Created`, `Deleted`, `Moved`, `Renamed`) as dedicated activity bubbles instead of hiding them with raw-event filtering.
+- CLI auth rotation hardening: `CODEX_HOME/auth.json` sync now uses atomic temp-file rename writes, and coding session bootstrap no longer suppresses `ActiveCLIAccountID` errors.
+- `/chat` stop control now uses two-step termination: first click requests graceful stop, second click switches to `Force Stop` and triggers immediate process kill on the active coding run.
 
 ## [1.0.3] - 2026-03-22
 
-### Web Coding (`/chat`)
+### Added (`/chat` Web Coding)
 - Added dedicated `/chat` web coding workspace with full-screen chat layout and persisted session history.
 - Chat transport on `/chat` uses WebSocket (`/api/coding/ws`) for live event streaming.
 - Added workspace-aware new session flow with folder picker and server-side path suggestions.
@@ -29,6 +41,9 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 - Improved `/chat` scroll UX during running streams: user scroll position is preserved when reading older messages and auto-follow to bottom is disabled until user jumps back.
 - Added floating `Jump to latest` button in `/chat` when conversation is scrolled away from bottom.
 - Made stale pagination cursors (`before_id`) resolve gracefully as end-of-history instead of returning request errors.
+- Added deterministic timeline ordering support for `/chat` messages (`sequence` + timestamp fallback) to keep mixed assistant/activity/terminal events stable in UI rendering.
+
+### Fixed
 - Fixed `/review` command argument handling so prompted review no longer sends conflicting `--uncommitted` + prompt flags to Codex CLI.
 
 ### Added

@@ -1,0 +1,15 @@
+.codex/
+.codexsess/
+tmp/
+web/node_modules/
+web/dist/
+*.log
+.history
+build
+dist/
+build/dist/
+codexsess
+internal/webui/assets/index.html
+internal/webui/assets/assets/
+assets/assets/*
+.omx/

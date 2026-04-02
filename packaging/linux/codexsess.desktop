@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CodexSess
+Comment=Codex Account Management
+Exec=codexsess
+Icon=codexsess
+Terminal=true
+Categories=Development;Utility;
+StartupNotify=true

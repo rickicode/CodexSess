@@ -1,0 +1,219 @@
+name: Build And Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install frontend deps
+        working-directory: web
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build:web
+
+      - name: Build Linux binaries
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-linux-arm64 .
+
+      - name: Prepare Linux desktop assets
+        run: |
+          mkdir -p dist/linux
+          go run ./scripts/gen_default_icon.go dist/linux/codexsess.png
+          cp packaging/linux/codexsess.desktop dist/linux/codexsess.desktop
+          chmod +x packaging/linux/postinstall.sh packaging/linux/postremove.sh
+
+      - name: Install nFPM
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Build DEB and RPM packages (amd64 + arm64)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist/packages
+          PKG_VERSION="${VERSION#v}"
+          cat > dist/nfpm-amd64.yaml <<EOF
+          name: codexsess_GUI
+          arch: amd64
+          platform: linux
+          version: ${PKG_VERSION}
+          section: default
+          priority: optional
+          maintainer: rickicode
+          description: CodexSess - Codex account management gateway
+          vendor: CodexSess
+          homepage: https://github.com/rickicode/CodexSess
+          license: MIT
+          contents:
+            - src: ./dist/codexsess-linux-amd64
+              dst: /usr/bin/codexsess
+              file_info:
+                mode: 0755
+            - src: ./dist/linux/codexsess.desktop
+              dst: /usr/share/applications/codexsess.desktop
+              file_info:
+                mode: 0644
+            - src: ./dist/linux/codexsess.png
+              dst: /usr/share/icons/hicolor/64x64/apps/codexsess.png
+              file_info:
+                mode: 0644
+          scripts:
+            postinstall: ./packaging/linux/postinstall.sh
+            postremove: ./packaging/linux/postremove.sh
+          EOF
+
+          cat > dist/nfpm-arm64.yaml <<EOF
+          name: codexsess_GUI
+          arch: arm64
+          platform: linux
+          version: ${PKG_VERSION}
+          section: default
+          priority: optional
+          maintainer: rickicode
+          description: CodexSess - Codex account management gateway
+          vendor: CodexSess
+          homepage: https://github.com/rickicode/CodexSess
+          license: MIT
+          contents:
+            - src: ./dist/codexsess-linux-arm64
+              dst: /usr/bin/codexsess
+              file_info:
+                mode: 0755
+            - src: ./dist/linux/codexsess.desktop
+              dst: /usr/share/applications/codexsess.desktop
+              file_info:
+                mode: 0644
+            - src: ./dist/linux/codexsess.png
+              dst: /usr/share/icons/hicolor/64x64/apps/codexsess.png
+              file_info:
+                mode: 0644
+          scripts:
+            postinstall: ./packaging/linux/postinstall.sh
+            postremove: ./packaging/linux/postremove.sh
+          EOF
+
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-amd64.yaml --packager deb --target dist/packages/codexsess_GUI_${PKG_VERSION}_amd64.deb
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-amd64.yaml --packager rpm --target dist/packages/codexsess_GUI-${PKG_VERSION}-1.x86_64.rpm
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-arm64.yaml --packager deb --target dist/packages/codexsess_GUI_${PKG_VERSION}_arm64.deb
+          "$(go env GOPATH)/bin/nfpm" package --config dist/nfpm-arm64.yaml --packager rpm --target dist/packages/codexsess_GUI-${PKG_VERSION}-1.aarch64.rpm
+
+      - name: Build Windows binaries with icon
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p build/windows
+          go run ./scripts/gen_default_icon.go build/windows/app.ico
+          go run github.com/akavel/rsrc@latest -ico build/windows/app.ico -o codexsess_windows_amd64.syso
+          go run github.com/akavel/rsrc@latest -ico build/windows/app.ico -o codexsess_windows_arm64.syso
+          GOOS=windows GOARCH=amd64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-windows-amd64.exe .
+          GOOS=windows GOARCH=arm64 go build -ldflags "-X main.appVersion=${VERSION}" -o dist/codexsess-windows-arm64.exe .
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum \
+            codexsess-linux-amd64 \
+            codexsess-linux-arm64 \
+            codexsess-windows-amd64.exe \
+            codexsess-windows-arm64.exe > SHA256SUMS.txt
+          sha256sum packages/*.deb packages/*.rpm >> SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: codexsess-build-${{ github.run_number }}
+          path: |
+            dist/codexsess-linux-amd64
+            dist/codexsess-linux-arm64
+            dist/codexsess-windows-amd64.exe
+            dist/codexsess-windows-arm64.exe
+            dist/SHA256SUMS.txt
+            dist/packages/*.deb
+            dist/packages/*.rpm
+
+      - name: Extract changelog for current tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: changelog
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          awk -v v="${TAG}" '
+            BEGIN { capture = 0 }
+            /^## \[/ {
+              if (capture) exit
+              if ($0 ~ "^## \\[" v "\\]" || $0 ~ "^## \\[v" v "\\]") {
+                capture = 1
+                next
+              }
+            }
+            capture { print }
+          ' CHANGELOG.md > dist/release-notes.raw.md
+
+          sed -e '/^[[:space:]]*$/N;/^\n$/D' dist/release-notes.raw.md > dist/release-notes.md || true
+
+          if [ -s dist/release-notes.md ]; then
+            echo "has_changelog=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changelog=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          ASSETS=(
+            dist/codexsess-linux-amd64
+            dist/codexsess-linux-arm64
+            dist/codexsess-windows-amd64.exe
+            dist/codexsess-windows-arm64.exe
+            dist/SHA256SUMS.txt
+            dist/packages/*.deb
+            dist/packages/*.rpm
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+              gh release edit "$TAG" --notes-file dist/release-notes.md
+            fi
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+            exit 0
+          fi
+
+          if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+            gh release create "$TAG" "${ASSETS[@]}" --notes-file dist/release-notes.md
+          else
+            gh release create "$TAG" "${ASSETS[@]}" --title "$TAG"
+          fi

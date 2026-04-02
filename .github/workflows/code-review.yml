@@ -1,0 +1,538 @@
+name: CodexSess Review And Autofix
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: "Target branch/tag/sha for manual run (e.g. main)"
+        required: false
+        default: "main"
+        type: string
+      review_scope:
+        description: "Review scope: diff (changes) or full (entire repository)"
+        required: false
+        default: "full"
+        type: choice
+        options:
+          - full
+          - diff
+      review_focus:
+        description: "Optional focus area for manual run (e.g. auth, api, performance, tests)"
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  review_autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate required secrets
+        env:
+          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
+          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CODEXSESS_URL:-}" ] || [ -z "${CODEXSESS_API_KEY:-}" ]; then
+            echo "Missing CODEXSESS_URL or CODEXSESS_API_KEY secret"
+            exit 1
+          fi
+
+      - name: Resolve execution context
+        id: ctx
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            let mode = 'manual';
+            let reportToPR = 'false';
+            let prNumber = '';
+            let title = '';
+            let baseSha = '';
+            let headSha = '';
+            let checkoutRepo = `${owner}/${repo}`;
+            let checkoutRef = (context.payload.inputs && context.payload.inputs.target_ref) || '${{ github.event.inputs.target_ref }}' || 'main';
+            let headRef = checkoutRef;
+            let sameRepo = 'true';
+
+            if (context.eventName === 'pull_request') {
+              mode = 'pr';
+              reportToPR = 'true';
+              const pr = context.payload.pull_request;
+              prNumber = String(pr.number);
+              title = pr.title || `PR #${pr.number}`;
+              baseSha = pr.base.sha;
+              headSha = pr.head.sha;
+              checkoutRepo = pr.head.repo.full_name;
+              checkoutRef = pr.head.ref;
+              headRef = pr.head.ref;
+              sameRepo = pr.head.repo.full_name === `${owner}/${repo}` ? 'true' : 'false';
+            } else {
+              title = `Manual review on ${checkoutRef}`;
+            }
+
+            core.setOutput('mode', mode);
+            core.setOutput('report_to_pr', reportToPR);
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('title', title);
+            core.setOutput('base_sha', baseSha);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('checkout_repo', checkoutRepo);
+            core.setOutput('checkout_ref', checkoutRef);
+            core.setOutput('head_ref', headRef);
+            core.setOutput('same_repo', sameRepo);
+
+      - name: Resolve review mode
+        id: mode
+        env:
+          REVIEW_SCOPE_INPUT: ${{ github.event.inputs.review_scope || '' }}
+          REVIEW_FOCUS_INPUT: ${{ github.event.inputs.review_focus || '' }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.ctx.outputs.mode }}" = "pr" ]; then
+            scope="diff"
+            focus=""
+          else
+            scope="full"
+            case "${REVIEW_SCOPE_INPUT:-full}" in
+              full|diff) scope="${REVIEW_SCOPE_INPUT:-full}" ;;
+              *) scope="full" ;;
+            esac
+            focus="$(printf '%s' "${REVIEW_FOCUS_INPUT:-}" | tr -d '\r' | xargs)"
+          fi
+          echo "scope=${scope}" >> "$GITHUB_OUTPUT"
+          echo "focus=${focus}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.ctx.outputs.checkout_repo }}
+          ref: ${{ steps.ctx.outputs.checkout_ref }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Setup Go (for security tooling)
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: "go.mod"
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@latest
+
+      - name: Install security tools for Codex review
+        run: |
+          set -euo pipefail
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user semgrep
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          go install github.com/zricethezav/gitleaks/v8@latest
+
+      - name: Download auth.json from CodexSess
+        env:
+          CODEXSESS_URL: ${{ secrets.CODEXSESS_URL }}
+          CODEXSESS_API_KEY: ${{ secrets.CODEXSESS_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.codex"
+          curl -fsSL \
+            "${CODEXSESS_URL%/}/v1/auth.json" \
+            -H "Authorization: Bearer ${CODEXSESS_API_KEY}" \
+            -o "$HOME/.codex/auth.json"
+          jq empty "$HOME/.codex/auth.json"
+          chmod 600 "$HOME/.codex/auth.json"
+
+      - name: Configure default MCP servers for Codex (CI)
+        env:
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.codex"
+          cat > "$HOME/.codex/config.toml" <<EOF
+          [mcp_servers.filesystem]
+          command = "npx"
+          args = ["-y", "@modelcontextprotocol/server-filesystem", "${GITHUB_WORKSPACE}"]
+
+          [mcp_servers.sequential_thinking]
+          command = "npx"
+          args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+
+          [mcp_servers.memory]
+          command = "npx"
+          args = ["-y", "@modelcontextprotocol/server-memory"]
+          EOF
+
+          if [ -n "${EXA_API_KEY:-}" ]; then
+            cat >> "$HOME/.codex/config.toml" <<EOF
+
+          [mcp_servers.exa]
+          command = "npx"
+          args = ["-y", "exa-mcp-server"]
+
+          [mcp_servers.exa.env]
+          EXA_API_KEY = "${EXA_API_KEY}"
+          EOF
+            echo "EXA MCP enabled (EXA_API_KEY is set)."
+          else
+            echo "EXA MCP disabled (EXA_API_KEY is not set)."
+          fi
+
+      - name: Build review diff
+        id: diff
+        run: |
+          set -euo pipefail
+          : > pr.diff
+          has_diff="false"
+          if [ "${{ steps.mode.outputs.scope }}" = "diff" ]; then
+            if [ "${{ steps.ctx.outputs.mode }}" = "pr" ]; then
+              git diff --unified=3 "${{ steps.ctx.outputs.base_sha }}...${{ steps.ctx.outputs.head_sha }}" > pr.diff
+            else
+              if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+                git diff --unified=3 HEAD~1..HEAD > pr.diff
+              fi
+            fi
+            if [ -s pr.diff ]; then
+              has_diff="true"
+            fi
+          fi
+          echo "has_diff=${has_diff}" >> "$GITHUB_OUTPUT"
+
+      - name: Temporarily disable local AGENTS instructions for CI codex run
+        run: |
+          set -euo pipefail
+          if [ -f AGENTS.md ]; then
+            mv AGENTS.md .codexsess-ci.AGENTS.md.bak
+          fi
+
+      - name: Run review with Codex
+        env:
+          BASE_SHA: ${{ steps.ctx.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+          REVIEW_TITLE: ${{ steps.ctx.outputs.title }}
+          REVIEW_SCOPE: ${{ steps.mode.outputs.scope }}
+          REVIEW_FOCUS: ${{ steps.mode.outputs.focus }}
+          EXEC_MODE: ${{ steps.ctx.outputs.mode }}
+          HAS_DIFF: ${{ steps.diff.outputs.has_diff }}
+        run: |
+          set -euo pipefail
+          scope_instruction='Review the ENTIRE repository (not limited to current diff). Start from the current working tree and inspect relevant files directly.'
+          if [ "${REVIEW_SCOPE}" = "diff" ]; then
+            scope_instruction='Use git to inspect changes in `pr.diff`.'
+            if [ "${HAS_DIFF}" != "true" ]; then
+              scope_instruction='No diff snapshot available. Fall back to repository-level review and report this condition clearly.'
+            fi
+          fi
+          focus_instruction=''
+          if [ -n "${REVIEW_FOCUS}" ]; then
+            focus_instruction="Extra focus requested by maintainer: ${REVIEW_FOCUS}"
+          fi
+          cat > review_prompt.txt <<PROMPT
+          You are reviewing code changes.
+          Execution mode: ${EXEC_MODE}
+          Context title: "${REVIEW_TITLE}"
+          Primary objective: find correctness bugs, regressions, and security vulnerabilities that could lead to compromise.
+          Perform a defensive security audit, not only style review.
+          You are allowed to run local security tools to verify findings when useful.
+          Available tools in this workflow:
+          - semgrep
+          - gitleaks
+          - gosec
+          - govulncheck
+          Use tool output as evidence and map findings to concrete files.
+          Security focus (non-exhaustive):
+          - Authentication and authorization bypass
+          - Privilege escalation paths
+          - Secret/token leakage (logs, errors, config, client exposure)
+          - Injection risks (SQL/NoSQL/command/template/code)
+          - Path traversal, SSRF, open redirect, unsafe file access
+          - CSRF/CORS/session/cookie misconfiguration
+          - Insecure deserialization / unsafe parsing
+          - Race conditions and TOCTOU in auth/state-changing flows
+          - Weak input validation / missing bounds checks
+          - Unsafe defaults, insecure debug behavior, missing rate limiting
+          - Dependency/supply-chain risk introduced by code changes
+          For each finding, explain realistic exploit impact and attack path.
+          If evidence is insufficient, say "needs verification" instead of guessing.
+          Output concise markdown with:
+          1) Summary
+          2) Findings ordered by severity (Critical/High/Medium/Low)
+             - For each finding include:
+               - Title
+               - Affected file/path
+               - Why exploitable (or why likely)
+               - Impact
+               - Minimal concrete fix
+               - Verification step/test
+          3) Concrete fix suggestions
+          4) Residual testing gaps
+          ${scope_instruction}
+          ${focus_instruction}
+          PROMPT
+          REVIEW_PROMPT="$(cat review_prompt.txt)"
+          codex exec \
+            --dangerously-bypass-approvals-and-sandbox \
+            --skip-git-repo-check \
+            -m gpt-5.2-codex \
+            "$REVIEW_PROMPT" > review.txt
+          if [ ! -s review.txt ]; then
+            echo "No review output generated." > review.txt
+          fi
+
+      - name: Run autofix with Codex
+        env:
+          REVIEW_TITLE: ${{ steps.ctx.outputs.title }}
+          REVIEW_SCOPE: ${{ steps.mode.outputs.scope }}
+          REVIEW_FOCUS: ${{ steps.mode.outputs.focus }}
+        run: |
+          set -euo pipefail
+          REVIEW_SNIPPET="$(head -c 20000 review.txt | tr '\0' ' ')"
+          mode_hint='Primary target: full repository findings.'
+          if [ "${REVIEW_SCOPE}" = "diff" ]; then
+            mode_hint='Primary target: diff findings.'
+          fi
+          focus_hint=''
+          if [ -n "${REVIEW_FOCUS}" ]; then
+            focus_hint="Maintainer focus: ${REVIEW_FOCUS}"
+          fi
+          cat > autofix_prompt.txt <<PROMPT
+          You are applying safe autofixes based on the latest review report.
+          Context title: "${REVIEW_TITLE}"
+          ${mode_hint}
+          ${focus_hint}
+
+          Review findings to address:
+          $REVIEW_SNIPPET
+
+          Instructions:
+          - Prioritize security vulnerabilities first (Critical/High), then correctness bugs.
+          - Apply minimal, safe fixes directly in repository files.
+          - Run available security tools when needed to verify fixes and reduce false positives.
+          - Do not modify unrelated files.
+          - Keep behavior backward-compatible unless fix requires change.
+          - Prefer hardening that reduces exploitability (validation, auth checks, safer defaults, secret handling).
+          - Avoid introducing new config/runtime requirements unless strictly necessary.
+          - If a finding cannot be safely fixed automatically, skip it.
+          - After edits, leave the repo in a consistent state.
+          Final response format (no code snippets):
+          1) Applied Fix Summary
+          2) Files Touched (path + reason)
+          3) Findings Skipped (with reason)
+          4) Verification Notes
+          PROMPT
+          AUTOFIX_PROMPT="$(cat autofix_prompt.txt)"
+          codex exec \
+            --dangerously-bypass-approvals-and-sandbox \
+            --skip-git-repo-check \
+            -m gpt-5.2-codex \
+            "$AUTOFIX_PROMPT" > autofix.txt || true
+
+      - name: Restore local AGENTS instructions
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f .codexsess-ci.AGENTS.md.bak ]; then
+            mv .codexsess-ci.AGENTS.md.bak AGENTS.md
+          fi
+
+      - name: Commit and push autofix
+        id: pushfix
+        if: steps.ctx.outputs.mode == 'manual' || steps.ctx.outputs.same_repo == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "codexsess-bot"
+          git config user.email "codexsess-bot@users.noreply.github.com"
+
+          target_ref="${{ steps.ctx.outputs.head_ref }}"
+          if [ "${{ steps.ctx.outputs.mode }}" = "manual" ]; then
+            target_ref="codexsess/manual-autofix-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            git checkout -b "${target_ref}"
+          fi
+
+          # Never include CI scratch artifacts in autofix commits.
+          rm -f review.txt autofix.txt review_prompt.txt autofix_prompt.txt pr.diff || true
+
+          git add -A
+          # Never allow workflow-file edits from this automation branch, because
+          # default GitHub App tokens often lack workflows:write permission.
+          git restore --staged .github/workflows/*.yml 2>/dev/null || true
+          git checkout -- .github/workflows/*.yml 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore: codexsess autofix (${target_ref})"
+          git push origin "HEAD:${target_ref}"
+
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=${target_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Create PR for manual autofix branch
+        id: manualpr
+        if: steps.ctx.outputs.mode == 'manual' && steps.pushfix.outputs.pushed == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = '${{ steps.pushfix.outputs.branch }}';
+            const base = '${{ steps.ctx.outputs.checkout_ref }}';
+            const title = `chore: codexsess manual autofix (${head})`;
+            const body = [
+              'Automated manual review/autofix branch generated by CodexSess workflow.',
+              '',
+              `- Base: \`${base}\``,
+              `- Head: \`${head}\``,
+              `- Scope: \`${{ steps.mode.outputs.scope }}\``,
+              `- Focus: \`${{ steps.mode.outputs.focus || '-' }}\``
+            ].join('\n');
+
+            let prNumber = '';
+            try {
+              const { data: created } = await github.rest.pulls.create({
+                owner,
+                repo,
+                title,
+                head,
+                base,
+                body
+              });
+              prNumber = String(created.number);
+            } catch (err) {
+              if (err.status === 422) {
+                const { data: pulls } = await github.rest.pulls.list({
+                  owner,
+                  repo,
+                  state: 'open',
+                  head: `${owner}:${head}`,
+                  base
+                });
+                if (pulls.length > 0) {
+                  prNumber = String(pulls[0].number);
+                } else {
+                  throw err;
+                }
+              } else {
+                throw err;
+              }
+            }
+
+            core.setOutput('number', prNumber);
+
+      - name: Report result to PR
+        if: steps.ctx.outputs.report_to_pr == 'true' || steps.manualpr.outputs.number != ''
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = Number('${{ steps.ctx.outputs.pr_number || steps.manualpr.outputs.number }}');
+            const marker = '<!-- codexsess-review-autofix -->';
+            let review = 'No review output generated.';
+            try {
+              review = fs.readFileSync('review.txt', 'utf8').trim() || review;
+            } catch (_) {}
+            if (review.length > 30000) review = review.slice(0, 30000) + '\n\n... (truncated)';
+            let autofix = 'No autofix output generated.';
+            try {
+              autofix = fs.readFileSync('autofix.txt', 'utf8').trim() || autofix;
+            } catch (_) {}
+            if (autofix.length > 15000) autofix = autofix.slice(0, 15000) + '\n\n... (truncated)';
+            // Keep PR comments focused on analysis/results (no raw code blocks).
+            review = review.replace(/```[\s\S]*?```/g, '[code omitted]');
+            autofix = autofix.replace(/```[\s\S]*?```/g, '[code omitted]');
+
+            const reviewScope = '${{ steps.mode.outputs.scope }}' || 'diff';
+            const reviewFocus = '${{ steps.mode.outputs.focus }}' || '-';
+            const pushed = '${{ steps.pushfix.outputs.pushed || 'false' }}' === 'true';
+            const sameRepo = '${{ steps.ctx.outputs.same_repo }}' === 'true';
+            const execMode = '${{ steps.ctx.outputs.mode }}';
+            let autofixStatus = '';
+            if (execMode === 'manual' && pushed) {
+              autofixStatus = `Autofix branch pushed: \`${'${{ steps.pushfix.outputs.branch }}'}\``;
+            } else if (!sameRepo) {
+              autofixStatus = 'Autofix generated but push skipped (fork PR / external head repository).';
+            } else if (pushed) {
+              autofixStatus = 'Autofix commit has been pushed to this PR branch.';
+            } else {
+              autofixStatus = 'No safe autofix changes were applied.';
+            }
+
+            const body = `${marker}
+            ## CodexSess Automated Review
+
+            - Scope: \`${reviewScope}\`
+            - Focus: \`${reviewFocus}\`
+
+            ${review}
+
+            ### Autofix Status
+            ${autofixStatus}
+
+            ### Autofix Analysis
+            ${autofix}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+            const existing = comments.find(c =>
+              c.user?.type === 'Bot' &&
+              typeof c.body === 'string' &&
+              c.body.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Manual run summary
+        if: steps.ctx.outputs.mode == 'manual'
+        run: |
+          {
+            echo "## CodexSess Manual Review Result"
+            echo ""
+            echo "- Scope: \`${{ steps.mode.outputs.scope }}\`"
+            echo "- Focus: \`${{ steps.mode.outputs.focus || '-' }}\`"
+            echo "- Target ref: \`${{ steps.ctx.outputs.checkout_ref }}\`"
+            if [ "${{ steps.pushfix.outputs.pushed }}" = "true" ]; then
+              echo "- Autofix branch: \`${{ steps.pushfix.outputs.branch }}\`"
+            else
+              echo "- Autofix branch: \`none (no safe changes)\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,20 @@
+{
+  "name": "codexsess-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "VITE_APP_MODE=web vite",
+    "build": "npm run build:web",
+    "build:web": "VITE_APP_MODE=web vite build",
+    "build:desktop": "VITE_APP_MODE=web vite build",
+    "test:unit": "node --test src/views/coding/*.test.js",
+    "check": "npm run build:web",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.0.0",
+    "svelte": "^5.38.0",
+    "vite": "^8.0.0"
+  }
+}

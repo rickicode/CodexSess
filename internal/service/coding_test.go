@@ -286,7 +286,7 @@ func TestEnsureCodingRuntimeHome_SanitizesLegacyRuntimeSkillsAndMemoryConfig(t *
 	if err := os.WriteFile(filepath.Join(runtimeHome, "skills", "using-superpowers", "SKILL.md"), []byte("# legacy\n"), 0o600); err != nil {
 		t.Fatalf("write legacy using-superpowers: %v", err)
 	}
-	legacyConfig := "approval_policy = \"never\"\n\n[mcp_servers.memory]\ncommand = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-memory\"]\n"
+	legacyConfig := "approval_policy = \"never\"\n\n[mcp_servers.memory]\ncommand = \"npx\"\nargs = [\"-y\", \"@modelcontextprotocol/server-memory\"]\n\n[mcp_servers.codex_apps]\nurl = \"https://example.invalid/mcp\"\n"
 	if err := os.WriteFile(filepath.Join(runtimeHome, "config.toml"), []byte(legacyConfig), 0o600); err != nil {
 		t.Fatalf("write legacy runtime config: %v", err)
 	}
@@ -316,6 +316,9 @@ func TestEnsureCodingRuntimeHome_SanitizesLegacyRuntimeSkillsAndMemoryConfig(t *
 	}
 	if strings.Contains(string(raw), "[mcp_servers.memory]") {
 		t.Fatalf("expected runtime config to remove mcp_servers.memory, got %q", string(raw))
+	}
+	if strings.Contains(string(raw), "[mcp_servers.codex_apps]") {
+		t.Fatalf("expected runtime config to remove mcp_servers.codex_apps, got %q", string(raw))
 	}
 }
 
@@ -478,7 +481,7 @@ func TestEnsureCodingTemplateHome_SyncsUserCodexBaseline(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(sourceRoot, "skills", "custom-skill", "SKILL.md"), []byte("# custom skill\n"), 0o600); err != nil {
 		t.Fatalf("write skill file: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(sourceRoot, "config.toml"), []byte("[mcp_servers.custom]\ncommand = \"npx\"\nargs = [\"custom-mcp\"]\nuser_theme = \"midnight\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(sourceRoot, "config.toml"), []byte("user_theme = \"midnight\"\n\n[mcp_servers.custom]\ncommand = \"npx\"\nargs = [\"custom-mcp\"]\n\n[mcp_servers.codex_apps]\nurl = \"https://example.invalid/mcp\"\n"), 0o600); err != nil {
 		t.Fatalf("write source config: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(sourceRoot, "settings.json"), []byte(`{"theme":"midnight","telemetry":false}`), 0o600); err != nil {
@@ -517,9 +520,12 @@ func TestEnsureCodingTemplateHome_SyncsUserCodexBaseline(t *testing.T) {
 			t.Fatalf("expected synced template config to contain %q, got %q", want, configText)
 		}
 	}
+	if strings.Contains(configText, `[mcp_servers.codex_apps]`) {
+		t.Fatalf("expected synced template config to remove mcp_servers.codex_apps, got %q", configText)
+	}
 
-	if _, err := os.Stat(filepath.Join(root, "skills", "custom-skill", "SKILL.md")); err != nil {
-		t.Fatalf("expected skill file to sync into template home: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "skills", "custom-skill", "SKILL.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected template home to avoid syncing local user skills, got err=%v", err)
 	}
 	for _, skill := range []string{
 		"using-superpowers",
@@ -555,14 +561,8 @@ func TestEnsureCodingTemplateHome_SyncsUserCodexBaseline(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(sourceRoot, "agents", "agent-installer.toml")); err != nil {
 		t.Fatalf("expected missing bundled agent to be installed into user codex home: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(sourceRoot, "skills", "brainstorming", "SKILL.md")); err != nil {
-		t.Fatalf("expected bundled brainstorming skill to be installed into user codex home: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(sourceRoot, "skills", "brainstorming", "scripts", "frame-template.html")); err != nil {
-		t.Fatalf("expected bundled brainstorming frame template in user codex home: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(sourceRoot, "skills", "brainstorming", "scripts", "helper.js")); err != nil {
-		t.Fatalf("expected bundled brainstorming helper script in user codex home: %v", err)
+	if _, err := os.Stat(filepath.Join(sourceRoot, "skills", "brainstorming", "SKILL.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected user codex home to avoid bundled skill install, got err=%v", err)
 	}
 	templateBundledRaw, err := os.ReadFile(filepath.Join(root, "agents", "agent-organizer.toml"))
 	if err != nil {
@@ -576,6 +576,26 @@ func TestEnsureCodingTemplateHome_SyncsUserCodexBaseline(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "auth.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected auth.json not to sync into template home, got err=%v", err)
+	}
+}
+
+func TestEnsureCodingTemplateHome_FailsWithoutSuperpowersRepoEvenWhenLocalSkillsExist(t *testing.T) {
+	homeRoot := t.TempDir()
+	t.Setenv("HOME", homeRoot)
+
+	sourceRoot := filepath.Join(homeRoot, ".codex")
+	if err := os.MkdirAll(filepath.Join(sourceRoot, "skills", "brainstorming"), 0o700); err != nil {
+		t.Fatalf("seed local skills dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceRoot, "skills", "brainstorming", "SKILL.md"), []byte("# local only\n"), 0o600); err != nil {
+		t.Fatalf("write local skill file: %v", err)
+	}
+
+	svc, _, _, _ := newCodingTestService(t)
+	t.Setenv(codingSuperpowersRepoPathEnv, filepath.Join(t.TempDir(), "missing-superpowers-source"))
+	t.Setenv(codingSuperpowersRepoURLEnv, "https://example.invalid/superpowers.git")
+	if _, err := svc.ensureCodingTemplateHome(); err == nil {
+		t.Fatalf("expected ensureCodingTemplateHome to fail without superpowers repo")
 	}
 }
 
@@ -1112,6 +1132,96 @@ exit 1
 	}
 	if len(streamed) == 0 {
 		t.Fatalf("expected streamed events")
+	}
+}
+
+func TestSendCodingMessageStream_PrioritizesSubagentAndMCPEventsOverCommandOutputSpam(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+	svc, st, cry, cfg := newCodingTestService(t)
+	seedCodingTestAccount(t, st, cry, cfg, "acc_priority_chat", "priority-chat@example.com", false)
+	svc.Codex.Binary = writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/start"'; then
+      echo '{"id":"2","result":{"thread":{"id":"thread_priority_chat"}}}'
+      echo '{"method":"thread/started","params":{"thread":{"id":"thread_priority_chat"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      echo '{"id":"3","result":{"turn":{"id":"turn_priority_chat","status":"inProgress"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"thread_priority_chat","turn":{"id":"turn_priority_chat"}}}'
+      i=1
+      while [ "$i" -le 260 ]; do
+        echo '{"method":"item/commandExecution/outputDelta","params":{"threadId":"thread_priority_chat","turnId":"turn_priority_chat","delta":"spam-'$i'"}}'
+        i=$((i + 1))
+      done
+      echo '{"method":"item/started","params":{"threadId":"thread_priority_chat","turnId":"turn_priority_chat","item":{"type":"tool_call","name":"spawn_agent","id":"subagent-call-1","arguments":"{\"message\":\"inspect view\"}"}}}'
+      echo '{"method":"item/completed","params":{"threadId":"thread_priority_chat","turnId":"turn_priority_chat","item":{"type":"tool_call","name":"mcp__github__search_code","id":"mcp-call-1","output":{"content":[{"type":"text","text":"{\"total_count\":0}"}]}}}}'
+      echo '{"method":"item/completed","params":{"threadId":"thread_priority_chat","turnId":"turn_priority_chat","item":{"type":"agentMessage","id":"item_agent","text":"done"}}}'
+      echo '{"method":"turn/completed","params":{"threadId":"thread_priority_chat","turn":{"id":"turn_priority_chat","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`)
+	createCodingTestSession(t, st, cfg, "sess_priority_chat")
+
+	result, err := svc.SendCodingMessageStream(
+		t.Context(),
+		"sess_priority_chat",
+		"trigger subagent and mcp",
+		"gpt-5.2-codex",
+		"medium",
+		"~/",
+		"full-access",
+		"chat",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("SendCodingMessageStream: %v", err)
+	}
+	if got := strings.TrimSpace(result.Assistant.Content); got != "done" {
+		t.Fatalf("expected final assistant content, got %q", got)
+	}
+
+	history, err := st.ListCodingMessages(t.Context(), "sess_priority_chat")
+	if err != nil {
+		t.Fatalf("ListCodingMessages: %v", err)
+	}
+
+	foundSpawnEvent := false
+	foundMCPEvent := false
+	foundTruncated := false
+	for _, msg := range history {
+		text := strings.TrimSpace(strings.ToLower(msg.Content))
+		if strings.Contains(text, "spawn_agent") {
+			foundSpawnEvent = true
+		}
+		if strings.Contains(text, "mcp__github__search_code") {
+			foundMCPEvent = true
+		}
+		if strings.Contains(text, "event log truncated:") {
+			foundTruncated = true
+		}
+	}
+	if !foundTruncated {
+		t.Fatalf("expected truncation marker when spam exceeds persistence limit")
+	}
+	if !foundSpawnEvent {
+		t.Fatalf("expected persisted raw history to retain spawn_agent event under truncation")
+	}
+	if !foundMCPEvent {
+		t.Fatalf("expected persisted raw history to retain mcp__github__search_code event under truncation")
 	}
 }
 

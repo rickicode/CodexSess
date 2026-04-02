@@ -14,7 +14,7 @@ import (
 	"github.com/ricki/codexsess/internal/store"
 )
 
-func (s *Server) handleOpenAIV1Root(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOpenAIRoot(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.handleModels(w, r)

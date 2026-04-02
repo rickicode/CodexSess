@@ -93,6 +93,76 @@ test("reconcileLiveMessagesWithPersisted replaces running exec bubble with persi
   assert.equal(merged[0].exec_status, "done");
 });
 
+test("reconcileLiveMessagesWithPersisted matches assistant rows by source identity before content", () => {
+  const current = [
+    {
+      id: "live-a",
+      role: "assistant",
+      content: "Shared bubble content",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T00:00:00Z",
+    },
+    {
+      id: "live-b",
+      role: "assistant",
+      content: "Shared bubble content",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T00:00:01Z",
+    },
+  ];
+  const persisted = [
+    {
+      id: "db-b",
+      role: "assistant",
+      content: "Shared bubble content",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T00:00:02Z",
+    },
+  ];
+
+  const merged = reconcileLiveMessagesWithPersisted(current, persisted, [
+    "live-a",
+    "live-b",
+  ]);
+  assert.deepEqual(
+    merged.map((item) => item.id),
+    ["live-a", "db-b"],
+  );
+});
+
+test("reconcileLiveMessagesWithPersisted keeps content fallback for legacy assistant rows without source identity", () => {
+  const current = [
+    {
+      id: "live-legacy",
+      role: "assistant",
+      content: "Legacy bubble",
+      created_at: "2026-04-02T00:00:00Z",
+    },
+  ];
+  const persisted = [
+    {
+      id: "db-legacy",
+      role: "assistant",
+      content: "Legacy bubble",
+      created_at: "2026-04-02T00:00:01Z",
+    },
+  ];
+
+  const merged = reconcileLiveMessagesWithPersisted(
+    current,
+    persisted,
+    ["live-legacy"],
+  );
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].id, "db-legacy");
+});
+
 test("reconcileLiveMessagesWithPersisted replaces terminal exec bubble with persisted row when command and owner match", () => {
   const current = [
     {

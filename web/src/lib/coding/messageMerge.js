@@ -115,6 +115,17 @@ function normalizeMessageMatchPart(value) {
     .replace(/\s+/g, ' ')
 }
 
+function sourceIdentityKey(item) {
+  const role = String(item?.role || '').trim().toLowerCase()
+  const itemID = String(item?.source_item_id ?? item?.sourceItemID ?? '').trim()
+  if (!role || !itemID) return ''
+  const turnID = String(item?.source_turn_id ?? item?.sourceTurnID ?? '').trim()
+  const itemType = String(item?.source_item_type ?? item?.sourceItemType ?? '')
+    .trim()
+    .toLowerCase()
+  return `${role}|${turnID}|${itemID}|${itemType}`
+}
+
 function messageMatchKey(item) {
   const role = String(item?.role || '').trim().toLowerCase()
   if (role === 'subagent') {
@@ -195,24 +206,36 @@ function reconcileLiveMessagesWithPersisted(currentMessages, persistedMessages, 
     return mergeMessagesChronologically(current, appendOnly)
   }
 
-  const liveIndexByKey = new Map()
+  const liveIndexByIdentity = new Map()
+  const liveIndexByLegacyKey = new Map()
   const matchWindowMs = 4000
   for (let idx = 0; idx < current.length; idx += 1) {
     const row = current[idx]
     const id = String(row?.id || '').trim()
     if (!id || !liveSet.has(id)) continue
+    const candidate = { idx, ts: timestampFromMessage(row) }
+    const identity = sourceIdentityKey(row)
+    if (identity) {
+      const bucket = liveIndexByIdentity.get(identity) || []
+      bucket.push(candidate)
+      liveIndexByIdentity.set(identity, bucket)
+      continue
+    }
     const key = messageMatchKey(row)
     if (!key) continue
-    const bucket = liveIndexByKey.get(key) || []
-    bucket.push({ idx, ts: timestampFromMessage(row) })
-    liveIndexByKey.set(key, bucket)
+    const bucket = liveIndexByLegacyKey.get(key) || []
+    bucket.push(candidate)
+    liveIndexByLegacyKey.set(key, bucket)
   }
 
   const unmatchedPersisted = []
   const replacedIndexes = new Set()
   for (const row of persisted) {
+    const identity = sourceIdentityKey(row)
     const key = messageMatchKey(row)
-    const bucket = liveIndexByKey.get(key) || []
+    const bucket = identity
+      ? (liveIndexByIdentity.get(identity) || liveIndexByLegacyKey.get(key) || [])
+      : (liveIndexByLegacyKey.get(key) || [])
     if (bucket.length > 0) {
       const persistedTS = timestampFromMessage(row)
       let pickAt = 0

@@ -45,6 +45,37 @@ function completedViewStatus(inputMessages, { messageActor }) {
   return "Response received.";
 }
 
+function currentRecoveryStatus(inputMessages) {
+  const src = Array.isArray(inputMessages) ? inputMessages : [];
+  for (let idx = src.length - 1; idx >= 0; idx -= 1) {
+    const recovery = runtimeRecoveryActivity(src[idx]);
+    const kind = String(recovery?.kind || "").trim().toLowerCase();
+    const reason = String(recovery?.reason || "").trim().toLowerCase();
+    if (!kind) continue;
+    switch (kind) {
+      case "recovery_detected":
+        if (reason === "usage_limit") return "Retrying after usage limit...";
+        if (reason === "auth_failure") return "Retrying after auth failure...";
+        return "Retrying...";
+      case "account_switch_started":
+      case "account_switch_completed":
+        return "Retrying with another account...";
+      case "auth_sync_started":
+      case "auth_sync_completed":
+        return "Syncing auth for retry...";
+      case "restart_started":
+      case "restart_completed":
+        return "Restarting runtime for retry...";
+      case "continue_started":
+      case "recovery_failed":
+        return "";
+      default:
+        continue;
+    }
+  }
+  return "";
+}
+
 function collectLiveMessageIDs(inputMessages) {
   const src = Array.isArray(inputMessages) ? inputMessages : [];
   return src
@@ -687,6 +718,13 @@ function shouldHideRenderedMessage(message) {
   const role = String(message?.role || "")
     .trim()
     .toLowerCase();
+  if (
+    role === "assistant" &&
+    Boolean(message?.pending) &&
+    !String(message?.content || "").trim()
+  ) {
+    return true;
+  }
   if (role === "event") {
     return isSpamEventMessage(message?.content || "");
   }
@@ -715,7 +753,8 @@ function shouldHideRenderedMessage(message) {
       contentLower.startsWith("thread/started:") ||
       contentLower.startsWith("thread.started:") ||
       contentLower.startsWith("rawresponseitem/completed:") ||
-      contentLower.startsWith("thread/tokenusage/updated:")
+      contentLower.startsWith("thread/tokenusage/updated:") ||
+      contentLower.startsWith("event log truncated:")
     ) {
       return true;
     }
@@ -1399,6 +1438,45 @@ function messageDisplayContent(message) {
   if (role === "activity") {
     const recovery = parseRuntimeRecoveryActivity(content);
     if (recovery?.text) return recovery.text;
+    if (message?.mcp_activity) {
+      const target = String(
+        message?.mcp_activity_target || message?.mcp_activity_tool || "",
+      )
+        .trim()
+        .toLowerCase();
+      const contentLower = content.trim().toLowerCase();
+      const searchLabel = (() => {
+        if (
+          target.includes("web_search") ||
+          target.includes("search_web") ||
+          target.includes("search the web")
+        ) {
+          return "the web";
+        }
+        if (
+          target.includes("search_code") ||
+          target.includes("grep") ||
+          target.includes("code_search")
+        ) {
+          return "code";
+        }
+        if (
+          target.includes("docs") ||
+          target.includes("documentation") ||
+          target.includes("ref_search_documentation") ||
+          target.includes("get_code_context")
+        ) {
+          return "docs";
+        }
+        return "";
+      })();
+      if (searchLabel && /^running mcp:/i.test(contentLower)) {
+        return `Searching ${searchLabel}`;
+      }
+      if (searchLabel && /^mcp done:/i.test(contentLower)) {
+        return `Searched ${searchLabel}`;
+      }
+    }
   }
   if (role === "event" || role === "stderr" || role === "activity") {
     return sanitizeSensitiveLogText(content);
@@ -1480,6 +1558,7 @@ function projectMessagesForView(
 export {
   collectLiveMessageIDs,
   completedViewStatus,
+  currentRecoveryStatus,
   execStatusLabel,
   fileOpTone,
   isInternalRunnerActivity,

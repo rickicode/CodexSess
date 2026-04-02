@@ -88,6 +88,16 @@ type appServerTurnError struct {
 	AdditionalDetails string `json:"additionalDetails,omitempty"`
 }
 
+type appServerEventMeta struct {
+	SourceEventType string
+	SourceThreadID  string
+	SourceTurnID    string
+	SourceItemID    string
+	SourceItemType  string
+	EventSeq        int64
+	CreatedAt       string
+}
+
 func runAppServerChat(ctx context.Context, binary string, opts ExecOptions, onEvent func(ChatEvent) error) (ChatResult, error) {
 	var out ChatResult
 	err := withPersistentAppServerClient(ctx, binary, opts.CodexHome, firstNonEmpty(opts.WorkDir, defaultExecWorkDir(opts.CodexHome)), opts.OnProcessStart, func(client *appServerClient) error {
@@ -103,7 +113,9 @@ func runAppServerChat(ctx context.Context, binary string, opts ExecOptions, onEv
 				if text == "" {
 					return nil
 				}
-				return onEvent(ChatEvent{Type: "stderr", Text: text, Actor: firstNonEmpty(strings.TrimSpace(opts.Actor), "executor")})
+				return onEvent(newAppServerChatEvent("stderr", text, firstNonEmpty(strings.TrimSpace(opts.Actor), "executor"), appServerEventMeta{
+					SourceEventType: "stderr",
+				}))
 			})
 			defer client.unsubscribeStderr(stderrSubID)
 		}
@@ -121,13 +133,18 @@ func runAppServerChat(ctx context.Context, binary string, opts ExecOptions, onEv
 
 		out.ThreadID = threadID
 		actor := strings.TrimSpace(opts.Actor)
-			if actor == "" {
-				actor = "executor"
+		if actor == "" {
+			actor = "executor"
+		}
+		turnID, runErr := client.startTurn(ctx, threadID, opts, func(evt rpcEnvelope) error {
+			params := map[string]any{}
+			if len(evt.Params) > 0 {
+				_ = json.Unmarshal(evt.Params, &params)
 			}
-			turnID, runErr := client.startTurn(ctx, threadID, opts, func(evt rpcEnvelope) error {
-				if onEvent != nil {
-					raw, _ := json.Marshal(evt)
-				if err := onEvent(ChatEvent{Type: "raw_event", Text: sanitizeSensitiveText(string(raw)), Actor: actor}); err != nil {
+			meta := extractAppServerEventMeta(evt.Method, params)
+			if onEvent != nil {
+				raw, _ := json.Marshal(evt)
+				if err := onEvent(newAppServerChatEvent("raw_event", sanitizeSensitiveText(string(raw)), actor, meta)); err != nil {
 					return err
 				}
 			}
@@ -742,6 +759,7 @@ func mapAppServerEvent(evt rpcEnvelope, out *ChatResult, actor string, onEvent f
 	if len(evt.Params) > 0 {
 		_ = json.Unmarshal(evt.Params, &params)
 	}
+	meta := extractAppServerEventMeta(method, params)
 	mergedEvent := appServerEventMap(method, params)
 	switch method {
 	case "thread/started":
@@ -754,7 +772,7 @@ func mapAppServerEvent(evt rpcEnvelope, out *ChatResult, actor string, onEvent f
 			out.Text += delta
 			if onEvent != nil {
 				emitted = true
-				return onEvent(ChatEvent{Type: "delta", Text: delta, Actor: eventActor})
+				return onEvent(newAppServerChatEvent("delta", delta, eventActor, meta))
 			}
 		}
 	case "item/completed", "rawResponseItem/completed":
@@ -768,7 +786,7 @@ func mapAppServerEvent(evt rpcEnvelope, out *ChatResult, actor string, onEvent f
 			out.Text = text
 			if onEvent != nil {
 				emitted = true
-				return onEvent(ChatEvent{Type: "assistant_message", Text: text, Actor: eventActor})
+				return onEvent(newAppServerChatEvent("assistant_message", text, eventActor, meta))
 			}
 		}
 	case "thread/tokenUsage/updated":
@@ -781,7 +799,7 @@ func mapAppServerEvent(evt rpcEnvelope, out *ChatResult, actor string, onEvent f
 		errText := strings.TrimSpace(extractAppServerError(params))
 		if isTransientAppServerReconnectMessage(errText) {
 			if onEvent != nil {
-				return onEvent(ChatEvent{Type: "activity", Text: firstNonEmpty(errText, "codex app-server reconnecting"), Actor: eventActor})
+				return onEvent(newAppServerChatEvent("activity", firstNonEmpty(errText, "codex app-server reconnecting"), eventActor, meta))
 			}
 			return nil
 		}
@@ -791,13 +809,13 @@ func mapAppServerEvent(evt rpcEnvelope, out *ChatResult, actor string, onEvent f
 		out.Text += delta
 		if onEvent != nil {
 			emitted = true
-			return onEvent(ChatEvent{Type: "delta", Text: delta, Actor: eventActor})
+			return onEvent(newAppServerChatEvent("delta", delta, eventActor, meta))
 		}
 	}
 	if onEvent != nil {
 		if text, ok := codexEventActivityText(mergedEvent); ok {
 			emitted = true
-			return onEvent(ChatEvent{Type: "activity", Text: text, Actor: eventActor})
+			return onEvent(newAppServerChatEvent("activity", text, eventActor, meta))
 		}
 	}
 	if shouldSuppressAppServerSummary(method) {
@@ -811,16 +829,94 @@ func mapAppServerEvent(evt rpcEnvelope, out *ChatResult, actor string, onEvent f
 				return nil
 			}
 			emitted = true
-			return onEvent(ChatEvent{Type: "activity", Text: summary, Actor: eventActor})
+			return onEvent(newAppServerChatEvent("activity", summary, eventActor, meta))
 		}
 	}
 	if onEvent != nil && !emitted {
 		summary := truncateActivityText(sanitizeSensitiveText(summarizeAppServerEvent(method, params)))
 		if strings.TrimSpace(summary) != "" {
-			return onEvent(ChatEvent{Type: "activity", Text: summary, Actor: eventActor})
+			return onEvent(newAppServerChatEvent("activity", summary, eventActor, meta))
 		}
 	}
 	return nil
+}
+
+func newAppServerChatEvent(eventType, text, actor string, meta appServerEventMeta) ChatEvent {
+	return ChatEvent{
+		Type:            eventType,
+		Text:            text,
+		Actor:           actor,
+		SourceEventType: meta.SourceEventType,
+		SourceThreadID:  meta.SourceThreadID,
+		SourceTurnID:    meta.SourceTurnID,
+		SourceItemID:    meta.SourceItemID,
+		SourceItemType:  meta.SourceItemType,
+		EventSeq:        meta.EventSeq,
+		CreatedAt:       meta.CreatedAt,
+	}
+}
+
+func extractAppServerEventMeta(method string, params map[string]any) appServerEventMeta {
+	thread, _ := params["thread"].(map[string]any)
+	turn, _ := params["turn"].(map[string]any)
+	item, _ := params["item"].(map[string]any)
+	return appServerEventMeta{
+		SourceEventType: strings.TrimSpace(method),
+		SourceThreadID:  firstNonEmpty(firstStringFromMap(params, "threadId"), firstStringFromMap(thread, "id")),
+		SourceTurnID:    firstNonEmpty(firstStringFromMap(params, "turnId"), firstStringFromMap(turn, "id")),
+		SourceItemID:    firstNonEmpty(firstStringFromMap(params, "itemId"), firstStringFromMap(item, "id")),
+		SourceItemType:  firstNonEmpty(firstStringFromMap(params, "itemType"), firstStringFromMap(item, "type")),
+		EventSeq: firstNonZeroInt64(
+			firstInt64FromMap(params, "sequence", "seq", "eventSeq", "event_seq"),
+			firstInt64FromMap(item, "sequence", "seq", "eventSeq", "event_seq"),
+			firstInt64FromMap(turn, "sequence", "seq", "eventSeq", "event_seq"),
+			firstInt64FromMap(thread, "sequence", "seq", "eventSeq", "event_seq"),
+		),
+		CreatedAt: firstNonEmpty(
+			firstStringFromMap(params, "createdAt", "created_at"),
+			firstStringFromMap(item, "createdAt", "created_at"),
+			firstStringFromMap(turn, "createdAt", "created_at"),
+			firstStringFromMap(thread, "createdAt", "created_at"),
+		),
+	}
+}
+
+func firstInt64FromMap(m map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			continue
+		}
+		value, ok := m[key]
+		if !ok {
+			continue
+		}
+		switch t := value.(type) {
+		case int:
+			return int64(t)
+		case int64:
+			return t
+		case float64:
+			return int64(t)
+		case json.Number:
+			if n, err := t.Int64(); err == nil {
+				return n
+			}
+		case string:
+			if n, err := json.Number(strings.TrimSpace(t)).Int64(); err == nil {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func firstNonZeroInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func isTransientAppServerReconnectMessage(text string) bool {

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   collectLiveMessageIDs,
   completedViewStatus,
+  currentRecoveryStatus,
   isInternalRunnerActivity,
   messageDisplayContent,
   parsePlanningFinalPlan,
@@ -12,6 +13,7 @@ import {
   subagentPreview,
 } from "./messageView.js";
 import { buildExecAwareMessages } from "./liveMessagePipeline.js";
+import { reconcileLiveMessagesWithPersisted } from "../../lib/coding/messageMerge.js";
 
 test("completed view status treats generic legacy_owner stop wording as waiting", () => {
   const status = completedViewStatus(
@@ -29,6 +31,40 @@ test("completed view status treats generic legacy_owner stop wording as waiting"
   );
 
   assert.equal(status, "Response received.");
+});
+
+test("currentRecoveryStatus surfaces retry progress from the latest recovery milestone", () => {
+  const status = currentRecoveryStatus([
+    {
+      id: "recovery-detected",
+      role: "activity",
+      content: "runtime.recovery_detected role=chat reason=usage_limit",
+    },
+    {
+      id: "switch-started",
+      role: "activity",
+      content: "account.switch_started role=chat",
+    },
+  ]);
+
+  assert.equal(status, "Retrying with another account...");
+});
+
+test("currentRecoveryStatus clears after retry flow continues successfully", () => {
+  const status = currentRecoveryStatus([
+    {
+      id: "switch-started",
+      role: "activity",
+      content: "account.switch_started role=chat",
+    },
+    {
+      id: "continue-started",
+      role: "activity",
+      content: "turn.continue_started role=chat thread_id=thread_retry",
+    },
+  ]);
+
+  assert.equal(status, "");
 });
 
 test("collectLiveMessageIDs only keeps active pending ids in the live format", () => {
@@ -832,6 +868,28 @@ test("canonical MCP activity stays visible as a specialized row", () => {
   );
 });
 
+test("messageDisplayContent humanizes running web-search MCP activity", () => {
+  const text = messageDisplayContent({
+    role: "activity",
+    content: "Running MCP: exa.web_search_exa",
+    mcp_activity: true,
+    mcp_activity_target: "exa.web_search_exa",
+  });
+
+  assert.equal(text, "Searching the web");
+});
+
+test("messageDisplayContent humanizes completed code-search MCP activity", () => {
+  const text = messageDisplayContent({
+    role: "activity",
+    content: "MCP done: github.search_code\n  └ Found 12 matches",
+    mcp_activity: true,
+    mcp_activity_target: "github.search_code",
+  });
+
+  assert.equal(text, "Searched code");
+});
+
 test("canonical terminal and file operation rows stay visible", () => {
   const rendered = projectMessagesForView(
     [
@@ -1019,6 +1077,61 @@ test("canonical view hides generic MCP startup status rows", () => {
   assert.equal(rendered[0].id, "mcp-failed");
 });
 
+test("canonical view hides event log truncated noise rows", () => {
+  const rendered = projectMessagesForView(
+    [
+      {
+        id: "truncated-noise",
+        role: "activity",
+        actor: "chat",
+        content: "Event log truncated: 57 additional entries omitted.",
+        created_at: "2026-04-02T12:00:00Z",
+        updated_at: "2026-04-02T12:00:00Z",
+      },
+      {
+        id: "assistant-after",
+        role: "assistant",
+        content: "Final answer.",
+        created_at: "2026-04-02T12:00:02Z",
+        updated_at: "2026-04-02T12:00:02Z",
+      },
+    ],
+    { alreadyCanonical: true },
+  );
+
+  assert.equal(rendered.length, 1);
+  assert.equal(rendered[0].id, "assistant-after");
+});
+
+test("canonical view hides empty pending assistant placeholders so streaming renders outside bubbles", () => {
+  const rendered = projectMessagesForView(
+    [
+      {
+        id: "assistant-pending-empty",
+        role: "assistant",
+        actor: "chat",
+        pending: true,
+        content: "",
+        created_at: "2026-04-02T08:33:58Z",
+        updated_at: "2026-04-02T08:33:59Z",
+      },
+      {
+        id: "assistant-done",
+        role: "assistant",
+        actor: "chat",
+        pending: false,
+        content: "Final answer.",
+        created_at: "2026-04-02T08:34:10Z",
+        updated_at: "2026-04-02T08:34:10Z",
+      },
+    ],
+    { alreadyCanonical: true },
+  );
+
+  assert.equal(rendered.length, 1);
+  assert.equal(rendered[0].id, "assistant-done");
+});
+
 
 test("parsePlanningFinalPlan extracts structured final plan sections", () => {
   const parsed = parsePlanningFinalPlan({
@@ -1064,4 +1177,65 @@ Confidence: 91%`,
   assert.ok(parsed);
   assert.equal(parsed.ready, true);
   assert.equal(parsed.confidence, 91);
+});
+
+test("assistant delta only updates the matching source item bubble", () => {
+  const current = [
+    {
+      id: "stream-assistant-1",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "First bubble",
+      pending: true,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.000Z",
+      updated_at: "2026-04-02T12:20:00.000Z",
+    },
+    {
+      id: "stream-assistant-2",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Second bubble",
+      pending: true,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.010Z",
+      updated_at: "2026-04-02T12:20:00.010Z",
+    },
+  ];
+  const persisted = [
+    {
+      id: "db-assistant-2",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Second bubble finalized",
+      pending: false,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.020Z",
+      updated_at: "2026-04-02T12:20:00.020Z",
+    },
+  ];
+
+  const merged = reconcileLiveMessagesWithPersisted(
+    current,
+    persisted,
+    collectLiveMessageIDs(current),
+  );
+
+  assert.deepEqual(
+    merged.map((row) => row.id),
+    ["stream-assistant-1", "db-assistant-2"],
+  );
+  assert.equal(merged[0]?.content, "First bubble");
+  assert.equal(merged[1]?.content, "Second bubble finalized");
+  assert.equal(merged[0]?.source_item_id, "item-assistant-1");
+  assert.equal(merged[1]?.source_item_id, "item-assistant-2");
 });

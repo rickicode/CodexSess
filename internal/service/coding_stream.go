@@ -14,6 +14,20 @@ import (
 
 const runtimeAppServerResumeRetryLimit = 5
 
+func shouldPersistCodingStreamEvent(evt provider.ChatEvent, eventType, text string) bool {
+	switch strings.TrimSpace(strings.ToLower(eventType)) {
+	case "activity":
+		return !strings.HasPrefix(strings.TrimSpace(strings.ToLower(text)), "command output:")
+	case "raw_event":
+		sourceType := strings.TrimSpace(strings.ToLower(evt.SourceEventType))
+		switch sourceType {
+		case "item/commandexecution/outputdelta", "item/filechange/outputdelta":
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Service) runCodingRoleAppServer(
 	ctx context.Context,
 	session store.CodingSession,
@@ -680,7 +694,9 @@ func (s *Service) SendCodingMessageStream(
 					Content:   truncateRunes(delta, codingEventContentMaxRunes),
 					CreatedAt: time.Now().UTC(),
 				}
-				if len(persistedEvents) >= codingEventPersistMax {
+				if !shouldPersistCodingStreamEvent(evt, eventType, delta) {
+					droppedEvents++
+				} else if len(persistedEvents) >= codingEventPersistMax {
 					droppedEvents++
 				} else {
 					saved, saveErr := s.appendCodingMessage(runCtx, item)
@@ -694,7 +710,18 @@ func (s *Service) SendCodingMessageStream(
 		if onEvent == nil {
 			return nil
 		}
-		return onEvent(provider.ChatEvent{Type: eventType, Text: delta, Actor: evt.Actor})
+		return onEvent(provider.ChatEvent{
+			Type:            eventType,
+			Text:            delta,
+			Actor:           evt.Actor,
+			SourceEventType: evt.SourceEventType,
+			SourceThreadID:  evt.SourceThreadID,
+			SourceTurnID:    evt.SourceTurnID,
+			SourceItemID:    evt.SourceItemID,
+			SourceItemType:  evt.SourceItemType,
+			EventSeq:        evt.EventSeq,
+			CreatedAt:       evt.CreatedAt,
+		})
 	}
 	reply, err := s.runCodingRoleWithErrorHandling(
 		runCtx,

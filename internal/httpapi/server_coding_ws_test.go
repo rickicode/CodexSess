@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,9 +20,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/ricki/codexsess/internal/config"
+	icrypto "github.com/ricki/codexsess/internal/crypto"
 	"github.com/ricki/codexsess/internal/provider"
 	"github.com/ricki/codexsess/internal/service"
 	"github.com/ricki/codexsess/internal/store"
+	"github.com/ricki/codexsess/internal/util"
 )
 
 func openCodingWS(t *testing.T, srv *Server) *websocket.Conn {
@@ -1400,6 +1404,153 @@ exit 1
 	if got := stringFromAny(errorEvent["category"]); got != "auth_failed" && got != "unknown_runtime_error" {
 		t.Fatalf("expected auth_failed/unknown_runtime_error category, got %q", got)
 	}
+}
+
+func TestCodingWS_StreamIncludesSourceIdentity(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+
+	root := t.TempDir()
+	st, err := store.Open(filepath.Join(root, "coding-ws-stream-identity.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cry, err := icrypto.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatalf("create crypto: %v", err)
+	}
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(root, "data")
+	cfg.AuthStoreDir = filepath.Join(root, "auth")
+	cfg.CodexHome = filepath.Join(root, "codex-home")
+
+	now := time.Now().UTC()
+	_, err = st.CreateCodingSession(context.Background(), store.CodingSession{
+		ID:             "sess_stream_identity",
+		Title:          "StreamIdentity",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "workspace-write",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastMessageAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	tokenID, err := cry.Encrypt([]byte("id-token-stream-identity"))
+	if err != nil {
+		t.Fatalf("encrypt id token: %v", err)
+	}
+	tokenAccess, err := cry.Encrypt([]byte("access-token-stream-identity"))
+	if err != nil {
+		t.Fatalf("encrypt access token: %v", err)
+	}
+	tokenRefresh, err := cry.Encrypt([]byte("refresh-token-stream-identity"))
+	if err != nil {
+		t.Fatalf("encrypt refresh token: %v", err)
+	}
+	account := store.Account{
+		ID:           "acc_stream_identity",
+		Email:        "stream-identity@example.com",
+		AccountID:    "acct-stream-identity",
+		TokenID:      tokenID,
+		TokenAccess:  tokenAccess,
+		TokenRefresh: tokenRefresh,
+		CodexHome:    cfg.CodexHome,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastUsedAt:   now,
+	}
+	if err := st.UpsertAccount(context.Background(), account); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	if err := util.WriteAuthJSON(filepath.Join(cfg.AuthStoreDir, account.ID), "id-token-stream-identity", "access-token-stream-identity", "refresh-token-stream-identity", account.AccountID); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
+	svc := service.New(cfg, st, cry)
+	if _, err := svc.UseAccountCLI(context.Background(), account.ID); err != nil {
+		t.Fatalf("use account cli: %v", err)
+	}
+	svc.Codex = provider.NewCodexAppServer(writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"jsonrpc":"2.0","id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/start"'; then
+      echo '{"jsonrpc":"2.0","id":"2","result":{"thread":{"id":"thread-chat-1"}}}'
+      echo '{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-chat-1"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      req_id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      [ -n "$req_id" ] || req_id=3
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"turn":{"id":"turn-chat-1","status":"completed"}}}\n' "$req_id"
+      echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-chat-1","turn":{"id":"turn-chat-1"}}}'
+      echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-chat-1","turnId":"turn-chat-1","itemId":"item-assistant-1","sequence":17,"createdAt":"2026-04-02T10:11:12Z","item":{"type":"agent_message"},"delta":"hello"}}'
+      echo '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"thread-chat-1","turnId":"turn-chat-1","item":{"id":"item-assistant-1","type":"agent_message","text":"hello"}}}'
+      echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-chat-1","turn":{"id":"turn-chat-1","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`))
+	srv := &Server{svc: svc}
+	conn := openCodingWS(t, srv)
+	if err := conn.WriteJSON(map[string]any{
+		"type":       "session.send",
+		"request_id": "req_stream_identity_1",
+		"session_id": "sess_stream_identity",
+		"lane":       "chat",
+		"content":    "hello",
+	}); err != nil {
+		t.Fatalf("write ws request: %v", err)
+	}
+
+	events := readWSEvents(t, conn, 20)
+	for _, evt := range events {
+		if stringFromAny(evt["event"]) != "session.stream" {
+			continue
+		}
+		if stringFromAny(evt["stream_type"]) != "delta" {
+			continue
+		}
+		if got := stringFromAny(evt["source_event_type"]); got != "item/agentMessage/delta" {
+			t.Fatalf("expected source_event_type, got %q in %#v", got, evt)
+		}
+		if got := stringFromAny(evt["source_thread_id"]); got != "thread-chat-1" {
+			t.Fatalf("expected source_thread_id, got %q in %#v", got, evt)
+		}
+		if got := stringFromAny(evt["source_turn_id"]); got != "turn-chat-1" {
+			t.Fatalf("expected source_turn_id, got %q in %#v", got, evt)
+		}
+		if got := stringFromAny(evt["source_item_id"]); got != "item-assistant-1" {
+			t.Fatalf("expected source_item_id, got %q in %#v", got, evt)
+		}
+		if got := stringFromAny(evt["source_item_type"]); got != "agent_message" {
+			t.Fatalf("expected source_item_type, got %q in %#v", got, evt)
+		}
+		if got := intFromAny(evt["event_seq"]); got != 17 {
+			t.Fatalf("expected provider event_seq, got %d in %#v", got, evt)
+		}
+		if got := stringFromAny(evt["created_at"]); got != "2026-04-02T10:11:12Z" {
+			t.Fatalf("expected provider created_at, got %q in %#v", got, evt)
+		}
+		return
+	}
+	t.Fatalf("expected session.stream delta with source identity, got %#v", events)
 }
 
 func TestCodingWS_StreamRedactsRawEventAndStderrText(t *testing.T) {

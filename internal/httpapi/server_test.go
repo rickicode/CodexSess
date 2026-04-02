@@ -45,7 +45,7 @@ func configureSuperpowersFixtureEnv(t *testing.T) {
 	t.Setenv("CODEXSESS_SUPERPOWERS_REPO_URL", "https://example.invalid/superpowers.git")
 }
 
-func TestHandleOpenAIV1Root_RejectsInvalidPayload(t *testing.T) {
+func TestHandleOpenAIRoot_RejectsInvalidPayload(t *testing.T) {
 	s := &Server{apiKey: "sk-test"}
 
 	t.Run("invalid json", func(t *testing.T) {
@@ -53,7 +53,7 @@ func TestHandleOpenAIV1Root_RejectsInvalidPayload(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer sk-test")
 		rec := httptest.NewRecorder()
 
-		s.handleOpenAIV1Root(rec, req)
+		s.handleOpenAIRoot(rec, req)
 
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400, got %d", rec.Code)
@@ -69,7 +69,7 @@ func TestHandleOpenAIV1Root_RejectsInvalidPayload(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer sk-test")
 		rec := httptest.NewRecorder()
 
-		s.handleOpenAIV1Root(rec, req)
+		s.handleOpenAIRoot(rec, req)
 
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400, got %d", rec.Code)
@@ -129,7 +129,7 @@ func TestHandleAPIUsageStatus_Unauthorized(t *testing.T) {
 	}
 }
 
-func TestHandleWebSettings_ClaudeEndpointUsesV1Messages(t *testing.T) {
+func TestHandleWebSettings_ClaudeEndpointUsesClaudeMessagesPath(t *testing.T) {
 	s := &Server{
 		apiKey:   "sk-test",
 		bindAddr: "127.0.0.1:3052",
@@ -398,6 +398,65 @@ func TestBootstrapCodingTemplateHome_SeedsTemplateHomeAtServerStartup(t *testing
 	for _, skill := range []string{"brainstorming", "writing-plans"} {
 		if _, err := os.Stat(filepath.Join(templateRoot, "skills", skill, "SKILL.md")); err != nil {
 			t.Fatalf("expected startup bootstrap to seed required superpowers skill %q: %v", skill, err)
+		}
+	}
+}
+
+func TestHandleWebCodingSkills_UsesTemplateSuperpowersOnly(t *testing.T) {
+	configureSuperpowersFixtureEnv(t)
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	if err := os.MkdirAll(filepath.Join(homeDir, ".codex", "skills", "local-only-skill"), 0o700); err != nil {
+		t.Fatalf("seed local-only skill dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(homeDir, ".codex", "skills", "local-only-skill", "SKILL.md"), []byte("# local only\n"), 0o600); err != nil {
+		t.Fatalf("write local-only skill file: %v", err)
+	}
+
+	s := &Server{
+		apiKey:   "sk-test",
+		bindAddr: "127.0.0.1:3052",
+		svc: &service.Service{
+			Cfg: config.Config{
+				DataDir: t.TempDir(),
+			},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/coding/skills", nil)
+	rec := httptest.NewRecorder()
+	s.handleWebCodingSkills(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	items, _ := body["skills"].([]any)
+	skills := make([]string, 0, len(items))
+	for _, item := range items {
+		skills = append(skills, strings.TrimSpace(item.(string)))
+	}
+	if len(skills) == 0 {
+		t.Fatalf("expected skills from superpowers template, got none")
+	}
+	for _, required := range []string{"brainstorming", "writing-plans", "using-superpowers"} {
+		found := false
+		for _, skill := range skills {
+			if skill == required {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected required superpowers skill %q in %#v", required, skills)
+		}
+	}
+	for _, skill := range skills {
+		if skill == "local-only-skill" {
+			t.Fatalf("expected local home skill to be ignored, got %#v", skills)
 		}
 	}
 }

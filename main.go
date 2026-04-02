@@ -28,7 +28,7 @@ import (
 	"golang.org/x/term"
 )
 
-var appVersion = "dev"
+var appVersion = "1.0.3"
 
 func main() {
 	if err := run(); err != nil {

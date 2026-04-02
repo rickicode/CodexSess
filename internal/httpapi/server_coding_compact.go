@@ -134,6 +134,61 @@ func normalizeCodingCompactEventType(raw string) string {
 	return strings.ReplaceAll(strings.ToLower(strings.TrimSpace(raw)), "/", ".")
 }
 
+func codingCompactSourceKey(entry map[string]any) string {
+	return codingCompactSourceKeyFromParts(
+		codingCompactSourceRole(entry),
+		stringFromAny(entry["source_thread_id"]),
+		stringFromAny(entry["source_turn_id"]),
+		stringFromAny(entry["source_item_id"]),
+		stringFromAny(entry["source_item_type"]),
+	)
+}
+
+func codingCompactSourceRole(entry map[string]any) string {
+	if boolFromAny(entry["internal_runner"]) {
+		return "internal_runner"
+	}
+	return stringFromAny(entry["role"])
+}
+
+func codingCompactSourceKeyFromParts(role, threadID, turnID, itemID, itemType string) string {
+	cleanItemID := strings.TrimSpace(itemID)
+	if cleanItemID == "" {
+		return ""
+	}
+	return strings.TrimSpace(strings.Join([]string{
+		strings.ToLower(strings.TrimSpace(role)),
+		strings.TrimSpace(threadID),
+		strings.TrimSpace(turnID),
+		cleanItemID,
+		normalizeCodingCompactItemType(itemType),
+	}, "|"))
+}
+
+func applyCodingCompactSourceIdentity(entry map[string]any, evt provider.ChatEvent) {
+	if entry == nil {
+		return
+	}
+	if value := strings.TrimSpace(evt.SourceEventType); value != "" {
+		entry["source_event_type"] = value
+	}
+	if value := strings.TrimSpace(evt.SourceThreadID); value != "" {
+		entry["source_thread_id"] = value
+	}
+	if value := strings.TrimSpace(evt.SourceTurnID); value != "" {
+		entry["source_turn_id"] = value
+	}
+	if value := strings.TrimSpace(evt.SourceItemID); value != "" {
+		entry["source_item_id"] = value
+	}
+	if value := strings.TrimSpace(evt.SourceItemType); value != "" {
+		entry["source_item_type"] = value
+	}
+	if evt.EventSeq > 0 {
+		entry["event_seq"] = evt.EventSeq
+	}
+}
+
 func parseCodingCompactFileOp(text string) string {
 	raw := strings.TrimSpace(text)
 	if raw == "" {
@@ -1128,6 +1183,9 @@ func (b *codingCompactBuilder) resumableAssistantIndex(actor string) int {
 		switch role {
 		case "assistant":
 			if stringFromAny(entry["id"]) == b.lastAssistantID {
+				if codingCompactSourceKey(entry) != "" {
+					return -1
+				}
 				nextActor := strings.TrimSpace(actor)
 				if nextActor != "" && !strings.EqualFold(stringFromAny(entry["actor"]), nextActor) {
 					return -1
@@ -1151,6 +1209,23 @@ func (b *codingCompactBuilder) resumableAssistantIndex(actor string) int {
 	return -1
 }
 
+func (b *codingCompactBuilder) resumableAssistantIndexBySourceIdentity(turnID, itemID, itemType string) int {
+	targetKey := codingCompactSourceKeyFromParts("assistant", "", turnID, itemID, itemType)
+	if targetKey == "" {
+		return -1
+	}
+	for idx := len(b.messages) - 1; idx >= 0; idx-- {
+		entry := b.messages[idx]
+		if !strings.EqualFold(stringFromAny(entry["role"]), "assistant") {
+			continue
+		}
+		if codingCompactSourceKey(entry) == targetKey {
+			return idx
+		}
+	}
+	return -1
+}
+
 func (b *codingCompactBuilder) resumableInternalRunnerIndex(actor string) int {
 	normalizedActor := strings.TrimSpace(actor)
 	if normalizedActor == "" {
@@ -1166,6 +1241,9 @@ func (b *codingCompactBuilder) resumableInternalRunnerIndex(actor string) int {
 					return -1
 				}
 				continue
+			}
+			if codingCompactSourceKey(entry) != "" {
+				return -1
 			}
 			if !strings.EqualFold(stringFromAny(entry["actor"]), normalizedActor) {
 				return -1
@@ -1183,8 +1261,25 @@ func (b *codingCompactBuilder) resumableInternalRunnerIndex(actor string) int {
 	return -1
 }
 
-func (b *codingCompactBuilder) upsertSubagent(actor, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning string, ids []string, _ any, createdAt string) {
-	normalizedActor := strings.TrimSpace(actor)
+func (b *codingCompactBuilder) resumableInternalRunnerIndexBySourceIdentity(threadID, turnID, itemID, itemType string) int {
+	targetKey := codingCompactSourceKeyFromParts("internal_runner", threadID, turnID, itemID, itemType)
+	if targetKey == "" {
+		return -1
+	}
+	for idx := len(b.messages) - 1; idx >= 0; idx-- {
+		entry := b.messages[idx]
+		if !boolFromAny(entry["internal_runner"]) {
+			continue
+		}
+		if codingCompactSourceKey(entry) == targetKey {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (b *codingCompactBuilder) upsertSubagent(evt provider.ChatEvent, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning string, ids []string, _ any, createdAt string) {
+	normalizedActor := strings.TrimSpace(evt.Actor)
 	if idx, ok := b.subagentIndexByKey[key]; ok && idx >= 0 && idx < len(b.messages) && strings.EqualFold(stringFromAny(b.messages[idx]["role"]), "subagent") {
 		entry := b.messages[idx]
 		entry["updated_at"] = createdAt
@@ -1227,6 +1322,7 @@ func (b *codingCompactBuilder) upsertSubagent(actor, key, lifecycleKey, title, s
 		if len(ids) > 0 {
 			entry["subagent_ids"] = ids
 		}
+		applyCodingCompactSourceIdentity(entry, evt)
 		if status != "running" {
 			delete(b.subagentIndexByKey, key)
 		}
@@ -1247,7 +1343,7 @@ func (b *codingCompactBuilder) upsertSubagent(actor, key, lifecycleKey, title, s
 			}
 			if target != "" && strings.EqualFold(stringFromAny(entry["subagent_target_id"]), target) {
 				b.subagentIndexByKey[key] = idx
-				b.upsertSubagent(actor, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning, ids, nil, createdAt)
+				b.upsertSubagent(evt, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning, ids, nil, createdAt)
 				return
 			}
 		}
@@ -1270,12 +1366,12 @@ func (b *codingCompactBuilder) upsertSubagent(actor, key, lifecycleKey, title, s
 					continue
 				}
 				b.subagentIndexByKey[key] = idx
-				b.upsertSubagent(actor, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning, ids, nil, createdAt)
+				b.upsertSubagent(evt, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning, ids, nil, createdAt)
 				return
 			}
 		}
 	}
-	b.messages = append(b.messages, map[string]any{
+	entry := map[string]any{
 		"id":                     b.nextID("subagent"),
 		"role":                   "subagent",
 		"actor":                  normalizedActor,
@@ -1298,16 +1394,19 @@ func (b *codingCompactBuilder) upsertSubagent(actor, key, lifecycleKey, title, s
 		"subagent_reasoning":     reasoning,
 		"subagent_prompt":        prompt,
 		"subagent_summary":       summary,
-	})
+	}
+	applyCodingCompactSourceIdentity(entry, evt)
+	b.messages = append(b.messages, entry)
 	if key != "" && status == "running" {
 		b.subagentIndexByKey[key] = len(b.messages) - 1
 	}
 	b.lastAssistantID = ""
 }
 
-func (b *codingCompactBuilder) upsertAssistant(actor, content, createdAt string, appendDelta bool) {
+func (b *codingCompactBuilder) upsertAssistant(evt provider.ChatEvent, content, createdAt string, appendDelta bool) {
+	actor := evt.Actor
 	if appendDelta {
-		if idx := b.resumableAssistantIndex(actor); idx >= 0 && idx < len(b.messages) {
+		if idx := b.resumableAssistantIndexBySourceIdentity(evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType); idx >= 0 && idx < len(b.messages) {
 			last := b.messages[idx]
 			if strings.EqualFold(stringFromAny(last["role"]), "assistant") {
 				current := stringFromAny(last["content"])
@@ -1319,15 +1418,36 @@ func (b *codingCompactBuilder) upsertAssistant(actor, content, createdAt string,
 				last["actor"] = nextActor
 				last["updated_at"] = createdAt
 				last["pending"] = true
+				applyCodingCompactSourceIdentity(last, evt)
+				b.lastAssistantID = stringFromAny(last["id"])
 				b.latestAssistantID = b.lastAssistantID
 				return
+			}
+		}
+		if codingCompactSourceKeyFromParts("assistant", evt.SourceThreadID, evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType) == "" {
+			if idx := b.resumableAssistantIndex(actor); idx >= 0 && idx < len(b.messages) {
+				last := b.messages[idx]
+				if strings.EqualFold(stringFromAny(last["role"]), "assistant") {
+					current := stringFromAny(last["content"])
+					nextActor := strings.TrimSpace(actor)
+					if nextActor == "" {
+						nextActor = stringFromAny(last["actor"])
+					}
+					last["content"] = current + content
+					last["actor"] = nextActor
+					last["updated_at"] = createdAt
+					last["pending"] = true
+					applyCodingCompactSourceIdentity(last, evt)
+					b.latestAssistantID = b.lastAssistantID
+					return
+				}
 			}
 		}
 	}
 	id := b.nextID("assistant")
 	b.lastAssistantID = id
 	b.latestAssistantID = id
-	b.messages = append(b.messages, map[string]any{
+	entry := map[string]any{
 		"id":         id,
 		"role":       "assistant",
 		"actor":      strings.TrimSpace(actor),
@@ -1335,26 +1455,67 @@ func (b *codingCompactBuilder) upsertAssistant(actor, content, createdAt string,
 		"created_at": createdAt,
 		"updated_at": createdAt,
 		"pending":    appendDelta,
-	})
+	}
+	applyCodingCompactSourceIdentity(entry, evt)
+	b.messages = append(b.messages, entry)
 }
 
-func (b *codingCompactBuilder) upsertInternalRunnerOutput(actor, content, createdAt string, appendDelta bool) {
-	if idx := b.resumableInternalRunnerIndex(actor); idx >= 0 && idx < len(b.messages) {
-		last := b.messages[idx]
-		current := stringFromAny(last["content"])
-		if appendDelta {
+func (b *codingCompactBuilder) upsertInternalRunnerOutput(evt provider.ChatEvent, content, createdAt string, appendDelta bool) {
+	actor := evt.Actor
+	if appendDelta {
+		if idx := b.resumableInternalRunnerIndexBySourceIdentity(evt.SourceThreadID, evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType); idx >= 0 && idx < len(b.messages) {
+			last := b.messages[idx]
+			current := stringFromAny(last["content"])
 			last["content"] = current + content
-		} else {
-			last["content"] = content
+			last["actor"] = strings.TrimSpace(actor)
+			last["updated_at"] = createdAt
+			last["pending"] = true
+			last["internal_runner"] = true
+			applyCodingCompactSourceIdentity(last, evt)
+			b.lastAssistantID = ""
+			return
 		}
-		last["actor"] = strings.TrimSpace(actor)
-		last["updated_at"] = createdAt
-		last["pending"] = appendDelta
-		last["internal_runner"] = true
-		b.lastAssistantID = ""
-		return
+		if codingCompactSourceKeyFromParts("internal_runner", evt.SourceThreadID, evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType) == "" {
+			if idx := b.resumableInternalRunnerIndex(actor); idx >= 0 && idx < len(b.messages) {
+				last := b.messages[idx]
+				current := stringFromAny(last["content"])
+				last["content"] = current + content
+				last["actor"] = strings.TrimSpace(actor)
+				last["updated_at"] = createdAt
+				last["pending"] = true
+				last["internal_runner"] = true
+				applyCodingCompactSourceIdentity(last, evt)
+				b.lastAssistantID = ""
+				return
+			}
+		}
+	} else {
+		if idx := b.resumableInternalRunnerIndexBySourceIdentity(evt.SourceThreadID, evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType); idx >= 0 && idx < len(b.messages) {
+			last := b.messages[idx]
+			last["content"] = content
+			last["actor"] = strings.TrimSpace(actor)
+			last["updated_at"] = createdAt
+			last["pending"] = false
+			last["internal_runner"] = true
+			applyCodingCompactSourceIdentity(last, evt)
+			b.lastAssistantID = ""
+			return
+		}
+		if codingCompactSourceKeyFromParts("internal_runner", evt.SourceThreadID, evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType) == "" {
+			if idx := b.resumableInternalRunnerIndex(actor); idx >= 0 && idx < len(b.messages) {
+				last := b.messages[idx]
+				last["content"] = content
+				last["actor"] = strings.TrimSpace(actor)
+				last["updated_at"] = createdAt
+				last["pending"] = false
+				last["internal_runner"] = true
+				applyCodingCompactSourceIdentity(last, evt)
+				b.lastAssistantID = ""
+				return
+			}
+		}
 	}
-	b.messages = append(b.messages, map[string]any{
+	entry := map[string]any{
 		"id":              b.nextID("activity"),
 		"role":            "activity",
 		"actor":           strings.TrimSpace(actor),
@@ -1363,11 +1524,14 @@ func (b *codingCompactBuilder) upsertInternalRunnerOutput(actor, content, create
 		"updated_at":      createdAt,
 		"pending":         appendDelta,
 		"internal_runner": true,
-	})
+	}
+	applyCodingCompactSourceIdentity(entry, evt)
+	b.messages = append(b.messages, entry)
 	b.lastAssistantID = ""
 }
 
-func (b *codingCompactBuilder) upsertExec(actor, command, status string, exitCode int, output, createdAt string) {
+func (b *codingCompactBuilder) upsertExec(evt provider.ChatEvent, command, status string, exitCode int, output, createdAt string) {
+	actor := evt.Actor
 	cmd := strings.TrimSpace(command)
 	if cmd == "" {
 		return
@@ -1399,7 +1563,7 @@ func (b *codingCompactBuilder) upsertExec(actor, command, status string, exitCod
 	}
 	if !ok || idx < 0 || idx >= len(b.messages) || !strings.EqualFold(stringFromAny(b.messages[idx]["role"]), "exec") {
 		idx = len(b.messages)
-		b.messages = append(b.messages, map[string]any{
+		entry := map[string]any{
 			"id":             b.nextID("exec"),
 			"role":           "exec",
 			"actor":          normalizedActor,
@@ -1411,7 +1575,9 @@ func (b *codingCompactBuilder) upsertExec(actor, command, status string, exitCod
 			"created_at":     createdAt,
 			"updated_at":     createdAt,
 			"pending":        false,
-		})
+		}
+		applyCodingCompactSourceIdentity(entry, evt)
+		b.messages = append(b.messages, entry)
 		b.execIndexByKey[key] = idx
 	}
 	entry := b.messages[idx]
@@ -1426,6 +1592,7 @@ func (b *codingCompactBuilder) upsertExec(actor, command, status string, exitCod
 	entry["exec_exit_code"] = exitCode
 	entry["exec_output"] = mergeCodingCompactOutput(stringFromAny(entry["exec_output"]), output)
 	entry["updated_at"] = createdAt
+	applyCodingCompactSourceIdentity(entry, evt)
 	b.lastExecKey = key
 	if status != "running" {
 		delete(b.execIndexByKey, key)
@@ -1477,20 +1644,20 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 			return false
 		}
 		if codingCompactActorUsesInternalRunnerRows(evt.Actor) {
-			b.upsertInternalRunnerOutput(evt.Actor, evt.Text, when, false)
+			b.upsertInternalRunnerOutput(evt, evt.Text, when, false)
 			return true
 		}
-		b.upsertAssistant(evt.Actor, evt.Text, when, false)
+		b.upsertAssistant(evt, evt.Text, when, false)
 		return true
 	case "delta":
 		if strings.TrimSpace(evt.Text) == "" {
 			return false
 		}
 		if codingCompactActorUsesInternalRunnerRows(evt.Actor) {
-			b.upsertInternalRunnerOutput(evt.Actor, evt.Text, when, true)
+			b.upsertInternalRunnerOutput(evt, evt.Text, when, true)
 			return true
 		}
-		b.upsertAssistant(evt.Actor, evt.Text, when, true)
+		b.upsertAssistant(evt, evt.Text, when, true)
 		return true
 	case "activity":
 		text := strings.TrimSpace(evt.Text)
@@ -1531,7 +1698,7 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 				key = strings.ToLower(strings.TrimSpace(strings.Join([]string{tool, parsed["title"]}, "|")))
 			}
 			b.upsertSubagent(
-				evt.Actor,
+				evt,
 				key,
 				key,
 				parsed["title"],
@@ -1584,7 +1751,7 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 				b.appendActivity(formatCodingCompactSupervisorExecActivity(evt.Actor, command, kind, exitCode), "", evt.Actor, when)
 				return true
 			}
-			b.upsertExec(evt.Actor, command, kind, exitCode, "", when)
+			b.upsertExec(evt, command, kind, exitCode, "", when)
 			return true
 		}
 		lastAssistantID := b.lastAssistantID
@@ -1598,7 +1765,7 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 		if subagent := parseCodingCompactSubagentEvent(payload); subagent != nil {
 			ids, _ := subagent["ids"].([]string)
 			b.upsertSubagent(
-				evt.Actor,
+				evt,
 				stringFromAny(subagent["key"]),
 				stringFromAny(subagent["lifecycle_key"]),
 				stringFromAny(subagent["title"]),
@@ -1636,6 +1803,7 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 					entry["mcp_activity_"+key] = value
 				}
 			}
+			applyCodingCompactSourceIdentity(entry, evt)
 			b.messages = append(b.messages, entry)
 			b.lastAssistantID = ""
 			return true
@@ -1652,7 +1820,7 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 			b.appendActivity(formatCodingCompactSupervisorExecActivity(evt.Actor, command, status, exitCode), "", evt.Actor, when)
 			return true
 		}
-		b.upsertExec(evt.Actor, command, status, exitCode, output, when)
+		b.upsertExec(evt, command, status, exitCode, output, when)
 		return true
 	case "stderr":
 		text := strings.TrimSpace(evt.Text)
@@ -1664,7 +1832,6 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 	}
 	return false
 }
-
 
 func (b *codingCompactBuilder) Snapshot() []map[string]any {
 	out := make([]map[string]any, 0, len(b.messages))
@@ -1738,7 +1905,7 @@ func (b *codingCompactBuilder) AppendStoredAssistant(id, actor, content, created
 		return
 	}
 	if codingCompactActorUsesInternalRunnerRows(actor) {
-		b.upsertInternalRunnerOutput(actor, text, createdAt, false)
+		b.upsertInternalRunnerOutput(provider.ChatEvent{Actor: actor}, text, createdAt, false)
 		return
 	}
 	entryID := strings.TrimSpace(id)

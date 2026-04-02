@@ -149,16 +149,7 @@
               {/if}
             {:else}
               {@const bodyText = messageDisplayContent(message) || ''}
-              {#if message.pending && messageShowsAssistantUsage(message) && !String(message.content || '').trim()}
-                <div class="coding-streaming-note coding-streaming-inline" role="status" aria-live="polite">
-                  <span class="streaming-pulse" aria-hidden="true"></span>
-                  <span class="streaming-label">{streamingLabel}</span>
-                  <span class="streaming-dots" aria-hidden="true"></span>
-                  <span class="streaming-bar" aria-hidden="true"><i></i></span>
-                </div>
-              {:else}
-                <pre>{isMessageExpanded(message.id) ? bodyText : messagePreviewContent(bodyText)}</pre>
-              {/if}
+              <pre>{isMessageExpanded(message.id) ? bodyText : messagePreviewContent(bodyText)}</pre>
               {@const showMoreAvailable = shouldCollapseContent(bodyText)}
               {#if messageShowsAssistantUsage(message) && assistantUsageSummary(message)}
                 <p class="setting-title coding-assistant-usage mono">{assistantUsageSummary(message)}</p>

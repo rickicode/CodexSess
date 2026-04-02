@@ -128,9 +128,6 @@ func (s *Service) ensureCodingTemplateHome() (string, error) {
 	if err := seedBundledCodingTemplateAgents(root); err != nil {
 		return "", err
 	}
-	if err := seedBundledCodingTemplateSkills(root); err != nil {
-		return "", err
-	}
 	if err := ensureCodingTemplateSuperpowers(root); err != nil {
 		return "", err
 	}
@@ -189,6 +186,37 @@ func (s *Service) CodingTemplateHomeStatus(ctx context.Context) (CodingTemplateH
 	return s.codingTemplateHomeStatus()
 }
 
+func (s *Service) CodingTemplateSkillNames() ([]string, error) {
+	templateHome, err := s.ensureCodingTemplateHome()
+	if err != nil {
+		return nil, err
+	}
+	skillsRoot, err := resolveCodingRuntimeSuperpowersSkillsRoot(templateHome)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(skillsRoot)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := strings.TrimSpace(entry.Name())
+		if name == "" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(skillsRoot, name, "SKILL.md")); err != nil {
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
 func (s *Service) refreshCodingTemplateHome() (string, error) {
 	root := s.codingTemplateHomeRoot()
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -203,9 +231,6 @@ func (s *Service) refreshCodingTemplateHome() (string, error) {
 		return "", err
 	}
 	if err := seedBundledCodingTemplateAgents(root); err != nil {
-		return "", err
-	}
-	if err := seedBundledCodingTemplateSkills(root); err != nil {
 		return "", err
 	}
 	if err := ensureCodingTemplateSuperpowers(root); err != nil {
@@ -324,7 +349,7 @@ func (s *Service) syncCodingTemplateHomeFromUserCodex(root string) error {
 	if info, err := os.Stat(sourceRoot); err != nil || !info.IsDir() {
 		return nil
 	}
-	for _, name := range []string{"agents", "skills", "mcp"} {
+	for _, name := range []string{"agents", "mcp"} {
 		srcPath := filepath.Join(sourceRoot, name)
 		if info, err := os.Stat(srcPath); err == nil && info.IsDir() {
 			if err := copyMissingDirContents(srcPath, filepath.Join(root, name)); err != nil {
@@ -361,9 +386,6 @@ func ensureBundledTemplateAssetsInUserCodexHome(homePath string) error {
 	if err := seedBundledCodingTemplateAgents(userCodexRoot); err != nil {
 		return err
 	}
-	if err := seedBundledCodingTemplateSkills(userCodexRoot); err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -396,7 +418,7 @@ func syncCodingRuntimeRoleSkills(runtimeHome, templateHome, role string) error {
 
 	sourceSkillsRoot, err := resolveCodingRuntimeSuperpowersSkillsRoot(templateHome)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	allowed := map[string]struct{}{}
@@ -446,20 +468,7 @@ func syncCodingRuntimeRoleSkills(runtimeHome, templateHome, role string) error {
 
 func resolveCodingRuntimeSuperpowersSkillsRoot(templateHome string) (string, error) {
 	templateRoot := strings.TrimSpace(templateHome)
-	repoSkillsRoot, repoErr := resolveTemplateSuperpowersSkillsRoot(filepath.Join(templateRoot, "superpowers"))
-	if repoErr == nil {
-		return repoSkillsRoot, nil
-	}
-
-	fallbackRoot := filepath.Join(templateRoot, "skills")
-	if info, err := os.Stat(fallbackRoot); err == nil {
-		if info.IsDir() {
-			return fallbackRoot, nil
-		}
-		return "", fmt.Errorf("template skills root is not directory: %s", fallbackRoot)
-	}
-
-	return "", repoErr
+	return resolveTemplateSuperpowersSkillsRoot(filepath.Join(templateRoot, "superpowers"))
 }
 
 func buildDefaultCodingTemplateConfig(homePath string) string {
@@ -497,7 +506,11 @@ func buildDefaultCodingTemplateConfig(homePath string) string {
 }
 
 func mergeMissingTemplateConfigSections(existing, homePath string) string {
-	body := stripTemplateConfigSection(strings.TrimSpace(existing), "[mcp_servers.memory]")
+	body := stripTemplateConfigSections(
+		strings.TrimSpace(existing),
+		"[mcp_servers.memory]",
+		"[mcp_servers.codex_apps]",
+	)
 	if body == "" {
 		return buildDefaultCodingTemplateConfig(homePath)
 	}
@@ -550,6 +563,14 @@ func mergeMissingTemplateConfigSections(existing, homePath string) string {
 		appendSection(marker, defaultBody[start:end])
 	}
 	return strings.TrimSpace(body) + "\n"
+}
+
+func stripTemplateConfigSections(body string, markers ...string) string {
+	text := strings.TrimSpace(body)
+	for _, marker := range markers {
+		text = stripTemplateConfigSection(text, marker)
+	}
+	return text
 }
 
 func stripTemplateConfigSection(body, marker string) string {

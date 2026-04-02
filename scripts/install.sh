@@ -63,7 +63,7 @@ Options:
 
 Examples:
   ./install.sh
-  ./install.sh --mode gui --version v1.0.1
+  ./install.sh --mode gui --version v1.0.3
   ./install.sh --mode server --bin-dir "$HOME/.local/bin"
   ./install.sh --mode update
 

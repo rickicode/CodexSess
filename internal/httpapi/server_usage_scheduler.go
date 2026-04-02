@@ -14,6 +14,14 @@ import (
 	"github.com/ricki/codexsess/internal/store"
 )
 
+type activeUsageRefreshResult struct {
+	Refreshed []string
+	APIFailed store.Account
+	APIErr    error
+	CLIFailed store.Account
+	CLIErr    error
+}
+
 func (s *Server) saveUsageSchedulerCursor(ctx context.Context, cursor int) error {
 	if s.svc == nil || s.svc.Store == nil {
 		return nil
@@ -56,9 +64,10 @@ func (s *Server) runUsageAutoSwitchActiveOnce(parent context.Context) {
 	s.runActiveUsageAutoSwitchTick(ctx)
 }
 
-func (s *Server) refreshUsageForActiveAccounts(ctx context.Context) []string {
+func (s *Server) refreshUsageForActiveAccounts(ctx context.Context) activeUsageRefreshResult {
 	refreshed := make([]string, 0, 2)
 	seen := make(map[string]struct{}, 2)
+	result := activeUsageRefreshResult{}
 
 	appendRefreshed := func(id string) {
 		id = strings.TrimSpace(id)
@@ -76,37 +85,46 @@ func (s *Server) refreshUsageForActiveAccounts(ctx context.Context) []string {
 		id := strings.TrimSpace(active.ID)
 		if id != "" {
 			if _, refreshErr := s.svc.RefreshUsage(ctx, id); refreshErr != nil {
+				s.markUsageLastError(ctx, id, refreshErr.Error())
 				s.svc.AddSystemLog(ctx, "usage_refresh", "Active API usage refresh failed", map[string]any{
 					"source":   "autoswitch",
 					"selector": id,
+					"email":    strings.TrimSpace(active.Email),
 					"type":     "api",
 					"error":    refreshErr.Error(),
 				})
-				log.Printf("[autoswitch] active api usage refresh failed for %s: %v", id, refreshErr)
+				log.Printf("[autoswitch] active api usage refresh failed for %s: %v", accountSwitchDisplayValue(active), refreshErr)
+				result.APIFailed = active
+				result.APIErr = refreshErr
 			} else {
 				appendRefreshed(id)
 			}
 		}
 	}
 
-	if cliID, err := s.svc.ActiveCLIAccountID(ctx); err == nil {
-		id := strings.TrimSpace(cliID)
+	if active, err := s.svc.Store.ActiveCLIAccount(ctx); err == nil {
+		id := strings.TrimSpace(active.ID)
 		if id != "" {
 			if _, refreshErr := s.svc.RefreshUsage(ctx, id); refreshErr != nil {
+				s.markUsageLastError(ctx, id, refreshErr.Error())
 				s.svc.AddSystemLog(ctx, "usage_refresh", "Active CLI usage refresh failed", map[string]any{
 					"source":   "autoswitch",
 					"selector": id,
+					"email":    strings.TrimSpace(active.Email),
 					"type":     "cli",
 					"error":    refreshErr.Error(),
 				})
-				log.Printf("[autoswitch] active cli usage refresh failed for %s: %v", id, refreshErr)
+				log.Printf("[autoswitch] active cli usage refresh failed for %s: %v", accountSwitchDisplayValue(active), refreshErr)
+				result.CLIFailed = active
+				result.CLIErr = refreshErr
 			} else {
 				appendRefreshed(id)
 			}
 		}
 	}
 
-	return refreshed
+	result.Refreshed = refreshed
+	return result
 }
 
 func (s *Server) runUsageSchedulerLoop(ctx context.Context) {
@@ -223,18 +241,47 @@ func (s *Server) runActiveUsageAutoSwitchTick(parent context.Context) {
 	switchCtx, switchCancel := context.WithTimeout(parent, switchTimeout)
 	defer switchCancel()
 
-	refreshed := s.refreshUsageForActiveAccounts(switchCtx)
-	if len(refreshed) > 0 {
+	refreshResult := s.refreshUsageForActiveAccounts(switchCtx)
+	if len(refreshResult.Refreshed) > 0 {
 		s.svc.AddSystemLog(switchCtx, "usage_refresh", "Active account usage refresh", map[string]any{
 			"source":    "autoswitch",
-			"selectors": refreshed,
-			"count":     len(refreshed),
+			"selectors": refreshResult.Refreshed,
+			"count":     len(refreshResult.Refreshed),
 		})
 	} else {
 		s.svc.AddSystemLog(switchCtx, "usage_refresh", "Active account usage refresh skipped", map[string]any{
 			"source": "autoswitch",
 			"reason": "no_active_accounts_refreshed",
 		})
+	}
+
+	if refreshResult.APIErr != nil && strings.TrimSpace(refreshResult.APIFailed.ID) != "" {
+		candidates, err := s.findAutoSwitchCandidatesFromDB(switchCtx, refreshResult.APIFailed.ID)
+		if err != nil {
+			s.svc.AddSystemLog(switchCtx, "api_autoswitch", "API refresh-failure switch lookup failed", map[string]any{
+				"from":       strings.TrimSpace(refreshResult.APIFailed.ID),
+				"from_email": strings.TrimSpace(refreshResult.APIFailed.Email),
+				"reason":     "refresh_failed",
+				"strategy":   "refresh_failure",
+				"error":      err.Error(),
+			})
+		} else if switchErr := s.switchAPIActiveToCandidate(switchCtx, refreshResult.APIFailed, candidates, 0, threshold, "refresh_failure", "refresh_failed"); switchErr != nil {
+			log.Printf("[autoswitch] api refresh-failure recovery failed: %v", switchErr)
+		}
+	}
+	if refreshResult.CLIErr != nil && strings.TrimSpace(refreshResult.CLIFailed.ID) != "" {
+		candidates, err := s.findAutoSwitchCandidatesFromDB(switchCtx, refreshResult.CLIFailed.ID)
+		if err != nil {
+			s.svc.AddSystemLog(switchCtx, "cli_autoswitch", "CLI refresh-failure switch lookup failed", map[string]any{
+				"from":       strings.TrimSpace(refreshResult.CLIFailed.ID),
+				"from_email": strings.TrimSpace(refreshResult.CLIFailed.Email),
+				"reason":     "refresh_failed",
+				"strategy":   "refresh_failure",
+				"error":      err.Error(),
+			})
+		} else if switchErr := s.switchCLIActiveToCandidate(switchCtx, refreshResult.CLIFailed, candidates, 0, threshold, "refresh_failure", "refresh_failed"); switchErr != nil {
+			log.Printf("[autoswitch] cli refresh-failure recovery failed: %v", switchErr)
+		}
 	}
 
 	if err := s.autoSwitchAPIIfNeeded(switchCtx, threshold); err != nil {

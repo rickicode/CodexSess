@@ -1,18 +1,13 @@
 package service
 
 import (
-	"embed"
 	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"strings"
 )
-
-//go:embed defaults/codex-skills/* defaults/codex-skills/*/* defaults/codex-skills/*/*/*
-var bundledCodingTemplateSkills embed.FS
 
 const (
 	defaultCodingTemplateSuperpowersRepoURL = "https://github.com/obra/superpowers.git"
@@ -46,49 +41,6 @@ func codingRuntimeRoleSkills(role string) []string {
 			"verification-before-completion",
 		}
 	}
-}
-
-func seedBundledCodingTemplateSkills(root string) error {
-	skillsRoot := filepath.Join(strings.TrimSpace(root), "skills")
-	if err := os.MkdirAll(skillsRoot, 0o700); err != nil {
-		return err
-	}
-	return copyBundledSkillsTree("defaults/codex-skills", skillsRoot)
-}
-
-func copyBundledSkillsTree(srcRoot, dstRoot string) error {
-	entries, err := fs.ReadDir(bundledCodingTemplateSkills, srcRoot)
-	if err != nil {
-		return nil
-	}
-	for _, entry := range entries {
-		name := strings.TrimSpace(entry.Name())
-		if name == "" {
-			continue
-		}
-		srcPath := path.Join(srcRoot, name)
-		dstPath := filepath.Join(dstRoot, name)
-		if entry.IsDir() {
-			if err := os.MkdirAll(dstPath, 0o700); err != nil {
-				return err
-			}
-			if err := copyBundledSkillsTree(srcPath, dstPath); err != nil {
-				return err
-			}
-			continue
-		}
-		raw, err := bundledCodingTemplateSkills.ReadFile(srcPath)
-		if err != nil {
-			return err
-		}
-		if _, err := os.Stat(dstPath); err == nil {
-			continue
-		}
-		if err := os.WriteFile(dstPath, raw, 0o600); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func ensureCodingTemplateSuperpowers(root string) error {

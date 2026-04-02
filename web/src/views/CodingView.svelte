@@ -80,6 +80,7 @@
   import {
     collectLiveMessageIDs,
     completedViewStatus,
+    currentRecoveryStatus,
     execStatusLabel,
     fileOpTone,
     isInternalRunnerActivity,
@@ -173,8 +174,8 @@
   const nearBottomThresholdPx = 120;
 
   const apiBase = String(import.meta.env.VITE_API_BASE || '').trim().replace(/\/+$/, '');
-  const draftStoragePrefix = 'codexsess.coding.draft.v1:';
-  const reasoningLevelStorageKey = 'codexsess.coding.reasoning_level.v1';
+  const draftStoragePrefix = 'codexsess.coding.draft:';
+  const reasoningLevelStorageKey = 'codexsess.coding.reasoning_level';
   const enableSkillHintWrap = ['1', 'true', 'yes', 'on'].includes(
     String(import.meta.env.VITE_CODEXSESS_SKILL_HINT_WRAP || '').trim().toLowerCase()
   );
@@ -586,6 +587,45 @@
     return '';
   }
 
+  function streamEventSourceField(evt, field) {
+    return String(evt?.[field] || evt?.payload?.[field] || '').trim();
+  }
+
+  function streamMessageSourceKey(role, turnID, itemID, itemType) {
+    const normalizedRole = String(role || '').trim().toLowerCase();
+    const normalizedTurnID = String(turnID || '').trim();
+    const normalizedItemID = String(itemID || '').trim();
+    const normalizedItemType = String(itemType || '').trim().toLowerCase();
+    if (!normalizedRole || !normalizedItemID) return '';
+    return [normalizedRole, normalizedTurnID, normalizedItemID, normalizedItemType].join('|');
+  }
+
+  function liveAssistantKeyFromEvent(evt) {
+    const turnID = streamEventSourceField(evt, 'source_turn_id');
+    const itemID = streamEventSourceField(evt, 'source_item_id');
+    const itemType = streamEventSourceField(evt, 'source_item_type');
+    return streamMessageSourceKey('assistant', turnID, itemID, itemType);
+  }
+
+  function applyStreamSourceIdentityFields(row, {
+    sourceEventType = '',
+    sourceThreadID = '',
+    sourceTurnID = '',
+    sourceItemID = '',
+    sourceItemType = '',
+    eventSeq = 0
+  } = {}) {
+    const next = row && typeof row === 'object' ? { ...row } : {};
+    if (sourceEventType) next.source_event_type = sourceEventType;
+    if (sourceThreadID) next.source_thread_id = sourceThreadID;
+    if (sourceTurnID) next.source_turn_id = sourceTurnID;
+    if (sourceItemID) next.source_item_id = sourceItemID;
+    if (sourceItemType) next.source_item_type = sourceItemType;
+    const seq = Number(eventSeq || 0);
+    if (Number.isFinite(seq) && seq > 0) next.event_seq = seq;
+    return next;
+  }
+
   function buildStreamMessageID(streamType, actor, sequence) {
     const suffix = Math.random().toString(36).slice(2, 8);
     const seqPart = sequence > 0 ? String(sequence) : String(Date.now());
@@ -593,37 +633,84 @@
     return `stream-${streamType}-${actorPart}-${seqPart}-${suffix}`;
   }
 
-  function upsertStreamAssistantMessage({ actor, lane = '', text, isDelta, createdAt, sequence, streamType }) {
+  function upsertStreamAssistantMessage({
+    actor,
+    lane = '',
+    text,
+    isDelta,
+    createdAt,
+    sequence,
+    streamType,
+    sourceEventType = '',
+    sourceThreadID = '',
+    sourceTurnID = '',
+    sourceItemID = '',
+    sourceItemType = '',
+    assistantKey = ''
+  }) {
     if (!text) return;
     const normalizedActor = String(actor || '').trim().toLowerCase();
+    const normalizedAssistantKey = String(assistantKey || '').trim();
     let index = -1;
-    for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
-      const candidate = messages[idx];
-      if (!candidate) continue;
-      if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
-      const candidateActor = String(candidate?.actor || '').trim().toLowerCase();
-      if (candidateActor !== normalizedActor) continue;
-      if (candidate?.pending) {
+    if (normalizedAssistantKey) {
+      for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+        const candidate = messages[idx];
+        if (!candidate) continue;
+        if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
+        if (String(candidate?.stream_identity_key || '').trim() !== normalizedAssistantKey) continue;
         index = idx;
         break;
+      }
+      if (index < 0) {
+        for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+          const candidate = messages[idx];
+          if (!candidate) continue;
+          if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
+          if (!candidate?.pending) continue;
+          if (String(candidate?.stream_identity_key || '').trim()) continue;
+          if (String(candidate?.content || '').trim()) continue;
+          index = idx;
+          break;
+        }
+      }
+    } else {
+      for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
+        const candidate = messages[idx];
+        if (!candidate) continue;
+        if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
+        const candidateActor = String(candidate?.actor || '').trim().toLowerCase();
+        if (candidateActor !== normalizedActor) continue;
+        if (candidate?.pending) {
+          index = idx;
+          break;
+        }
       }
     }
     if (index >= 0) {
       const current = messages[index];
       const base = String(current?.content || '');
       const nextContent = isDelta ? `${base}${text}` : text;
-      const next = {
+      let next = {
         ...current,
         content: nextContent,
         updated_at: createdAt,
         pending: isDelta
       };
       if (sequence > 0) next.sequence = sequence;
+      if (normalizedAssistantKey) next.stream_identity_key = normalizedAssistantKey;
+      next = applyStreamSourceIdentityFields(next, {
+        sourceEventType,
+        sourceThreadID,
+        sourceTurnID,
+        sourceItemID,
+        sourceItemType,
+        eventSeq: sequence
+      });
       messages = messages.map((item, idx) => (idx === index ? next : item));
       return;
     }
     const id = buildStreamMessageID(streamType || 'assistant', normalizedActor, sequence);
-    const next = {
+    let next = {
       id,
       role: 'assistant',
       content: text,
@@ -634,6 +721,15 @@
     if (lane) next.lane = lane;
     if (normalizedActor) next.actor = normalizedActor;
     if (sequence > 0) next.sequence = sequence;
+    if (normalizedAssistantKey) next.stream_identity_key = normalizedAssistantKey;
+    next = applyStreamSourceIdentityFields(next, {
+      sourceEventType,
+      sourceThreadID,
+      sourceTurnID,
+      sourceItemID,
+      sourceItemType,
+      eventSeq: sequence
+    });
     messages = mergeMessagesChronologically(messages, [next]);
   }
 
@@ -659,12 +755,18 @@
     const shouldAutoFollow = isViewportNearBottom(targetViewport, nearBottomThresholdPx);
     const createdAt = streamEventTimestamp(evt);
     const sequence = streamEventSequence(evt);
+    const sourceEventType = streamEventSourceField(evt, 'source_event_type');
+    const sourceThreadID = streamEventSourceField(evt, 'source_thread_id');
+    const sourceTurnID = streamEventSourceField(evt, 'source_turn_id');
+    const sourceItemID = streamEventSourceField(evt, 'source_item_id');
+    const sourceItemType = streamEventSourceField(evt, 'source_item_type').toLowerCase();
+    const assistantKey = liveAssistantKeyFromEvent(evt);
     if (streamType === 'raw_event') {
       const rawPayloadText = String(evt?.raw_payload || evt?.payload?.raw_payload || text || '').trim();
       const payload = parseRawEventPayload(rawPayloadText);
       const parsedExec = parseExecEventFromPayload(payload);
       if (parsedExec?.command) {
-        const next = {
+        let next = {
           id: buildStreamMessageID('exec', actor, sequence),
           role: 'exec',
           content: parsedExec.command,
@@ -680,13 +782,21 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
       }
       const parsedSubagent = parseSubagentEventFromPayload(payload);
       if (parsedSubagent?.toolName) {
-        const next = {
+        let next = {
           id: buildStreamMessageID('subagent', actor, sequence),
           role: 'subagent',
           content: parsedSubagent.title || text,
@@ -713,13 +823,21 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
       }
       const parsedMCP = parseMCPActivityPayload(payload);
       if (parsedMCP?.text) {
-        const next = {
+        let next = {
           id: buildStreamMessageID('mcp', actor, sequence),
           role: 'activity',
           content: parsedMCP.text,
@@ -735,13 +853,21 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
       }
       const fileOpLabel = parseFileOperationPayload(payload);
       if (fileOpLabel) {
-        const next = {
+        let next = {
           id: buildStreamMessageID('fileop', actor, sequence),
           role: 'activity',
           content: fileOpLabel,
@@ -753,6 +879,14 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
@@ -770,7 +904,13 @@
         isDelta: streamType === 'delta',
         createdAt,
         sequence,
-        streamType
+        streamType,
+        sourceEventType,
+        sourceThreadID,
+        sourceTurnID,
+        sourceItemID,
+        sourceItemType,
+        assistantKey
       });
       autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
       return;
@@ -782,7 +922,7 @@
       }
       const execActivity = parseActivityText(text);
       if (execActivity?.kind === 'running' || execActivity?.kind === 'done' || execActivity?.kind === 'failed') {
-        const next = {
+        let next = {
           id: buildStreamMessageID(streamType, actor, sequence),
           role: 'exec',
           content: execActivity.command || text,
@@ -798,6 +938,14 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
@@ -811,7 +959,7 @@
       }
       const fileOpLabel = parseFileOperationText(text);
       if (fileOpLabel) {
-        const next = {
+        let next = {
           id: buildStreamMessageID(streamType, actor, sequence),
           role: 'activity',
           content: fileOpLabel,
@@ -824,13 +972,21 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
       }
       const subagentActivity = parseSubagentActivityText(text);
       if (subagentActivity?.toolName) {
-        const next = {
+        let next = {
           id: buildStreamMessageID(streamType, actor, sequence),
           role: 'subagent',
           content: subagentActivity.title || text,
@@ -856,6 +1012,14 @@
         if (lane) next.lane = lane;
         if (actor) next.actor = actor;
         if (sequence > 0) next.sequence = sequence;
+        next = applyStreamSourceIdentityFields(next, {
+          sourceEventType,
+          sourceThreadID,
+          sourceTurnID,
+          sourceItemID,
+          sourceItemType,
+          eventSeq: sequence
+        });
         messages = mergeMessagesChronologically(messages, [next]);
         autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
         return;
@@ -915,11 +1079,12 @@
   });
 
   let effectiveViewStatus = $derived.by(() => {
+    const recoveryStatus = currentRecoveryStatus(messages);
     if (stopRequested) {
       return 'Stopping...';
     }
     if (sending || backgroundProcessing) {
-      return 'Streaming...';
+      return recoveryStatus || 'Streaming...';
     }
     return viewStatus;
   });

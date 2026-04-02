@@ -197,6 +197,22 @@ test("buildExecAwareMessages hides generic thread.started raw events", () => {
   assert.equal(messages.length, 0);
 });
 
+test("buildExecAwareMessages hides generic skills.changed raw events", () => {
+  const messages = buildExecAwareMessages([
+    {
+      id: "raw-skills-changed",
+      role: "event",
+      content: JSON.stringify({
+        method: "skills/changed",
+        params: {},
+      }),
+      created_at: "2026-04-02T07:00:00Z",
+    },
+  ]);
+
+  assert.equal(messages.length, 0);
+});
+
 test("parseSubagentActivityText supports timeline waiting activity", () => {
   const parsed = parseSubagentActivityText(
     "Timeline event: `WAITING` (awaiting analysis result from subagent `Kepler`).",
@@ -503,4 +519,112 @@ test("parseFileOperationPayload supports nested kind objects from file change pa
   });
 
   assert.equal(parsed, "Deleted: /tmp/nested-old.txt");
+});
+
+test("assistant stream keeps two blank-actor items separate when source item ids differ", () => {
+  const rows = buildExecAwareMessages([
+    {
+      id: "stream-assistant-1",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Draft boundary",
+      pending: true,
+      created_at: "2026-04-02T12:00:00.000Z",
+      updated_at: "2026-04-02T12:00:00.000Z",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agentmessage",
+    },
+    {
+      id: "stream-assistant-2",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Draft boundary",
+      pending: true,
+      created_at: "2026-04-02T12:00:00.010Z",
+      updated_at: "2026-04-02T12:00:00.010Z",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+    },
+  ]);
+
+  const assistantRows = rows.filter(
+    (row) => String(row?.role || "").trim().toLowerCase() === "assistant",
+  );
+  assert.equal(assistantRows.length, 2);
+  assert.deepEqual(
+    assistantRows.map((row) => row?.source_item_id),
+    ["item-assistant-1", "item-assistant-2"],
+  );
+});
+
+test("buildExecAwareMessages preserves source identity on synthesized stream rows", () => {
+  const rows = buildExecAwareMessages([
+    {
+      id: "stream-raw-exec-1",
+      role: "event",
+      actor: "",
+      lane: "",
+      source_event_type: "item/completed",
+      source_thread_id: "thread-chat-1",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-exec-1",
+      source_item_type: "commandexecution",
+      event_seq: 91,
+      content: JSON.stringify({
+        method: "item/completed",
+        params: {
+          item: {
+            type: "commandExecution",
+            command: "pwd",
+            aggregatedOutput: "/tmp/workspace",
+            exitCode: 0,
+          },
+        },
+      }),
+      created_at: "2026-04-02T12:10:00.000Z",
+      updated_at: "2026-04-02T12:10:00.000Z",
+    },
+    {
+      id: "stream-raw-mcp-1",
+      role: "event",
+      actor: "",
+      lane: "",
+      source_event_type: "item/completed",
+      source_thread_id: "thread-chat-1",
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-mcp-1",
+      source_item_type: "tool_call",
+      event_seq: 92,
+      content: JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "tool_call",
+          name: "mcp__github__search_code",
+          output: { summary: "Found 2 matches" },
+        },
+      }),
+      created_at: "2026-04-02T12:10:01.000Z",
+      updated_at: "2026-04-02T12:10:01.000Z",
+    },
+  ]);
+
+  const execRow = rows.find(
+    (row) => String(row?.role || "").trim().toLowerCase() === "exec",
+  );
+  const mcpRow = rows.find((row) => row?.mcp_activity);
+
+  assert.ok(execRow);
+  assert.ok(mcpRow);
+  assert.equal(execRow?.source_turn_id, "turn-chat-1");
+  assert.equal(execRow?.source_item_id, "item-exec-1");
+  assert.equal(execRow?.source_item_type, "commandexecution");
+  assert.equal(execRow?.event_seq, 91);
+  assert.equal(mcpRow?.source_turn_id, "turn-chat-1");
+  assert.equal(mcpRow?.source_item_id, "item-mcp-1");
+  assert.equal(mcpRow?.source_item_type, "tool_call");
+  assert.equal(mcpRow?.event_seq, 92);
 });

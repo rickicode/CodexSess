@@ -42,7 +42,7 @@ func TestMemoryItemsUpsertAndListByNaturalKey(t *testing.T) {
 		ScopeID:    "sess_1",
 		Kind:       "constraint",
 		Key:        "goal",
-		ValueJSON:  `{"text":"ship feature v2"}`,
+		ValueJSON:  `{"text":"ship feature next"}`,
 		SourceType: "user",
 		SourceRef:  "msg_2",
 		Verified:   true,
@@ -54,7 +54,7 @@ func TestMemoryItemsUpsertAndListByNaturalKey(t *testing.T) {
 	if second.ID != first.ID {
 		t.Fatalf("expected upsert to keep natural-key record id=%q, got=%q", first.ID, second.ID)
 	}
-	if second.ValueJSON != `{"text":"ship feature v2"}` {
+	if second.ValueJSON != `{"text":"ship feature next"}` {
 		t.Fatalf("expected updated value_json, got %q", second.ValueJSON)
 	}
 

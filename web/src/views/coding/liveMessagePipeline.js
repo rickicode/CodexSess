@@ -438,10 +438,132 @@ function normalizeAppServerEventType(rawType) {
   return String(rawType || '').trim().toLowerCase().replaceAll('/', '.');
 }
 
+function eventSequenceValue(...values) {
+  for (const value of values) {
+    const num = Number(value ?? 0);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+  return 0;
+}
+
+function sourceIdentityFromRowFields(row) {
+  const item = row && typeof row === 'object' ? row : {};
+  return {
+    sourceEventType: String(item?.source_event_type ?? item?.sourceEventType ?? '').trim(),
+    sourceThreadID: String(item?.source_thread_id ?? item?.sourceThreadID ?? '').trim(),
+    sourceTurnID: String(item?.source_turn_id ?? item?.sourceTurnID ?? '').trim(),
+    sourceItemID: String(item?.source_item_id ?? item?.sourceItemID ?? '').trim(),
+    sourceItemType: String(item?.source_item_type ?? item?.sourceItemType ?? '').trim().toLowerCase(),
+    eventSeq: eventSequenceValue(item?.event_seq, item?.eventSeq),
+  };
+}
+
+function sourceIdentityFromMessageRow(row, payload = null) {
+  const item = row && typeof row === 'object' ? row : {};
+  const evt = payload && typeof payload === 'object' ? payload : {};
+  const payloadItem = evt?.item && typeof evt.item === 'object' ? evt.item : {};
+  const rawItemType = String(
+    item?.source_item_type ??
+      item?.sourceItemType ??
+      evt?.source_item_type ??
+      evt?.sourceItemType ??
+      evt?.item_type ??
+      evt?.itemType ??
+      payloadItem?.type ??
+      '',
+  )
+    .trim()
+    .toLowerCase();
+  const normalizedItemType = normalizeAppServerItemType(rawItemType).replaceAll('_', '');
+  const itemType = rawItemType || normalizedItemType;
+  const sourceEventType = String(
+    item?.source_event_type ??
+      item?.sourceEventType ??
+      evt?.source_event_type ??
+      evt?.sourceEventType ??
+      evt?.type ??
+      '',
+  ).trim();
+  const sourceThreadID = String(
+    item?.source_thread_id ??
+      item?.sourceThreadID ??
+      evt?.source_thread_id ??
+      evt?.sourceThreadID ??
+      evt?.thread_id ??
+      evt?.threadId ??
+      payloadItem?.thread_id ??
+      payloadItem?.threadId ??
+      '',
+  ).trim();
+  const sourceTurnID = String(
+    item?.source_turn_id ??
+      item?.sourceTurnID ??
+      evt?.source_turn_id ??
+      evt?.sourceTurnID ??
+      evt?.turn_id ??
+      evt?.turnId ??
+      payloadItem?.turn_id ??
+      payloadItem?.turnId ??
+      '',
+  ).trim();
+  const sourceItemID = String(
+    item?.source_item_id ??
+      item?.sourceItemID ??
+      evt?.source_item_id ??
+      evt?.sourceItemID ??
+      evt?.item_id ??
+      evt?.itemId ??
+      payloadItem?.id ??
+      '',
+  ).trim();
+  return {
+    sourceEventType,
+    sourceThreadID,
+    sourceTurnID,
+    sourceItemID,
+    sourceItemType: itemType,
+    eventSeq: eventSequenceValue(
+      item?.event_seq,
+      item?.eventSeq,
+      evt?.event_seq,
+      evt?.eventSeq,
+      evt?.sequence,
+      evt?.seq,
+    ),
+  };
+}
+
+function mergeSourceIdentity(existing, incoming) {
+  const prev = existing && typeof existing === 'object' ? existing : {};
+  const next = incoming && typeof incoming === 'object' ? incoming : {};
+  return {
+    sourceEventType: String(next?.sourceEventType || prev?.sourceEventType || '').trim(),
+    sourceThreadID: String(next?.sourceThreadID || prev?.sourceThreadID || '').trim(),
+    sourceTurnID: String(next?.sourceTurnID || prev?.sourceTurnID || '').trim(),
+    sourceItemID: String(next?.sourceItemID || prev?.sourceItemID || '').trim(),
+    sourceItemType: String(next?.sourceItemType || prev?.sourceItemType || '').trim().toLowerCase(),
+    eventSeq: eventSequenceValue(next?.eventSeq, prev?.eventSeq),
+  };
+}
+
+function applySourceIdentityFields(row, sourceIdentity) {
+  const next = row && typeof row === 'object' ? { ...row } : {};
+  const source = sourceIdentity && typeof sourceIdentity === 'object' ? sourceIdentity : {};
+  if (source?.sourceEventType) next.source_event_type = source.sourceEventType;
+  if (source?.sourceThreadID) next.source_thread_id = source.sourceThreadID;
+  if (source?.sourceTurnID) next.source_turn_id = source.sourceTurnID;
+  if (source?.sourceItemID) next.source_item_id = source.sourceItemID;
+  if (source?.sourceItemType) next.source_item_type = source.sourceItemType;
+  const seq = eventSequenceValue(source?.eventSeq);
+  if (seq > 0) next.event_seq = seq;
+  return next;
+}
+
 function shouldIgnoreRawEventPayload(payload) {
   const evt = payload && typeof payload === 'object' ? payload : null;
   if (!evt) return false;
-  return normalizeAppServerEventType(evt?.type) === 'thread.started';
+  const type = normalizeAppServerEventType(evt?.type);
+  return type === 'thread.started' || type === 'skills.changed';
 }
 
 function parseExecEventFromPayload(payload) {
@@ -803,6 +925,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
   const upsertExecEntry = (entry) => {
     const command = String(entry?.command || '').trim();
     if (!command) return null;
+    const sourceIdentity = mergeSourceIdentity({}, entry?.sourceIdentity);
     const ownership = resolveLegacyRuntimeOwnership(entry?.actor, entry?.lane);
     const actor = ownership.actor;
     const lane = ownership.lane;
@@ -825,7 +948,11 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
         prevStatus === 'running' ||
         (prevStatus === nextStatus && prevExitCode === nextExitCode && nextStatus !== 'running');
       if (canUpdateExisting) {
-        out[indexedExisting] = {
+        const mergedSourceIdentity = mergeSourceIdentity(
+          sourceIdentityFromRowFields(prev),
+          sourceIdentity,
+        );
+        out[indexedExisting] = applySourceIdentityFields({
           ...prev,
           ...(actor ? { actor } : {}),
           ...(lane ? { lane } : {}),
@@ -834,7 +961,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           exec_exit_code: nextExitCode,
           exec_output: mergeExecOutput(prevOutput, nextOutput),
           exec_output_source: mergeExecOutputSource(prev?.exec_output_source, entry?.source || 'live')
-        };
+        }, mergedSourceIdentity);
         latestExecByKey.set(key, indexedExisting);
         if (nextStatus === 'running') {
           activeExecByKey.set(key, indexedExisting);
@@ -865,7 +992,11 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           prevOutput.includes(nextOutput) ||
           nextOutput.includes(prevOutput);
         if (!windowOk || !outputOk) continue;
-        out[i] = {
+        const mergedSourceIdentity = mergeSourceIdentity(
+          sourceIdentityFromRowFields(prev),
+          sourceIdentity,
+        );
+        out[i] = applySourceIdentityFields({
           ...prev,
           ...(actor ? { actor } : {}),
           ...(lane ? { lane } : {}),
@@ -874,7 +1005,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           exec_exit_code: nextExitCode,
           exec_output: mergeExecOutput(prevOutput, nextOutput),
           exec_output_source: mergeExecOutputSource(prev?.exec_output_source, entry?.source || 'live')
-        };
+        }, mergedSourceIdentity);
         latestExecByKey.set(key, i);
         activeExecByKey.delete(key);
         if (normalizeActivityCommandKey(lastExecKey) === key) {
@@ -901,7 +1032,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
       if (!Number.isNaN(nextCreatedAtMs) && !Number.isNaN(prevMs) && Math.abs(nextCreatedAtMs - prevMs) > 1800) continue;
       return prev;
     }
-    const next = {
+    const next = applySourceIdentityFields({
       id: `exec-${String(entry?.sourceID || key)}`,
       role: 'exec',
       actor,
@@ -915,7 +1046,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
       exec_exit_code: nextExitCode,
       exec_output: nextOutput,
       exec_output_source: normalizeExecOutputSource(entry?.source || 'live')
-    };
+    }, sourceIdentity);
     out.push(next);
     latestExecByKey.set(key, out.length - 1);
     if (next.exec_status === 'running') {
@@ -931,6 +1062,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
   };
 
   const upsertSubagentEntry = (entry) => {
+    const sourceIdentity = mergeSourceIdentity({}, entry?.sourceIdentity);
     const ownership = resolveLegacyRuntimeOwnership(entry?.actor, entry?.lane);
     const actor = ownership.actor;
     const lane = ownership.lane;
@@ -1052,7 +1184,11 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
         effectiveRole,
         String(current?.subagent_role || '').trim()
       );
-      out[resolvedExistingIdx] = {
+      const mergedSourceIdentity = mergeSourceIdentity(
+        sourceIdentityFromRowFields(current),
+        sourceIdentity,
+      );
+      out[resolvedExistingIdx] = applySourceIdentityFields({
         ...current,
         ...(actor ? { actor } : {}),
         ...(lane ? { lane } : {}),
@@ -1070,7 +1206,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
         subagent_prompt: String(entry?.prompt || current?.subagent_prompt || '').trim(),
         subagent_summary: String(entry?.summary || current?.subagent_summary || '').trim(),
         subagent_raw: entry?.raw || current?.subagent_raw || {}
-      };
+      }, mergedSourceIdentity);
       if (preferredNickname) {
         for (const id of mergedIDs) {
           subagentIdentityByID.set(id, preferredNickname);
@@ -1102,7 +1238,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
       }
       return current || 'Subagent Activity';
     })();
-    const next = {
+    const next = applySourceIdentityFields({
       id: `subagent-${String(entry?.sourceID || key)}`,
       role: 'subagent',
       actor,
@@ -1124,7 +1260,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
       subagent_prompt: String(entry?.prompt || '').trim(),
       subagent_summary: String(entry?.summary || '').trim(),
       subagent_raw: entry?.raw || {}
-    };
+    }, sourceIdentity);
     out.push(next);
     if (next.subagent_nickname) {
       for (const id of idsFromEntry) {
@@ -1154,7 +1290,8 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           output: item?.exec_output || '',
           sourceID: item?.id,
           createdAt: item?.created_at,
-          source: 'persisted'
+          source: 'persisted',
+          sourceIdentity: sourceIdentityFromMessageRow(item)
         });
         continue;
       }
@@ -1176,7 +1313,8 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           actor: item?.actor,
           lane: item?.lane,
           sourceID: item?.id,
-          createdAt: item?.created_at
+          createdAt: item?.created_at,
+          sourceIdentity: sourceIdentityFromMessageRow(item)
         });
         continue;
       }
@@ -1190,7 +1328,8 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           exitCode: 0,
           sourceID: item?.id,
           createdAt: item?.created_at,
-          source: detectMetaSource(item?.id)
+          source: detectMetaSource(item?.id),
+          sourceIdentity: sourceIdentityFromMessageRow(item)
         });
         continue;
       }
@@ -1203,7 +1342,8 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           exitCode: Number(parsed.exitCode || 0) || 0,
           sourceID: item?.id,
           createdAt: item?.created_at,
-          source: detectMetaSource(item?.id)
+          source: detectMetaSource(item?.id),
+          sourceIdentity: sourceIdentityFromMessageRow(item)
         });
         continue;
       }
@@ -1212,6 +1352,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
     }
     if (role === 'event') {
       const payload = parseRawEventPayload(item?.content || '');
+      const eventSourceIdentity = sourceIdentityFromMessageRow(item, payload);
       if (isRedundantAssistantRawEvent(payload)) {
         // Assistant text is rendered as assistant bubble; hide duplicate raw event row.
         continue;
@@ -1229,7 +1370,8 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           lane: item?.lane,
           sourceID: item?.id,
           createdAt: item?.created_at,
-          source: detectMetaSource(item?.id)
+          source: detectMetaSource(item?.id),
+          sourceIdentity: eventSourceIdentity
         });
         void recordExec;
         handled = true;
@@ -1240,14 +1382,15 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           actor: item?.actor,
           lane: item?.lane,
           sourceID: item?.id,
-          createdAt: item?.created_at
+          createdAt: item?.created_at,
+          sourceIdentity: eventSourceIdentity
         });
         void recordSubagent;
         handled = true;
       }
       if (parsedMCP?.text) {
         const ownership = resolveLegacyRuntimeOwnership(item?.actor, item?.lane);
-        out.push({
+        out.push(applySourceIdentityFields({
           id: `mcp-${String(item?.id || Date.now())}`,
           role: 'activity',
           actor: ownership.actor,
@@ -1260,7 +1403,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           created_at: String(item?.created_at || new Date().toISOString()),
           updated_at: String(item?.created_at || new Date().toISOString()),
           pending: false
-        });
+        }, eventSourceIdentity));
         handled = true;
       }
       if (!handled && rawText) {
@@ -1280,7 +1423,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
       }
       if (fileOpText) {
         const ownership = resolveLegacyRuntimeOwnership(item?.actor, item?.lane);
-        out.push({
+        out.push(applySourceIdentityFields({
           id: `fileop-${String(item?.id || Date.now())}`,
           role: 'activity',
           actor: ownership.actor,
@@ -1290,7 +1433,7 @@ function buildExecAwareMessages(inputMessages, includeRawEvents) {
           created_at: String(item?.created_at || new Date().toISOString()),
           updated_at: String(item?.created_at || new Date().toISOString()),
           pending: false
-        });
+        }, eventSourceIdentity));
         if (!includeRawEvents) {
           continue;
         }

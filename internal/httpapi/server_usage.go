@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"time"
 
@@ -19,6 +20,12 @@ type cliSwitchStatus struct {
 	Strategy   string `json:"strategy"`
 	Error      string `json:"error"`
 	Candidates int    `json:"candidates"`
+}
+
+type autoSwitchCandidate struct {
+	account store.Account
+	usage   store.UsageSnapshot
+	score   int
 }
 
 func (s *Server) autoSwitchAPIIfNeeded(ctx context.Context, threshold int) error {
@@ -45,7 +52,7 @@ func (s *Server) autoSwitchAPIIfNeeded(ctx context.Context, threshold int) error
 		return nil
 	}
 
-	target, targetScore, ok, err := s.findBestAutoSwitchAccountFromDB(ctx, active.ID)
+	candidates, err := s.findAutoSwitchCandidatesFromDB(ctx, active.ID)
 	if err != nil {
 		s.svc.AddSystemLog(ctx, "api_autoswitch", "API autoswitch check failed", map[string]any{
 			"from":      strings.TrimSpace(active.ID),
@@ -55,7 +62,7 @@ func (s *Server) autoSwitchAPIIfNeeded(ctx context.Context, threshold int) error
 		})
 		return err
 	}
-	if !ok {
+	if len(candidates) == 0 {
 		s.svc.AddSystemLog(ctx, "api_autoswitch", "API autoswitch skipped", map[string]any{
 			"from":      strings.TrimSpace(active.ID),
 			"reason":    "no_backup_candidate",
@@ -64,26 +71,7 @@ func (s *Server) autoSwitchAPIIfNeeded(ctx context.Context, threshold int) error
 		})
 		return nil
 	}
-	if _, err := s.svc.UseAccountAPI(service.WithAPISwitchReason(ctx, "autoswitch"), target.ID); err != nil {
-		s.svc.AddSystemLog(ctx, "api_autoswitch", "API autoswitch failed", map[string]any{
-			"from":         strings.TrimSpace(active.ID),
-			"to":           strings.TrimSpace(target.ID),
-			"score":        score,
-			"target_score": targetScore,
-			"threshold":    threshold,
-			"error":        err.Error(),
-		})
-		return err
-	}
-	s.svc.AddSystemLog(ctx, "api_autoswitch", "API autoswitch switched", map[string]any{
-		"from":         strings.TrimSpace(active.ID),
-		"to":           strings.TrimSpace(target.ID),
-		"score":        score,
-		"target_score": targetScore,
-		"threshold":    threshold,
-	})
-	log.Printf("[autoswitch] api active switched from %s to %s (remaining %d%% -> %d%%, threshold=%d%%)", active.ID, target.ID, score, targetScore, threshold)
-	return nil
+	return s.switchAPIActiveToCandidate(ctx, active, candidates, score, threshold, "threshold", "autoswitch")
 }
 
 func (s *Server) autoSwitchCLIActiveIfNeeded(ctx context.Context, threshold int) error {
@@ -110,7 +98,7 @@ func (s *Server) autoSwitchCLIActiveIfNeeded(ctx context.Context, threshold int)
 		return nil
 	}
 
-	target, targetScore, ok, err := s.findBestAutoSwitchAccountFromDB(ctx, active.ID)
+	candidates, err := s.findAutoSwitchCandidatesFromDB(ctx, active.ID)
 	if err != nil {
 		s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI autoswitch check failed", map[string]any{
 			"from":      strings.TrimSpace(active.ID),
@@ -120,10 +108,10 @@ func (s *Server) autoSwitchCLIActiveIfNeeded(ctx context.Context, threshold int)
 		})
 		return err
 	}
-	if !ok {
+	if len(candidates) == 0 {
 		s.setCLISwitchStatus(cliSwitchStatus{
 			At:         time.Now().UTC().UnixMilli(),
-			From:       strings.TrimSpace(active.ID),
+			From:       accountSwitchDisplayValue(active),
 			Reason:     "skip",
 			Strategy:   "threshold",
 			Error:      "no_backup_candidate",
@@ -138,45 +126,7 @@ func (s *Server) autoSwitchCLIActiveIfNeeded(ctx context.Context, threshold int)
 		})
 		return nil
 	}
-	if _, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, "autoswitch"), target.ID); err != nil {
-		s.setCLISwitchStatus(cliSwitchStatus{
-			At:         time.Now().UTC().UnixMilli(),
-			From:       strings.TrimSpace(active.ID),
-			To:         strings.TrimSpace(target.ID),
-			Reason:     "skip",
-			Strategy:   "threshold",
-			Error:      err.Error(),
-			Candidates: 0,
-		})
-		s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI autoswitch failed", map[string]any{
-			"from":         strings.TrimSpace(active.ID),
-			"to":           strings.TrimSpace(target.ID),
-			"score":        score,
-			"target_score": targetScore,
-			"threshold":    threshold,
-			"strategy":     "threshold",
-			"error":        err.Error(),
-		})
-		return err
-	}
-	s.setCLISwitchStatus(cliSwitchStatus{
-		At:         time.Now().UTC().UnixMilli(),
-		From:       strings.TrimSpace(active.ID),
-		To:         strings.TrimSpace(target.ID),
-		Reason:     "autoswitch",
-		Strategy:   "threshold",
-		Candidates: 0,
-	})
-	s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI threshold switched", map[string]any{
-		"from":      strings.TrimSpace(active.ID),
-		"to":        strings.TrimSpace(target.ID),
-		"reason":    "autoswitch",
-		"strategy":  "threshold",
-		"score":     targetScore,
-		"threshold": threshold,
-	})
-	log.Printf("[autoswitch] cli active switched from %s to %s (remaining %d%% -> %d%%, threshold=%d%%)", active.ID, target.ID, score, targetScore, threshold)
-	return nil
+	return s.switchCLIActiveToCandidate(ctx, active, candidates, score, threshold, "threshold", "autoswitch")
 }
 
 func (s *Server) setCLISwitchStatus(status cliSwitchStatus) {
@@ -226,14 +176,24 @@ func (s *Server) findBestUsageAccountAbove(ctx context.Context, skipID string, m
 }
 
 func (s *Server) findBestAutoSwitchAccountFromDB(ctx context.Context, skipID string) (store.Account, int, bool, error) {
-	accounts, err := s.svc.ListAccounts(ctx)
-	if err != nil || len(accounts) == 0 {
+	candidates, err := s.findAutoSwitchCandidatesFromDB(ctx, skipID)
+	if err != nil {
 		return store.Account{}, 0, false, err
 	}
-	best, bestScore, ok := pickBestAutoSwitchCandidate(accounts, skipID, func(accountID string) (store.UsageSnapshot, error) {
+	if len(candidates) == 0 {
+		return store.Account{}, 0, false, nil
+	}
+	return candidates[0].account, candidates[0].score, true, nil
+}
+
+func (s *Server) findAutoSwitchCandidatesFromDB(ctx context.Context, skipID string) ([]autoSwitchCandidate, error) {
+	accounts, err := s.svc.ListAccounts(ctx)
+	if err != nil || len(accounts) == 0 {
+		return nil, err
+	}
+	return rankAutoSwitchCandidates(accounts, skipID, func(accountID string) (store.UsageSnapshot, error) {
 		return s.loadUsageForDecision(ctx, accountID)
-	})
-	return best, bestScore, ok, nil
+	}), nil
 }
 
 func pickBestUsageCandidateAbove(accounts []store.Account, skipID string, minScore int, loadUsage func(accountID string) (store.UsageSnapshot, error)) (store.Account, int, bool) {
@@ -275,9 +235,15 @@ func autoSwitchBackupScore(u store.UsageSnapshot) int {
 }
 
 func pickBestAutoSwitchCandidate(accounts []store.Account, skipID string, loadUsage func(accountID string) (store.UsageSnapshot, error)) (store.Account, int, bool) {
-	best := store.Account{}
-	bestUsage := store.UsageSnapshot{}
-	bestScore := -1
+	candidates := rankAutoSwitchCandidates(accounts, skipID, loadUsage)
+	if len(candidates) == 0 {
+		return store.Account{}, 0, false
+	}
+	return candidates[0].account, candidates[0].score, true
+}
+
+func rankAutoSwitchCandidates(accounts []store.Account, skipID string, loadUsage func(accountID string) (store.UsageSnapshot, error)) []autoSwitchCandidate {
+	candidates := make([]autoSwitchCandidate, 0, len(accounts))
 	for _, account := range accounts {
 		if strings.TrimSpace(account.ID) == "" || account.ID == skipID || account.Revoked {
 			continue
@@ -286,26 +252,129 @@ func pickBestAutoSwitchCandidate(accounts []store.Account, skipID string, loadUs
 		if err != nil || !autoSwitchBackupEligible(usage) {
 			continue
 		}
-		score := autoSwitchBackupScore(usage)
-		if score < bestScore {
+		candidates = append(candidates, autoSwitchCandidate{
+			account: account,
+			usage:   usage,
+			score:   autoSwitchBackupScore(usage),
+		})
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		if candidates[i].usage.WeeklyPct != candidates[j].usage.WeeklyPct {
+			return candidates[i].usage.WeeklyPct > candidates[j].usage.WeeklyPct
+		}
+		if candidates[i].usage.HourlyPct != candidates[j].usage.HourlyPct {
+			return candidates[i].usage.HourlyPct > candidates[j].usage.HourlyPct
+		}
+		return strings.TrimSpace(candidates[i].account.ID) < strings.TrimSpace(candidates[j].account.ID)
+	})
+	return candidates
+}
+
+func accountSwitchDisplayValue(account store.Account) string {
+	if email := strings.TrimSpace(account.Email); email != "" {
+		return email
+	}
+	if alias := strings.TrimSpace(account.Alias); alias != "" {
+		return alias
+	}
+	return strings.TrimSpace(account.ID)
+}
+
+func (s *Server) switchAPIActiveToCandidate(ctx context.Context, active store.Account, candidates []autoSwitchCandidate, score, threshold int, strategy, reason string) error {
+	var lastErr error
+	for idx, candidate := range candidates {
+		switched, err := s.svc.UseAccountAPI(service.WithAPISwitchReason(ctx, reason), candidate.account.ID)
+		if err != nil {
+			lastErr = err
 			continue
 		}
-		if score == bestScore {
-			if usage.WeeklyPct < bestUsage.WeeklyPct {
-				continue
-			}
-			if usage.WeeklyPct == bestUsage.WeeklyPct && usage.HourlyPct < bestUsage.HourlyPct {
-				continue
-			}
+		s.svc.AddSystemLog(ctx, "api_autoswitch", "API autoswitch switched", map[string]any{
+			"from":         strings.TrimSpace(active.ID),
+			"from_email":   strings.TrimSpace(active.Email),
+			"to":           strings.TrimSpace(switched.ID),
+			"to_email":     strings.TrimSpace(switched.Email),
+			"reason":       reason,
+			"strategy":     strategy,
+			"score":        score,
+			"target_score": candidate.score,
+			"threshold":    threshold,
+			"attempt":      idx + 1,
+			"candidates":   len(candidates),
+		})
+		log.Printf("[autoswitch] api active switched from %s to %s (remaining %d%% -> %d%%, threshold=%d%%)", accountSwitchDisplayValue(active), accountSwitchDisplayValue(switched), score, candidate.score, threshold)
+		return nil
+	}
+	if lastErr != nil {
+		s.svc.AddSystemLog(ctx, "api_autoswitch", "API autoswitch failed", map[string]any{
+			"from":       strings.TrimSpace(active.ID),
+			"from_email": strings.TrimSpace(active.Email),
+			"reason":     reason,
+			"strategy":   strategy,
+			"score":      score,
+			"threshold":  threshold,
+			"candidates": len(candidates),
+			"error":      lastErr.Error(),
+		})
+	}
+	return lastErr
+}
+
+func (s *Server) switchCLIActiveToCandidate(ctx context.Context, active store.Account, candidates []autoSwitchCandidate, score, threshold int, strategy, reason string) error {
+	var lastErr error
+	for idx, candidate := range candidates {
+		switched, err := s.svc.UseAccountCLI(service.WithCLISwitchReason(ctx, reason), candidate.account.ID)
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		best = account
-		bestUsage = usage
-		bestScore = score
+		s.setCLISwitchStatus(cliSwitchStatus{
+			At:         time.Now().UTC().UnixMilli(),
+			From:       accountSwitchDisplayValue(active),
+			To:         accountSwitchDisplayValue(switched),
+			Reason:     reason,
+			Strategy:   strategy,
+			Candidates: len(candidates),
+		})
+		s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI autoswitch switched", map[string]any{
+			"from":         strings.TrimSpace(active.ID),
+			"from_email":   strings.TrimSpace(active.Email),
+			"to":           strings.TrimSpace(switched.ID),
+			"to_email":     strings.TrimSpace(switched.Email),
+			"reason":       reason,
+			"strategy":     strategy,
+			"score":        score,
+			"target_score": candidate.score,
+			"threshold":    threshold,
+			"attempt":      idx + 1,
+			"candidates":   len(candidates),
+		})
+		log.Printf("[autoswitch] cli active switched from %s to %s (remaining %d%% -> %d%%, threshold=%d%%)", accountSwitchDisplayValue(active), accountSwitchDisplayValue(switched), score, candidate.score, threshold)
+		return nil
 	}
-	if bestScore < 0 {
-		return store.Account{}, 0, false
+	if lastErr != nil {
+		s.setCLISwitchStatus(cliSwitchStatus{
+			At:         time.Now().UTC().UnixMilli(),
+			From:       accountSwitchDisplayValue(active),
+			Reason:     "skip",
+			Strategy:   strategy,
+			Error:      lastErr.Error(),
+			Candidates: len(candidates),
+		})
+		s.svc.AddSystemLog(ctx, "cli_autoswitch", "CLI autoswitch failed", map[string]any{
+			"from":       strings.TrimSpace(active.ID),
+			"from_email": strings.TrimSpace(active.Email),
+			"reason":     reason,
+			"strategy":   strategy,
+			"score":      score,
+			"threshold":  threshold,
+			"candidates": len(candidates),
+			"error":      lastErr.Error(),
+		})
 	}
-	return best, bestScore, true
+	return lastErr
 }
 
 func maxInt(a, b int) int {

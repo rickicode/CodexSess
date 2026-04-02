@@ -30,6 +30,16 @@ var oauthHTTPClient = &http.Client{
 	Timeout: 20 * time.Second,
 }
 
+func OverrideOAuthHTTPClientForTests(client *http.Client) func() {
+	prev := oauthHTTPClient
+	if client != nil {
+		oauthHTTPClient = client
+	}
+	return func() {
+		oauthHTTPClient = prev
+	}
+}
+
 const (
 	oauthClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	authEndpoint  = "https://auth.openai.com/oauth/authorize"

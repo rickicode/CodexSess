@@ -19,8 +19,8 @@ const defaultZoModels = [
 ];
 
 const jsonHeaders = { 'Content-Type': 'application/json' };
-const uiPrefsKey = 'codexsess.ui.preferences.v1';
-const zoModelsCacheKey = 'codexsess.zo.models.v1';
+const uiPrefsKey = 'codexsess.ui.preferences';
+const zoModelsCacheKey = 'codexsess.zo.models';
 
 function statusClass(kind) {
   if (kind === 'error') return 'error';

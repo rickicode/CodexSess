@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-func (s *Server) handleZoV1Root(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleZoRoot(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.handleZoModels(w, r)

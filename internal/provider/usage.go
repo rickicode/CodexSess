@@ -14,6 +14,14 @@ var usageHTTPClient = &http.Client{
 	Timeout: 15 * time.Second,
 }
 
+func TestingSwapUsageHTTPClient(client *http.Client) *http.Client {
+	prev := usageHTTPClient
+	if client != nil {
+		usageHTTPClient = client
+	}
+	return prev
+}
+
 type UsageResult struct {
 	HourlyPct       int
 	WeeklyPct       int

@@ -1,9 +1,13 @@
 package provider
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -290,6 +294,136 @@ exit 1
 	}
 }
 
+func TestCodexAppServerStreamChatWithOptions_EmitsRawEventIdentityMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+	script := writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/start"'; then
+      echo '{"id":"2","result":{"thread":{"id":"thread_raw"}}}'
+      echo '{"method":"thread/started","params":{"thread":{"id":"thread_raw"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      echo '{"id":"3","result":{"turn":{"id":"turn_raw","status":"inProgress"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"thread_raw","turn":{"id":"turn_raw"}}}'
+      echo '{"method":"item/agentMessage/delta","params":{"threadId":"thread_raw","turnId":"turn_raw","itemId":"item_raw","sequence":9,"createdAt":"2026-04-02T12:00:00Z","item":{"id":"item_raw","type":"agent_message"},"delta":"hello"}}'
+      echo '{"method":"item/completed","params":{"threadId":"thread_raw","turnId":"turn_raw","item":{"type":"agentMessage","id":"item_raw","text":"hello"}}}'
+      echo '{"method":"turn/completed","params":{"threadId":"thread_raw","turn":{"id":"turn_raw","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`)
+	var events []ChatEvent
+	_, err := NewCodexAppServer(script).StreamChatWithOptions(context.Background(), ExecOptions{
+		CodexHome: t.TempDir(),
+		WorkDir:   t.TempDir(),
+		Model:     "gpt-5.2-codex",
+		Prompt:    "say hello",
+	}, func(evt ChatEvent) error {
+		events = append(events, evt)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamChatWithOptions: %v", err)
+	}
+	for _, evt := range events {
+		if strings.TrimSpace(evt.Type) != "raw_event" {
+			continue
+		}
+		if !strings.Contains(evt.Text, `"method":"item/agentMessage/delta"`) {
+			continue
+		}
+		if evt.SourceEventType != "item/agentMessage/delta" ||
+			evt.SourceThreadID != "thread_raw" ||
+			evt.SourceTurnID != "turn_raw" ||
+			evt.SourceItemID != "item_raw" ||
+			evt.SourceItemType != "agent_message" ||
+			evt.EventSeq != 9 ||
+			evt.CreatedAt != "2026-04-02T12:00:00Z" {
+			t.Fatalf("expected raw_event identity metadata, got %#v", evt)
+		}
+		return
+	}
+	t.Fatalf("expected raw_event delta in %#v", events)
+}
+
+func TestCodexAppServerStreamChatWithOptions_EmitsStderrIdentityMetadata(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+	script := writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/start"'; then
+      echo '{"id":"2","result":{"thread":{"id":"thread_stderr_meta"}}}'
+      echo '{"method":"thread/started","params":{"thread":{"id":"thread_stderr_meta"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      printf '%s\n' 'stderr metadata line' >&2
+      echo '{"id":"3","result":{"turn":{"id":"turn_stderr_meta","status":"inProgress"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"thread_stderr_meta","turn":{"id":"turn_stderr_meta"}}}'
+      echo '{"method":"item/completed","params":{"threadId":"thread_stderr_meta","turnId":"turn_stderr_meta","item":{"type":"agentMessage","id":"item_agent","text":"hello"}}}'
+      echo '{"method":"turn/completed","params":{"threadId":"thread_stderr_meta","turn":{"id":"turn_stderr_meta","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`)
+	var events []ChatEvent
+	_, err := NewCodexAppServer(script).StreamChatWithOptions(context.Background(), ExecOptions{
+		CodexHome: t.TempDir(),
+		WorkDir:   t.TempDir(),
+		Model:     "gpt-5.2-codex",
+		Prompt:    "say hello",
+	}, func(evt ChatEvent) error {
+		events = append(events, evt)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamChatWithOptions: %v", err)
+	}
+	for _, evt := range events {
+		if strings.TrimSpace(evt.Type) != "stderr" {
+			continue
+		}
+		if !strings.Contains(evt.Text, "stderr metadata line") {
+			continue
+		}
+		if evt.SourceEventType != "stderr" ||
+			evt.SourceThreadID != "" ||
+			evt.SourceTurnID != "" ||
+			evt.SourceItemID != "" ||
+			evt.SourceItemType != "" ||
+			evt.EventSeq != 0 ||
+			evt.CreatedAt != "" {
+			t.Fatalf("expected stderr metadata defaults, got %#v", evt)
+		}
+		return
+	}
+	t.Fatalf("expected stderr event in %#v", events)
+}
+
 func TestCodexEventActivityText_WaitAgentStarted(t *testing.T) {
 	evt := map[string]any{
 		"type": "item.started",
@@ -559,6 +693,98 @@ func TestMapAppServerEvent_UnknownMethodFallsBackToActivity(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected activity text to mention method, got %#v", events)
+	}
+}
+
+func TestMapAppServerEvent_PreservesAssistantItemIdentity(t *testing.T) {
+	out := ChatResult{}
+	var captured []ChatEvent
+
+	evt := rpcEnvelope{
+		Method: "item/agentMessage/delta",
+		Params: mustJSON(map[string]any{
+			"threadId":  "thread-chat-1",
+			"turnId":    "turn-chat-1",
+			"itemId":    "item-assistant-1",
+			"sequence":  17,
+			"createdAt": "2026-04-02T10:11:12Z",
+			"item": map[string]any{
+				"type": "agent_message",
+			},
+			"delta": "hello",
+		}),
+	}
+
+	err := mapAppServerEvent(evt, &out, "chat", func(event ChatEvent) error {
+		captured = append(captured, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mapAppServerEvent: %v", err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected one event, got %d", len(captured))
+	}
+	if got := captured[0]; got.SourceEventType != "item/agentMessage/delta" ||
+		got.SourceThreadID != "thread-chat-1" ||
+		got.SourceTurnID != "turn-chat-1" ||
+		got.SourceItemID != "item-assistant-1" ||
+		got.SourceItemType != "agent_message" ||
+		got.EventSeq != 17 ||
+		got.CreatedAt != "2026-04-02T10:11:12Z" {
+		t.Fatalf("expected source identity metadata to be preserved, got %#v", got)
+	}
+}
+
+func TestMapAppServerEvent_PreservesCompletedToolIdentity(t *testing.T) {
+	out := ChatResult{}
+	var captured []ChatEvent
+
+	evt := rpcEnvelope{
+		Method: "item/completed",
+		Params: mustJSON(map[string]any{
+			"eventSeq": 23,
+			"thread": map[string]any{
+				"id": "thread-chat-2",
+			},
+			"turn": map[string]any{
+				"id":        "turn-chat-2",
+				"createdAt": "2026-04-02T11:12:13Z",
+			},
+			"item": map[string]any{
+				"id":     "item-tool-2",
+				"type":   "tool_call",
+				"name":   "mcp__github__search_code",
+				"output": map[string]any{"summary": "Found 2 matches"},
+			},
+		}),
+	}
+
+	err := mapAppServerEvent(evt, &out, "chat", func(event ChatEvent) error {
+		captured = append(captured, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mapAppServerEvent: %v", err)
+	}
+	if len(captured) == 0 {
+		t.Fatalf("expected captured events")
+	}
+	found := false
+	for _, event := range captured {
+		if event.SourceEventType == "item/completed" &&
+			event.SourceThreadID == "thread-chat-2" &&
+			event.SourceTurnID == "turn-chat-2" &&
+			event.SourceItemID == "item-tool-2" &&
+			event.SourceItemType == "tool_call" &&
+			event.EventSeq == 23 &&
+			event.CreatedAt == "2026-04-02T11:12:13Z" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected source tool identity in %#v", captured)
 	}
 }
 
@@ -995,6 +1221,122 @@ exit 1
 	}
 }
 
+func TestStreamChatWithOptions_DoesNotIdleCompleteWhileThreadActivityContinues(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+	prevTimeout := appServerTurnCompletionIdleTimeout
+	appServerTurnCompletionIdleTimeout = 50 * time.Millisecond
+	defer func() {
+		appServerTurnCompletionIdleTimeout = prevTimeout
+	}()
+
+	script := writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/resume"'; then
+      echo '{"id":"2","result":{"thread":{"id":"thread_stream_busy"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      echo '{"id":"3","result":{"turn":{"id":"turn_stream_busy","status":"inProgress"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"thread_stream_busy","turn":{"id":"turn_stream_busy"}}}'
+      echo '{"method":"item/completed","params":{"threadId":"thread_stream_busy","turnId":"turn_stream_busy","item":{"type":"agentMessage","id":"item_agent","text":"keep waiting"}}}'
+      sleep 0.04
+      echo '{"method":"item/started","params":{"threadId":"thread_stream_busy","turnId":"turn_stream_busy","item":{"type":"commandExecution","id":"cmd_1"}}}'
+      sleep 0.04
+      echo '{"method":"turn/completed","params":{"threadId":"thread_stream_busy","turn":{"id":"turn_stream_busy","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`)
+
+	startedAt := time.Now()
+	reply, err := NewCodexAppServer(script).StreamChatWithOptions(context.Background(), ExecOptions{
+		CodexHome: t.TempDir(),
+		WorkDir:   t.TempDir(),
+		Model:     "gpt-5.2-codex",
+		Prompt:    "say hello",
+		ResumeID:  "thread_stream_busy",
+	}, nil)
+	if err != nil {
+		t.Fatalf("StreamChatWithOptions: %v", err)
+	}
+	if got := strings.TrimSpace(reply.ThreadID); got != "thread_stream_busy" {
+		t.Fatalf("expected thread_stream_busy, got %q", got)
+	}
+	if got := strings.TrimSpace(reply.Text); got != "keep waiting" {
+		t.Fatalf("expected assistant text keep waiting, got %q", got)
+	}
+	if elapsed := time.Since(startedAt); elapsed < 70*time.Millisecond {
+		t.Fatalf("expected turn to stay open while thread activity continues, completed too early after %s", elapsed)
+	}
+}
+
+func TestAppServerClient_CallRemovesPendingOnContextCancellation(t *testing.T) {
+	client := &appServerClient{
+		stdin:   bufio.NewWriter(io.Discard),
+		pending: map[string]chan rpcResponse{},
+		subs:    map[int64]func(rpcEnvelope) error{},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := client.call(ctx, "initialize", map[string]any{}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got %v", err)
+	}
+	if len(client.pending) != 0 {
+		t.Fatalf("expected pending calls to be cleaned up after context cancellation, got %d", len(client.pending))
+	}
+}
+
+func TestAppServerClient_ReadLoopLogsMalformedStdoutLine(t *testing.T) {
+	client := &appServerClient{
+		pending: map[string]chan rpcResponse{},
+		subs:    map[int64]func(rpcEnvelope) error{},
+	}
+	var logBuf bytes.Buffer
+	prevLogWriter := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLogWriter)
+
+	client.readLoop(io.NopCloser(strings.NewReader("not-json\n")))
+
+	if !strings.Contains(strings.ToLower(logBuf.String()), "malformed app-server stdout") {
+		t.Fatalf("expected malformed stdout line to be logged, got %q", logBuf.String())
+	}
+}
+
+func TestAppServerClient_ReadLoopPreservesStructuredErrorData(t *testing.T) {
+	respCh := make(chan rpcResponse, 1)
+	client := &appServerClient{
+		pending: map[string]chan rpcResponse{
+			"1": respCh,
+		},
+		subs: map[int64]func(rpcEnvelope) error{},
+	}
+
+	client.readLoop(io.NopCloser(strings.NewReader(`{"id":"1","error":{"message":"request failed","data":{"code":"model_capacity"}}}` + "\n")))
+
+	resp := <-respCh
+	if resp.Err == nil {
+		t.Fatalf("expected structured rpc error")
+	}
+	if !strings.Contains(strings.ToLower(resp.Err.Error()), "model_capacity") {
+		t.Fatalf("expected structured error data to be preserved, got %q", resp.Err.Error())
+	}
+}
+
 func TestPersistentAppServerRuntimeCache_ReusesClientForSameHome(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script codex test runner is unix-only")
@@ -1054,6 +1396,70 @@ exit 1
 	}
 	if got := strings.TrimSpace(string(rawCount)); got != "1" {
 		t.Fatalf("expected persistent app-server process to start once, got %q", got)
+	}
+	persistentAppServerRuntimeCache.discard(script, codexHome, clientA)
+}
+
+func TestPersistentAppServerRuntimeCache_ClientSurvivesAcquireContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+	codexHome := t.TempDir()
+	startCountPath := filepath.Join(t.TempDir(), "start-count")
+	script := writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  count=0
+  if [ -f "`+startCountPath+`" ]; then
+    count="$(cat "`+startCountPath+`")"
+  fi
+  count=$((count + 1))
+  printf '%s' "$count" > "`+startCountPath+`"
+  while IFS= read -r line; do
+    rpc_id="$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"id":"'"${rpc_id:-1}"'","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/start"'; then
+      echo '{"id":"'"${rpc_id:-2}"'","result":{"thread":{"id":"thread_reuse_after_cancel"}}}'
+      echo '{"method":"thread/started","params":{"thread":{"id":"thread_reuse_after_cancel"}}}'
+      continue
+    fi
+  done
+fi
+exit 1
+`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	clientA, createdA, err := persistentAppServerRuntimeCache.acquire(ctx, script, codexHome, t.TempDir())
+	if err != nil {
+		t.Fatalf("acquire client A: %v", err)
+	}
+	if !createdA {
+		t.Fatalf("expected first acquire to create client")
+	}
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	clientB, createdB, err := persistentAppServerRuntimeCache.acquire(context.Background(), script, codexHome, t.TempDir())
+	if err != nil {
+		t.Fatalf("acquire client B: %v", err)
+	}
+	if createdB {
+		t.Fatalf("expected canceled caller context not to kill cached client")
+	}
+	if clientA != clientB {
+		t.Fatalf("expected same client after caller context cancellation")
+	}
+	rawCount, err := os.ReadFile(startCountPath)
+	if err != nil {
+		t.Fatalf("read start count: %v", err)
+	}
+	if got := strings.TrimSpace(string(rawCount)); got != "1" {
+		t.Fatalf("expected persistent app-server process to stay alive after caller cancellation, got start count %q", got)
 	}
 	persistentAppServerRuntimeCache.discard(script, codexHome, clientA)
 }

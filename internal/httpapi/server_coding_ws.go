@@ -369,6 +369,27 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 							"text":        clientText,
 							"actor":       streamActor,
 						}
+						if sourceEventType := strings.TrimSpace(evt.SourceEventType); sourceEventType != "" {
+							streamPayload["source_event_type"] = sourceEventType
+						}
+						if sourceThreadID := strings.TrimSpace(evt.SourceThreadID); sourceThreadID != "" {
+							streamPayload["source_thread_id"] = sourceThreadID
+						}
+						if sourceTurnID := strings.TrimSpace(evt.SourceTurnID); sourceTurnID != "" {
+							streamPayload["source_turn_id"] = sourceTurnID
+						}
+						if sourceItemID := strings.TrimSpace(evt.SourceItemID); sourceItemID != "" {
+							streamPayload["source_item_id"] = sourceItemID
+						}
+						if sourceItemType := strings.TrimSpace(evt.SourceItemType); sourceItemType != "" {
+							streamPayload["source_item_type"] = sourceItemType
+						}
+						if evt.EventSeq > 0 {
+							streamPayload["event_seq"] = evt.EventSeq
+						}
+						if createdAt := strings.TrimSpace(evt.CreatedAt); createdAt != "" {
+							streamPayload["created_at"] = createdAt
+						}
 						streamLane := streamActor
 						if streamLane == "" {
 							streamLane = activeLane
@@ -596,23 +617,11 @@ func (s *Server) handleWebCodingSkills(w http.ResponseWriter, r *http.Request) {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
 		return
 	}
-	home, _ := os.UserHomeDir()
-	searchRoots := []string{
-		filepath.Join(home, ".codex", "skills"),
-		filepath.Join(home, ".agents", "skills"),
-		filepath.Join(".", ".codex", "skills"),
+	out, err := s.svc.CodingTemplateSkillNames()
+	if err != nil {
+		respondSanitizedCodingError(w, 503, "runtime_unavailable", "runtime_unavailable", err, true)
+		return
 	}
-	searchRoots = append(searchRoots, additionalSkillRootsFromEnv()...)
-	seen := map[string]struct{}{}
-	out := make([]string, 0, 64)
-	for _, root := range searchRoots {
-		root = strings.TrimSpace(root)
-		if root == "" {
-			continue
-		}
-		collectSkillNames(root, seen, &out)
-	}
-	sort.Strings(out)
 	respondJSON(w, 200, map[string]any{
 		"ok":     true,
 		"skills": out,

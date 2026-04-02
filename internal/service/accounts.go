@@ -70,7 +70,7 @@ type RestoreAccountsResult struct {
 	Skipped  int `json:"skipped"`
 }
 
-const accountsBackupVersion = "codexsess.accounts.backup.v1"
+const accountsBackupVersion = "codexsess.accounts.backup"
 const cliActiveCacheTTL = 1 * time.Second
 
 type cliSwitchReasonKey struct{}

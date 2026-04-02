@@ -13,3 +13,5 @@ internal/webui/assets/index.html
 internal/webui/assets/assets/
 assets/assets/*
 .omx/
+.playwright-mcp/
+docs/

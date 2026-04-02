@@ -42,6 +42,336 @@ func TestCodingCompactBuilder_AssistantDeltaFinalStaysSingleRow(t *testing.T) {
 	}
 }
 
+func TestCodingCompactBuilder_AssistantIdentitySeparatesItems(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 4, 2, 1, 2, 3, 0, time.UTC)
+
+	if !b.Apply(provider.ChatEvent{
+		Type:            "delta",
+		Text:            "First ",
+		SourceEventType: "item/agentMessage/delta",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-assistant-1",
+		SourceItemType:  "agentmessage",
+	}, now) {
+		t.Fatalf("expected first delta")
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:            "delta",
+		Text:            "Second ",
+		SourceEventType: "item/agentMessage/delta",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-assistant-2",
+		SourceItemType:  "agentmessage",
+	}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected second delta")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 assistant rows, got %d", len(snapshot))
+	}
+	if got := stringFromAny(snapshot[0]["role"]); got != "assistant" {
+		t.Fatalf("expected first row assistant, got %q", got)
+	}
+	if got := stringFromAny(snapshot[0]["content"]); got != "First" {
+		t.Fatalf("expected first assistant row content, got %q", got)
+	}
+	if got := stringFromAny(snapshot[0]["source_item_id"]); got != "item-assistant-1" {
+		t.Fatalf("expected first assistant source_item_id, got %q", got)
+	}
+	if got := stringFromAny(snapshot[1]["role"]); got != "assistant" {
+		t.Fatalf("expected second row assistant, got %q", got)
+	}
+	if got := stringFromAny(snapshot[1]["content"]); got != "Second" {
+		t.Fatalf("expected second assistant row content, got %q", got)
+	}
+	if got := stringFromAny(snapshot[1]["source_item_id"]); got != "item-assistant-2" {
+		t.Fatalf("expected second assistant source_item_id, got %q", got)
+	}
+}
+
+func TestCodingCompactBuilder_SnapshotKeepsSourceIdentity(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 4, 2, 1, 2, 3, 0, time.UTC)
+
+	if !b.Apply(provider.ChatEvent{
+		Type:            "delta",
+		Text:            "Assistant bubble",
+		Actor:           "chat",
+		SourceEventType: "item/agentMessage/delta",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-assistant-1",
+		SourceItemType:  "agentmessage",
+		EventSeq:        11,
+	}, now) {
+		t.Fatalf("expected assistant delta")
+	}
+
+	rawExec, err := json.Marshal(map[string]any{
+		"type": "item.started",
+		"item": map[string]any{
+			"type":    "command_execution",
+			"command": "pwd",
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal exec event: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:            "raw_event",
+		Text:            string(rawExec),
+		Actor:           "executor",
+		SourceEventType: "item/started",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-exec-1",
+		SourceItemType:  "command_execution",
+		EventSeq:        12,
+	}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected exec event")
+	}
+
+	rawSubagent, err := json.Marshal(map[string]any{
+		"type": "item.started",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "spawn_agent",
+			"arguments": `{"message":"Investigate ordering"}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal subagent event: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:            "raw_event",
+		Text:            string(rawSubagent),
+		Actor:           "executor",
+		SourceEventType: "item/started",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-2",
+		SourceItemID:    "item-subagent-1",
+		SourceItemType:  "tool_call",
+		EventSeq:        13,
+	}, now.Add(20*time.Millisecond)) {
+		t.Fatalf("expected subagent event")
+	}
+
+	rawMCP, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type": "tool_call",
+			"name": "mcp__github__search_code",
+			"output": map[string]any{
+				"summary": "Found 2 matches",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal mcp event: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:            "raw_event",
+		Text:            string(rawMCP),
+		Actor:           "chat",
+		SourceEventType: "item/completed",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-3",
+		SourceItemID:    "item-mcp-1",
+		SourceItemType:  "tool_call",
+		EventSeq:        14,
+	}, now.Add(30*time.Millisecond)) {
+		t.Fatalf("expected mcp event")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 4 {
+		t.Fatalf("expected 4 compact rows, got %d", len(snapshot))
+	}
+
+	assertSourceIdentity := func(row map[string]any, role, turnID, itemID, itemType, eventType string, eventSeq int64) {
+		t.Helper()
+		if got := stringFromAny(row["role"]); got != role {
+			t.Fatalf("expected role %q, got %q", role, got)
+		}
+		if got := stringFromAny(row["source_event_type"]); got != eventType {
+			t.Fatalf("expected source_event_type %q, got %q", eventType, got)
+		}
+		if got := stringFromAny(row["source_thread_id"]); got != "thread-chat-1" {
+			t.Fatalf("expected source_thread_id thread-chat-1, got %q", got)
+		}
+		if got := stringFromAny(row["source_turn_id"]); got != turnID {
+			t.Fatalf("expected source_turn_id %q, got %q", turnID, got)
+		}
+		if got := stringFromAny(row["source_item_id"]); got != itemID {
+			t.Fatalf("expected source_item_id %q, got %q", itemID, got)
+		}
+		if got := stringFromAny(row["source_item_type"]); got != itemType {
+			t.Fatalf("expected source_item_type %q, got %q", itemType, got)
+		}
+		if got := int64(intFromAny(row["event_seq"])); got != eventSeq {
+			t.Fatalf("expected event_seq %d, got %d", eventSeq, got)
+		}
+	}
+
+	assertSourceIdentity(snapshot[0], "assistant", "turn-chat-1", "item-assistant-1", "agentmessage", "item/agentMessage/delta", 11)
+	assertSourceIdentity(snapshot[1], "exec", "turn-chat-1", "item-exec-1", "command_execution", "item/started", 12)
+	assertSourceIdentity(snapshot[2], "subagent", "turn-chat-2", "item-subagent-1", "tool_call", "item/started", 13)
+	assertSourceIdentity(snapshot[3], "activity", "turn-chat-3", "item-mcp-1", "tool_call", "item/completed", 14)
+}
+
+func TestCodingCompactBuilder_InternalRunnerIdentitySeparatesItems(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 4, 2, 2, 3, 4, 0, time.UTC)
+
+	if !b.Apply(provider.ChatEvent{
+		Type:            "delta",
+		Text:            "First runner delta",
+		Actor:           "internal_runner",
+		SourceEventType: "item/agentMessage/delta",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-runner-1",
+		SourceItemType:  "agentmessage",
+	}, now) {
+		t.Fatalf("expected first internal runner delta")
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:            "delta",
+		Text:            "Second runner delta",
+		Actor:           "internal_runner",
+		SourceEventType: "item/agentMessage/delta",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-runner-2",
+		SourceItemType:  "agentmessage",
+	}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected second internal runner delta")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 internal runner rows, got %d", len(snapshot))
+	}
+	for idx, wantItemID := range []string{"item-runner-1", "item-runner-2"} {
+		row := snapshot[idx]
+		if got := stringFromAny(row["role"]); got != "activity" {
+			t.Fatalf("expected activity role at index %d, got %q", idx, got)
+		}
+		if !boolFromAny(row["internal_runner"]) {
+			t.Fatalf("expected internal_runner row at index %d", idx)
+		}
+		if got := stringFromAny(row["source_item_id"]); got != wantItemID {
+			t.Fatalf("expected source_item_id %q at index %d, got %q", wantItemID, idx, got)
+		}
+	}
+}
+
+func TestCodingCompactBuilder_InternalRunnerLegacyFallbackSkipsSourceTaggedRows(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 4, 2, 2, 4, 5, 0, time.UTC)
+
+	if !b.Apply(provider.ChatEvent{
+		Type:            "delta",
+		Text:            "Tagged runner",
+		Actor:           "internal_runner",
+		SourceEventType: "item/agentMessage/delta",
+		SourceThreadID:  "thread-chat-1",
+		SourceTurnID:    "turn-chat-1",
+		SourceItemID:    "item-runner-1",
+		SourceItemType:  "agentmessage",
+	}, now) {
+		t.Fatalf("expected tagged internal runner delta")
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:  "delta",
+		Text:  "Legacy",
+		Actor: "internal_runner",
+	}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected first legacy delta")
+	}
+	if !b.Apply(provider.ChatEvent{
+		Type:  "delta",
+		Text:  " fallback",
+		Actor: "internal_runner",
+	}, now.Add(20*time.Millisecond)) {
+		t.Fatalf("expected second legacy delta")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected tagged row plus legacy fallback row, got %d", len(snapshot))
+	}
+	if got := stringFromAny(snapshot[0]["content"]); got != "Tagged runner" {
+		t.Fatalf("expected source-tagged row to stay intact, got %q", got)
+	}
+	if got := stringFromAny(snapshot[0]["source_item_id"]); got != "item-runner-1" {
+		t.Fatalf("expected source-tagged row to keep source_item_id, got %q", got)
+	}
+	if got := stringFromAny(snapshot[1]["content"]); got != "Legacy fallback" {
+		t.Fatalf("expected legacy deltas to merge on their own fallback row, got %q", got)
+	}
+	if got := stringFromAny(snapshot[1]["source_item_id"]); got != "" {
+		t.Fatalf("expected legacy fallback row to remain without source identity, got %q", got)
+	}
+}
+
+func TestCodingCompactBuilder_InternalRunnerLegacyDeltaFinalStaysSingleRow(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 4, 2, 2, 5, 6, 0, time.UTC)
+
+	if !b.Apply(provider.ChatEvent{Type: "delta", Text: "Legacy runner partial", Actor: "internal_runner"}, now) {
+		t.Fatalf("expected legacy internal runner delta")
+	}
+	if !b.Apply(provider.ChatEvent{Type: "assistant_message", Text: "Legacy runner final", Actor: "internal_runner"}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected legacy internal runner final message")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 1 {
+		t.Fatalf("expected 1 legacy internal runner row, got %d", len(snapshot))
+	}
+	if got := stringFromAny(snapshot[0]["content"]); got != "Legacy runner final" {
+		t.Fatalf("expected legacy internal runner row to finalize in place, got %q", got)
+	}
+	if got := stringFromAny(snapshot[0]["source_item_id"]); got != "" {
+		t.Fatalf("expected legacy final row to stay without source identity, got %q", got)
+	}
+}
+
+func TestCodingCompactBuilder_AssistantIdentitySeparatesThreads(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 4, 2, 2, 6, 7, 0, time.UTC)
+
+	for idx, threadID := range []string{"thread-chat-1", "thread-chat-2"} {
+		if !b.Apply(provider.ChatEvent{
+			Type:            "delta",
+			Text:            "Thread-specific",
+			SourceEventType: "item/agentMessage/delta",
+			SourceThreadID:  threadID,
+			SourceTurnID:    "turn-chat-1",
+			SourceItemID:    "item-assistant-1",
+			SourceItemType:  "agentmessage",
+		}, now.Add(time.Duration(idx)*10*time.Millisecond)) {
+			t.Fatalf("expected assistant delta for thread %s", threadID)
+		}
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 assistant rows across distinct source threads, got %d", len(snapshot))
+	}
+	if got := stringFromAny(snapshot[0]["source_thread_id"]); got != "thread-chat-1" {
+		t.Fatalf("expected first source_thread_id thread-chat-1, got %q", got)
+	}
+	if got := stringFromAny(snapshot[1]["source_thread_id"]); got != "thread-chat-2" {
+		t.Fatalf("expected second source_thread_id thread-chat-2, got %q", got)
+	}
+}
+
 func TestCodingCompactBuilder_ExecCompletesInPlace(t *testing.T) {
 	b := newCodingCompactBuilder()
 	now := time.Date(2026, 3, 24, 1, 2, 3, 0, time.UTC)

@@ -1,9 +1,16 @@
 package provider
 
 type ChatEvent struct {
-	Type  string
-	Text  string
-	Actor string
+	Type            string
+	Text            string
+	Actor           string
+	SourceEventType string
+	SourceThreadID  string
+	SourceTurnID    string
+	SourceItemID    string
+	SourceItemType  string
+	EventSeq        int64
+	CreatedAt       string
 }
 
 type ChatResult struct {

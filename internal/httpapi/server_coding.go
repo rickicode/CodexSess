@@ -136,8 +136,6 @@ func (s *Server) loadCompactCodingMessagesPage(ctx context.Context, sessionID, v
 			if rows, hasMore, err := s.svc.Store.ListCodingViewMessagesPage(ctx, sessionID, viewMode, limit, beforeID); err == nil && len(rows) > 0 {
 				return rows, hasMore, "canonical", nil
 			}
-			page, hasMore := paginateCodingSnapshot(snapshot, limit, beforeID)
-			return page, hasMore, "snapshot", nil
 		}
 	}
 

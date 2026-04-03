@@ -695,6 +695,57 @@ func TestHandleWebCodingMessages_RePersistsSanitizedSnapshotRows(t *testing.T) {
 	}
 }
 
+func TestHandleWebCodingMessages_SnapshotRehydrationStillReturnsCanonicalSource(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "coding-compact-snapshot-canonical-source.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	sessionID := "sess-snapshot-canonical-source"
+	if _, err := st.CreateCodingSession(ctx, store.CodingSession{
+		ID:             sessionID,
+		Title:          "Snapshot Canonical Source",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "workspace-write",
+	}); err != nil {
+		t.Fatalf("create coding session: %v", err)
+	}
+
+	snapshot := `[{"id":"assistant-snap-1","role":"assistant","content":"hello from snapshot","created_at":"2026-04-03T10:00:00Z","updated_at":"2026-04-03T10:00:00Z"}]`
+	if err := st.UpsertCodingMessageSnapshot(ctx, sessionID, "compact", snapshot); err != nil {
+		t.Fatalf("seed compact snapshot: %v", err)
+	}
+
+	s := &Server{svc: &service.Service{Store: st}}
+	req := httptest.NewRequest(http.MethodGet, "/api/coding/messages?session_id="+sessionID+"&view=compact&limit=50", nil)
+	rec := httptest.NewRecorder()
+
+	s.handleWebCodingMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := stringFromAny(body["source"]); got != "canonical" {
+		t.Fatalf("expected source canonical after snapshot rehydration, got %q", got)
+	}
+	items, _ := body["messages"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 message after snapshot rehydration, got %d", len(items))
+	}
+	row, _ := items[0].(map[string]any)
+	if got := stringFromAny(row["content"]); got != "hello from snapshot" {
+		t.Fatalf("expected snapshot content preserved, got %q", got)
+	}
+}
+
 func TestHandleWebCodingMessageSnapshot_SanitizesBeforePersistence(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "coding-message-snapshot-sanitize.db"))

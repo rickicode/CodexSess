@@ -74,7 +74,8 @@
     parseMCPActivityText,
     parseRawEventPayload,
     parseSubagentActivityText,
-    parseSubagentEventFromPayload
+    parseSubagentEventFromPayload,
+    shouldSkipRawParsingForCompactRow
   } from './coding/liveMessagePipeline.js';
   import { findActiveLiveMessageID } from './coding/liveState.js';
   import { findAssistantStreamTargetIndex } from './coding/assistantStreamState.js';
@@ -725,6 +726,31 @@
     scrollViewportToBottom(viewport);
   }
 
+  function compactRowFromStreamEvent(evt) {
+    const payload = evt?.payload && typeof evt.payload === 'object' ? evt.payload : {};
+    const row = evt?.compact_row || payload?.compact_row || null;
+    return row && typeof row === 'object' ? row : null;
+  }
+
+  function appendCompactStreamRow(row, { actor = '', lane = '', createdAt = '', sequence = 0 } = {}) {
+    const base = row && typeof row === 'object' ? row : null;
+    if (!base) return false;
+    const next = {
+      ...base,
+      created_at: String(base?.created_at || createdAt || '').trim() || new Date().toISOString(),
+      updated_at: String(base?.updated_at || base?.created_at || createdAt || '').trim() || new Date().toISOString()
+    };
+    if (!next.actor && actor) next.actor = actor;
+    if (!next.lane && lane) next.lane = lane;
+    if (sequence > 0 && !Number(next.sequence || 0)) next.sequence = sequence;
+    messages = reconcileLiveMessagesWithPersisted(
+      messages,
+      [next],
+      liveMessageIDs(messages)
+    );
+    return true;
+  }
+
   function appendStreamEventMessage(evt) {
     if (!evt) return;
     const streamType = String(evt?.stream_type || evt?.payload?.stream_type || '').trim().toLowerCase();
@@ -747,6 +773,13 @@
     const sourceItemID = streamEventSourceField(evt, 'source_item_id');
     const sourceItemType = streamEventSourceField(evt, 'source_item_type').toLowerCase();
     const assistantKey = liveAssistantKeyFromEvent(evt);
+    const compactRow = compactRowFromStreamEvent(evt);
+    if (compactRow && shouldSkipRawParsingForCompactRow(evt)) {
+      if (appendCompactStreamRow(compactRow, { actor, lane, createdAt, sequence })) {
+        autoFollowStreamIfNeeded(shouldAutoFollow, targetViewport);
+        return;
+      }
+    }
     if (streamType === 'raw_event') {
       const rawPayloadText = String(evt?.raw_payload || evt?.payload?.raw_payload || text || '').trim();
       const payload = parseRawEventPayload(rawPayloadText);

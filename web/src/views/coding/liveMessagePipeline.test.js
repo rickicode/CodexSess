@@ -7,6 +7,7 @@ import {
   parseRawEventPayload,
   parseSubagentActivityText,
   parseSubagentEventFromPayload,
+  shouldSkipRawParsingForCompactRow,
 } from "./liveMessagePipeline.js";
 import { parseFileOperationPayload } from "../../lib/coding/activityParsing.js";
 
@@ -232,6 +233,33 @@ test("parseSubagentActivityText supports completion activity text", () => {
   assert.equal(parsed.toolName, "wait_agent");
   assert.equal(parsed.status, "done");
   assert.equal(parsed.title, "Subagent wait completed");
+});
+
+test("shouldSkipRawParsingForCompactRow skips assistant exec and subagent compact rows", () => {
+  assert.equal(
+    shouldSkipRawParsingForCompactRow({
+      payload: { compact_row: { role: "assistant" } },
+    }),
+    true,
+  );
+  assert.equal(
+    shouldSkipRawParsingForCompactRow({
+      payload: { compact_row: { role: "exec" } },
+    }),
+    true,
+  );
+  assert.equal(
+    shouldSkipRawParsingForCompactRow({
+      payload: { compact_row: { role: "subagent" } },
+    }),
+    true,
+  );
+  assert.equal(
+    shouldSkipRawParsingForCompactRow({
+      payload: { compact_row: { role: "activity" } },
+    }),
+    false,
+  );
 });
 
 test("buildExecAwareMessages keeps completed subagent wait rows visible", () => {

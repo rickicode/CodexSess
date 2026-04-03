@@ -228,3 +228,35 @@ test("contract view preserves live order after snapshot replacement", () => {
     ["item-exec-1", "item-exec-2"],
   );
 });
+
+test("CodingView prioritizes compact_row for assistant exec and subagent stream updates", () => {
+  assert.match(codingViewSource, /function compactRowFromStreamEvent\(evt\)/);
+  assert.match(codingViewSource, /function appendCompactStreamRow\(row,\s*\{\s*actor = '', lane = '', createdAt = '', sequence = 0\s*\} = \{\}\)/);
+  assert.match(
+    codingViewSource,
+    /const compactRow = compactRowFromStreamEvent\(evt\);[\s\S]*if \(compactRow && shouldSkipRawParsingForCompactRow\(evt\)\) \{[\s\S]*appendCompactStreamRow\(compactRow, \{ actor, lane, createdAt, sequence \}\)[\s\S]*return;/,
+  );
+});
+
+test("live compact row and persisted canonical row produce the same rendered message state", () => {
+  const live = [{
+    id: "assistant-1",
+    role: "assistant",
+    content: "hello",
+    created_at: "2026-04-03T10:00:00Z",
+    updated_at: "2026-04-03T10:00:00Z",
+    pending: true,
+  }];
+
+  const persisted = [{
+    id: "assistant-1",
+    role: "assistant",
+    content: "hello",
+    created_at: "2026-04-03T10:00:00Z",
+    updated_at: "2026-04-03T10:00:01Z",
+    pending: false,
+  }];
+
+  const merged = reconcileLiveMessagesWithPersisted(live, persisted, ["assistant-1"]);
+  assert.deepEqual(merged, persisted);
+});

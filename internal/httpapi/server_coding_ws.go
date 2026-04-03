@@ -50,6 +50,23 @@ func codingMessageProjectionLane(item store.CodingMessage) string {
 	}
 }
 
+func codingWSEventCreatedAt(evt provider.ChatEvent) time.Time {
+	for _, raw := range []string{
+		strings.TrimSpace(evt.CreatedAt),
+	} {
+		if raw == "" {
+			continue
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+			return parsed.UTC()
+		}
+		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+			return parsed.UTC()
+		}
+	}
+	return time.Now().UTC()
+}
+
 func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")
@@ -123,6 +140,9 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 			"payload":    data,
 		}
 		for k, v := range data {
+			if k == "compact_row" {
+				continue
+			}
 			payload[k] = v
 		}
 		return writeJSON(payload)
@@ -339,6 +359,7 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 					}
 					return activeLane
 				}
+				liveCompactBuilder := newCodingCompactBuilder()
 				result, runErr := s.svc.SendCodingMessageStream(
 					bgCtx,
 					payload.SessionID,
@@ -369,6 +390,9 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 							"text":        clientText,
 							"actor":       streamActor,
 						}
+						if compactRow, ok := buildCompactRowFromChatEvent(liveCompactBuilder, evt, codingWSEventCreatedAt(evt)); ok {
+							streamPayload["compact_row"] = compactRow
+						}
 						if sourceEventType := strings.TrimSpace(evt.SourceEventType); sourceEventType != "" {
 							streamPayload["source_event_type"] = sourceEventType
 						}
@@ -385,7 +409,7 @@ func (s *Server) handleWebCodingWS(w http.ResponseWriter, r *http.Request) {
 							streamPayload["source_item_type"] = sourceItemType
 						}
 						if evt.EventSeq > 0 {
-							streamPayload["event_seq"] = evt.EventSeq
+							streamPayload["source_event_seq"] = evt.EventSeq
 						}
 						if createdAt := strings.TrimSpace(evt.CreatedAt); createdAt != "" {
 							streamPayload["created_at"] = createdAt

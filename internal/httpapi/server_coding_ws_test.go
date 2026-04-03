@@ -1542,8 +1542,11 @@ exit 1
 		if got := stringFromAny(evt["source_item_type"]); got != "agent_message" {
 			t.Fatalf("expected source_item_type, got %q in %#v", got, evt)
 		}
-		if got := intFromAny(evt["event_seq"]); got != 17 {
-			t.Fatalf("expected provider event_seq, got %d in %#v", got, evt)
+		if got := intFromAny(evt["source_event_seq"]); got != 17 {
+			t.Fatalf("expected source_event_seq, got %d in %#v", got, evt)
+		}
+		if got := intFromAny(evt["event_seq"]); got <= 0 {
+			t.Fatalf("expected transport event_seq to stay positive, got %d in %#v", got, evt)
 		}
 		if got := stringFromAny(evt["created_at"]); got != "2026-04-02T10:11:12Z" {
 			t.Fatalf("expected provider created_at, got %q in %#v", got, evt)
@@ -1551,6 +1554,163 @@ exit 1
 		return
 	}
 	t.Fatalf("expected session.stream delta with source identity, got %#v", events)
+}
+
+func TestHandleWebCodingWS_SessionStreamIncludesCompactRow(t *testing.T) {
+	root := t.TempDir()
+	st, err := store.Open(filepath.Join(root, "coding-ws-stream-compact-row.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	cry, err := icrypto.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatalf("create crypto: %v", err)
+	}
+	cfg := config.Default()
+	cfg.DataDir = filepath.Join(root, "data")
+	cfg.AuthStoreDir = filepath.Join(root, "auth")
+	cfg.CodexHome = filepath.Join(root, "codex-home")
+
+	now := time.Now().UTC()
+	_, err = st.CreateCodingSession(context.Background(), store.CodingSession{
+		ID:             "sess_stream_compact_row",
+		Title:          "StreamCompactRow",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "workspace-write",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		LastMessageAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	tokenID, err := cry.Encrypt([]byte("id-token-stream-compact-row"))
+	if err != nil {
+		t.Fatalf("encrypt id token: %v", err)
+	}
+	tokenAccess, err := cry.Encrypt([]byte("access-token-stream-compact-row"))
+	if err != nil {
+		t.Fatalf("encrypt access token: %v", err)
+	}
+	tokenRefresh, err := cry.Encrypt([]byte("refresh-token-stream-compact-row"))
+	if err != nil {
+		t.Fatalf("encrypt refresh token: %v", err)
+	}
+	account := store.Account{
+		ID:           "acc_stream_compact_row",
+		Email:        "stream-compact-row@example.com",
+		AccountID:    "acct-stream-compact-row",
+		TokenID:      tokenID,
+		TokenAccess:  tokenAccess,
+		TokenRefresh: tokenRefresh,
+		CodexHome:    cfg.CodexHome,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+		LastUsedAt:   now,
+	}
+	if err := st.UpsertAccount(context.Background(), account); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+	if err := util.WriteAuthJSON(filepath.Join(cfg.AuthStoreDir, account.ID), "id-token-stream-compact-row", "access-token-stream-compact-row", "refresh-token-stream-compact-row", account.AccountID); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
+	svc := service.New(cfg, st, cry)
+	if _, err := svc.UseAccountCLI(context.Background(), account.ID); err != nil {
+		t.Fatalf("use account cli: %v", err)
+	}
+	svc.Codex = provider.NewCodexAppServer(writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"jsonrpc":"2.0","id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/start"'; then
+      echo '{"jsonrpc":"2.0","id":"2","result":{"thread":{"id":"thread-chat-compact-row"}}}'
+      echo '{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread-chat-compact-row"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      req_id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      [ -n "$req_id" ] || req_id=3
+      printf '{"jsonrpc":"2.0","id":"%s","result":{"turn":{"id":"turn-chat-compact-row","status":"completed"}}}\n' "$req_id"
+      echo '{"jsonrpc":"2.0","method":"turn/started","params":{"threadId":"thread-chat-compact-row","turn":{"id":"turn-chat-compact-row"}}}'
+      echo '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"thread-chat-compact-row","turnId":"turn-chat-compact-row","itemId":"item-assistant-compact-row","sequence":17,"createdAt":"2026-04-03T10:11:12Z","item":{"type":"agent_message"},"delta":"hello"}}'
+      echo '{"jsonrpc":"2.0","method":"item.started","params":{"threadId":"thread-chat-compact-row","turnId":"turn-chat-compact-row","itemId":"item-exec-compact-row","sequence":18,"createdAt":"2026-04-03T10:11:13Z","item":{"type":"command_execution","command":"rtk git status --short"}}}'
+      echo '{"jsonrpc":"2.0","method":"item.completed","params":{"threadId":"thread-chat-compact-row","turnId":"turn-chat-compact-row","itemId":"item-subagent-compact-row","sequence":19,"createdAt":"2026-04-03T10:11:14Z","item":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"explorer\",\"message\":\"inspect backend\"}","output_text":"Spawned Rawls"}}}'
+      echo '{"jsonrpc":"2.0","method":"item.completed","params":{"threadId":"thread-chat-compact-row","turnId":"turn-chat-compact-row","item":{"id":"item-assistant-compact-row","type":"agent_message","text":"hello"}}}'
+      echo '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"thread-chat-compact-row","turn":{"id":"turn-chat-compact-row","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`))
+	srv := &Server{svc: svc}
+	conn := openCodingWS(t, srv)
+	if err := conn.WriteJSON(map[string]any{
+		"type":       "session.send",
+		"request_id": "req_stream_compact_row_1",
+		"session_id": "sess_stream_compact_row",
+		"lane":       "chat",
+		"content":    "hello",
+	}); err != nil {
+		t.Fatalf("write ws request: %v", err)
+	}
+
+	events := readWSEvents(t, conn, 20)
+	var assistantRow, execRow, subagentRow map[string]any
+	for _, evt := range events {
+		if stringFromAny(evt["event"]) != "session.stream" {
+			continue
+		}
+		payload, _ := evt["payload"].(map[string]any)
+		row, _ := payload["compact_row"].(map[string]any)
+		if row == nil {
+			continue
+		}
+		switch stringFromAny(row["role"]) {
+		case "assistant":
+			if stringFromAny(row["source_item_id"]) == "item-assistant-compact-row" {
+				assistantRow = row
+			}
+		case "exec":
+			if stringFromAny(row["exec_command"]) == "rtk git status --short" {
+				execRow = row
+			}
+		case "subagent":
+			if stringFromAny(row["subagent_tool"]) == "spawn_agent" {
+				subagentRow = row
+			}
+		}
+	}
+	if assistantRow == nil {
+		t.Fatalf("expected assistant compact_row in %#v", events)
+	}
+	if got := stringFromAny(assistantRow["content"]); got != "hello" {
+		t.Fatalf("assistant compact_row content = %q", got)
+	}
+	if execRow == nil {
+		t.Fatalf("expected exec compact_row in %#v", events)
+	}
+	if got := stringFromAny(execRow["exec_status"]); got != "running" {
+		t.Fatalf("exec compact_row status = %q", got)
+	}
+	if subagentRow == nil {
+		t.Fatalf("expected subagent compact_row in %#v", events)
+	}
+	if got := stringFromAny(subagentRow["subagent_tool"]); got != "spawn_agent" {
+		t.Fatalf("subagent compact_row tool = %q", got)
+	}
 }
 
 func TestCodingWS_StreamRedactsRawEventAndStderrText(t *testing.T) {

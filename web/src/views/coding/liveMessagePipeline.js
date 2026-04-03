@@ -290,6 +290,12 @@ function parseMCPActivityText(rawText) {
   };
 }
 
+function shouldSkipRawParsingForCompactRow(evt) {
+  const row = evt?.compact_row || evt?.payload?.compact_row || null;
+  const role = String(row?.role || '').trim().toLowerCase();
+  return role === 'assistant' || role === 'exec' || role === 'subagent';
+}
+
 function isRedundantAssistantRawEvent(payload) {
   if (!payload || typeof payload !== 'object') return false;
   const eventType = String(payload?.type || '').trim().toLowerCase();
@@ -1542,5 +1548,6 @@ export {
   parseMCPActivityText,
   parseRawEventPayload,
   parseSubagentActivityText,
-  parseSubagentEventFromPayload
+  parseSubagentEventFromPayload,
+  shouldSkipRawParsingForCompactRow
 }

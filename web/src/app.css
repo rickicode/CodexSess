@@ -1910,25 +1910,25 @@ input[type="range"].threshold-slider:focus-visible {
 }
 
 .sandbox-mode-btn.mode-full {
-  border-color: rgba(239, 68, 68, 0.72);
-  background: rgba(239, 68, 68, 0.18);
-  color: #fecaca;
+  border-color: rgba(190, 64, 64, 0.88);
+  background: rgba(86, 28, 28, 0.92);
+  color: #ffe2de;
 }
 
 .sandbox-mode-btn.mode-full:hover:not(:disabled) {
-  border-color: rgba(239, 68, 68, 0.9);
-  background: rgba(239, 68, 68, 0.24);
+  border-color: rgba(220, 91, 91, 0.96);
+  background: rgba(108, 35, 35, 0.96);
 }
 
 .sandbox-mode-btn.mode-write {
-  border-color: rgba(59, 130, 246, 0.72);
-  background: rgba(59, 130, 246, 0.18);
-  color: #bfdbfe;
+  border-color: rgba(34, 142, 98, 0.84);
+  background: rgba(18, 63, 44, 0.92);
+  color: #d8f7e8;
 }
 
 .sandbox-mode-btn.mode-write:hover:not(:disabled) {
-  border-color: rgba(59, 130, 246, 0.92);
-  background: rgba(59, 130, 246, 0.24);
+  border-color: rgba(52, 172, 121, 0.96);
+  background: rgba(25, 82, 57, 0.96);
 }
 
 .coding-streaming-note {
@@ -2134,8 +2134,7 @@ input[type="range"].threshold-slider:focus-visible {
   justify-content: space-between;
   gap: 12px;
   padding: 8px 10px 10px;
-  border-top: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.02);
+  background: transparent;
 }
 
 .coding-composer-hint {
@@ -2197,6 +2196,30 @@ input[type="range"].threshold-slider:focus-visible {
 .coding-composer-actions .btn-secondary:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.06);
   border-color: transparent;
+}
+
+.coding-composer-actions .sandbox-mode-btn.mode-full {
+  border-color: rgba(190, 64, 64, 0.88);
+  background: rgba(86, 28, 28, 0.92);
+  color: #ffe2de;
+}
+
+.coding-composer-actions .sandbox-mode-btn.mode-full:hover:not(:disabled) {
+  border-color: rgba(220, 91, 91, 0.96);
+  background: rgba(108, 35, 35, 0.96);
+  color: #fff1ef;
+}
+
+.coding-composer-actions .sandbox-mode-btn.mode-write {
+  border-color: rgba(34, 142, 98, 0.84);
+  background: rgba(18, 63, 44, 0.92);
+  color: #d8f7e8;
+}
+
+.coding-composer-actions .sandbox-mode-btn.mode-write:hover:not(:disabled) {
+  border-color: rgba(52, 172, 121, 0.96);
+  background: rgba(25, 82, 57, 0.96);
+  color: #effff6;
 }
 
 .coding-composer-actions .btn-primary,
@@ -2272,6 +2295,7 @@ input[type="range"].threshold-slider:focus-visible {
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+  padding-left: 6px;
   min-width: 0;
   flex: 1 1 auto;
   overflow: hidden;

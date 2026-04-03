@@ -878,6 +878,24 @@ func TestResolveStreamAssistantParts_FallsBackToMergedDeltaText(t *testing.T) {
 	}
 }
 
+func TestResolveStreamAssistantRecords_PreservesStreamTimestamps(t *testing.T) {
+	now := time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	reply := provider.ChatResult{
+		Messages: []string{"First", "Second"},
+		Text:     "First\n\nSecond",
+	}
+	got := resolveStreamAssistantRecords(reply, "", []assistantPartRecord{
+		{Content: "First", CreatedAt: now},
+		{Content: "Second", CreatedAt: now.Add(2 * time.Second)},
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 assistant records, got %#v", got)
+	}
+	if !got[0].CreatedAt.Equal(now) || !got[1].CreatedAt.Equal(now.Add(2*time.Second)) {
+		t.Fatalf("expected assistant timestamps to be preserved, got %#v", got)
+	}
+}
+
 func TestCreateCodingSession_UsesUUIDSessionIDWithSeparateThreadID(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell-script codex test runner is unix-only")

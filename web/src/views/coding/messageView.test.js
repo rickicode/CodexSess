@@ -934,6 +934,32 @@ test("canonical terminal and file operation rows stay visible", () => {
   assert.equal(rendered[2].file_op, "Deleted: /tmp/old.go");
 });
 
+test("canonical view keeps terminal interaction activity visible", () => {
+  const rendered = projectMessagesForView(
+    [
+      {
+        id: "terminal-interaction",
+        role: "activity",
+        actor: "chat",
+        content: "Terminal interaction",
+        created_at: "2026-04-02T12:00:00Z",
+        updated_at: "2026-04-02T12:00:00Z",
+      },
+      {
+        id: "assistant-after",
+        role: "assistant",
+        content: "Done.",
+        created_at: "2026-04-02T12:00:01Z",
+        updated_at: "2026-04-02T12:00:01Z",
+      },
+    ],
+    { alreadyCanonical: true },
+  );
+
+  assert.equal(rendered.length, 2);
+  assert.equal(rendered[0].id, "terminal-interaction");
+});
+
 test("generic activity rows with legacy legacy_owner metadata do not render as internal runner activity", () => {
   const rendered = projectMessagesForView(
     [

@@ -964,6 +964,16 @@ func TestSummarizeAppServerEvent_SuppressesEmptyCommandOutputDelta(t *testing.T)
 	}
 }
 
+func TestSummarizeAppServerEvent_TerminalInteractionIsHumanized(t *testing.T) {
+	if got := summarizeAppServerEvent("item/commandExecution/terminalInteraction", map[string]any{
+		"itemId":    "call_123",
+		"processId": "6579",
+		"stdin":     "",
+	}); got != "Terminal interaction" {
+		t.Fatalf("expected terminal interaction summary, got %q", got)
+	}
+}
+
 func TestTruncateActivityText_UTF8Safe(t *testing.T) {
 	src := strings.Repeat("🙂", 140)
 	got := truncateActivityText(src)

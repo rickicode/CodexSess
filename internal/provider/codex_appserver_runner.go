@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"strings"
 	"sync"
@@ -199,7 +200,8 @@ func startAppServerClient(ctx context.Context, binary, codexHome, workDir string
 	if strings.TrimSpace(binary) == "" {
 		binary = "codex"
 	}
-	cmd := exec.CommandContext(ctx, binary, "app-server", "--listen", "stdio://")
+	processCtx := context.WithoutCancel(ctx)
+	cmd := exec.CommandContext(processCtx, binary, "app-server", "--listen", "stdio://")
 	if strings.TrimSpace(workDir) != "" {
 		cmd.Dir = workDir
 	}
@@ -508,6 +510,19 @@ func (c *appServerClient) startTurn(ctx context.Context, threadID string, opts E
 				}
 				scheduleIdleFallback()
 			}
+		case "item/started":
+			var payload struct {
+				ThreadID string `json:"threadId"`
+				TurnID   string `json:"turnId"`
+			}
+			if err := json.Unmarshal(evt.Params, &payload); err == nil && strings.TrimSpace(payload.ThreadID) == strings.TrimSpace(threadID) {
+				if currentTurnID == "" {
+					currentTurnID = strings.TrimSpace(payload.TurnID)
+				}
+				if assistantStarted || assistantCompleted {
+					scheduleIdleFallback()
+				}
+			}
 		case "item/completed", "rawResponseItem/completed":
 			var payload struct {
 				ThreadID string `json:"threadId"`
@@ -616,6 +631,9 @@ func (c *appServerClient) call(ctx context.Context, method string, params any, o
 		}
 		return nil
 	case <-ctx.Done():
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -653,6 +671,7 @@ func (c *appServerClient) readLoop(stdout io.ReadCloser) {
 		}
 		var env rpcEnvelope
 		if err := json.Unmarshal([]byte(line), &env); err != nil {
+			log.Printf("malformed app-server stdout: %s", line)
 			continue
 		}
 		if env.ID != nil && env.Method == "" {
@@ -663,7 +682,11 @@ func (c *appServerClient) readLoop(stdout io.ReadCloser) {
 			c.pendingMu.Unlock()
 			if ch != nil {
 				if env.Error != nil {
-					ch <- rpcResponse{Err: fmt.Errorf("%s", firstNonEmpty(strings.TrimSpace(env.Error.Message), "codex app-server request failed"))}
+					errText := firstNonEmpty(strings.TrimSpace(env.Error.Message), "codex app-server request failed")
+					if data := strings.TrimSpace(string(env.Error.Data)); data != "" && data != "null" {
+						errText = errText + ": " + data
+					}
+					ch <- rpcResponse{Err: errors.New(errText)}
 				} else {
 					ch <- rpcResponse{Result: env.Result}
 				}
@@ -964,6 +987,8 @@ func summarizeAppServerEvent(method string, params map[string]any) string {
 		default:
 			return strings.TrimSpace("Command output: " + delta)
 		}
+	case "item/commandExecution/terminalInteraction":
+		return "Terminal interaction"
 	case "item/fileChange/outputDelta":
 		return ""
 	case "item/mcpToolCall/progress":

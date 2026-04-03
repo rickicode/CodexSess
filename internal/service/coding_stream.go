@@ -238,18 +238,22 @@ func (s *Service) persistAssistantParts(
 	sessionID string,
 	session store.CodingSession,
 	commandMode string,
-	assistantParts []string,
+	assistantParts []assistantPartRecord,
 	reply provider.ChatResult,
 ) ([]store.CodingMessage, store.CodingMessage, error) {
 	assistants := make([]store.CodingMessage, 0, len(assistantParts))
 	for idx, part := range assistantParts {
+		partCreatedAt := part.CreatedAt.UTC()
+		if partCreatedAt.IsZero() {
+			partCreatedAt = time.Now().UTC()
+		}
 		msg := store.CodingMessage{
 			ID:        "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 			SessionID: sessionID,
 			Role:      "assistant",
 			Actor:     codingAssistantActor(session, commandMode),
-			Content:   part,
-			CreatedAt: time.Now().UTC(),
+			Content:   part.Content,
+			CreatedAt: partCreatedAt,
 		}
 		if idx == len(assistantParts)-1 {
 			msg.InputTokens = reply.InputTokens
@@ -262,6 +266,36 @@ func (s *Service) persistAssistantParts(
 		assistants = append(assistants, saved)
 	}
 	return assistants, assistants[len(assistants)-1], nil
+}
+
+type assistantPartRecord struct {
+	Content   string
+	CreatedAt time.Time
+}
+
+func assistantPartRecordsFromStrings(parts []string, createdAt time.Time) []assistantPartRecord {
+	out := make([]assistantPartRecord, 0, len(parts))
+	for _, part := range parts {
+		out = append(out, assistantPartRecord{
+			Content:   part,
+			CreatedAt: createdAt,
+		})
+	}
+	return out
+}
+
+func assistantRecordTime(raw string) time.Time {
+	text := strings.TrimSpace(raw)
+	if text == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+		return parsed.UTC()
+	}
+	if parsed, err := time.Parse(time.RFC3339, text); err == nil {
+		return parsed.UTC()
+	}
+	return time.Time{}
 }
 
 func (s *Service) finalizeCodingTurn(
@@ -581,7 +615,14 @@ func (s *Service) SendCodingMessage(ctx context.Context, sessionID, content, mod
 	if err := s.requireAssistantParts(runCtx, sid, assistantParts); err != nil {
 		return CodingChatResult{}, err
 	}
-	assistants, assistantMsg, err := s.persistAssistantParts(ctx, sid, setup.session, setup.commandMode, assistantParts, reply)
+	assistants, assistantMsg, err := s.persistAssistantParts(
+		ctx,
+		sid,
+		setup.session,
+		setup.commandMode,
+		assistantPartRecordsFromStrings(assistantParts, time.Now().UTC()),
+		reply,
+	)
 	if err != nil {
 		return CodingChatResult{}, err
 	}
@@ -657,7 +698,7 @@ func (s *Service) SendCodingMessageStream(
 	}
 	defer s.beginCodingRuntimeStateScope(runCtx, sid)()
 
-	streamedParts := make([]string, 0, 4)
+	streamedParts := make([]assistantPartRecord, 0, 4)
 	var streamedText strings.Builder
 	persistedEvents := make([]store.CodingMessage, 0, codingEventPersistMax+1)
 	droppedEvents := 0
@@ -679,7 +720,10 @@ func (s *Service) SendCodingMessageStream(
 			return nil
 		}
 		if eventType == "assistant_message" {
-			streamedParts = append(streamedParts, delta)
+			streamedParts = append(streamedParts, assistantPartRecord{
+				Content:   delta,
+				CreatedAt: assistantRecordTime(evt.CreatedAt),
+			})
 		}
 		if eventType == "delta" {
 			streamedText.WriteString(delta)
@@ -742,7 +786,11 @@ func (s *Service) SendCodingMessageStream(
 		return CodingChatResult{}, err
 	}
 
-	assistantParts := resolveStreamAssistantParts(reply, streamedText.String(), streamedParts)
+	assistantRecords := resolveStreamAssistantRecords(reply, streamedText.String(), streamedParts)
+	assistantParts := make([]string, 0, len(assistantRecords))
+	for _, part := range assistantRecords {
+		assistantParts = append(assistantParts, part.Content)
+	}
 	if err := s.requireAssistantParts(runCtx, sid, assistantParts); err != nil {
 		return CodingChatResult{}, err
 	}
@@ -761,7 +809,7 @@ func (s *Service) SendCodingMessageStream(
 		}
 		persistedEvents = append(persistedEvents, saved)
 	}
-	assistants, assistantMsg, err := s.persistAssistantParts(ctx, sid, setup.session, setup.commandMode, assistantParts, reply)
+	assistants, assistantMsg, err := s.persistAssistantParts(ctx, sid, setup.session, setup.commandMode, assistantRecords, reply)
 	if err != nil {
 		return CodingChatResult{}, err
 	}
@@ -809,6 +857,47 @@ func resolveStreamAssistantParts(reply provider.ChatResult, streamedText string,
 	}
 	if merged := strings.TrimSpace(streamedText); merged != "" {
 		return []string{merged}
+	}
+	return nil
+}
+
+func resolveStreamAssistantRecords(reply provider.ChatResult, streamedText string, streamedParts []assistantPartRecord) []assistantPartRecord {
+	assistantParts := normalizedAssistantParts(reply.Messages, reply.Text)
+	if len(assistantParts) > 0 {
+		if len(streamedParts) == len(assistantParts) {
+			out := make([]assistantPartRecord, 0, len(assistantParts))
+			for idx, part := range assistantParts {
+				out = append(out, assistantPartRecord{
+					Content:   part,
+					CreatedAt: streamedParts[idx].CreatedAt,
+				})
+			}
+			return out
+		}
+		return assistantPartRecordsFromStrings(assistantParts, time.Now().UTC())
+	}
+	if len(streamedParts) > 0 {
+		textParts := make([]string, 0, len(streamedParts))
+		for _, part := range streamedParts {
+			textParts = append(textParts, part.Content)
+		}
+		assistantParts = normalizedAssistantParts(textParts, "")
+		if len(assistantParts) > 0 && len(assistantParts) == len(streamedParts) {
+			out := make([]assistantPartRecord, 0, len(assistantParts))
+			for idx, part := range assistantParts {
+				out = append(out, assistantPartRecord{
+					Content:   part,
+					CreatedAt: streamedParts[idx].CreatedAt,
+				})
+			}
+			return out
+		}
+		if len(assistantParts) > 0 {
+			return assistantPartRecordsFromStrings(assistantParts, time.Now().UTC())
+		}
+	}
+	if merged := strings.TrimSpace(streamedText); merged != "" {
+		return []assistantPartRecord{{Content: merged, CreatedAt: time.Now().UTC()}}
 	}
 	return nil
 }

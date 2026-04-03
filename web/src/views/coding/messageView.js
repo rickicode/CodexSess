@@ -105,13 +105,15 @@ function collapseTransientActivityMessages(inputMessages) {
   let lastGenericActivityIndex = -1;
   for (let idx = 0; idx < src.length; idx += 1) {
     const item = src[idx];
+    const content = String(item?.content || "").trim().toLowerCase();
     if (
       String(item?.role || "")
         .trim()
         .toLowerCase() === "activity" &&
       !item?.file_op &&
       !item?.mcp_activity &&
-      !isInternalRunnerActivity(item)
+      !isInternalRunnerActivity(item) &&
+      content !== "terminal interaction"
     ) {
       lastGenericActivityIndex = idx;
     }
@@ -131,7 +133,8 @@ function collapseTransientActivityMessages(inputMessages) {
         .trim()
         .toLowerCase() === "activity" &&
       !item?.file_op &&
-      !item?.mcp_activity;
+      !item?.mcp_activity &&
+      String(item?.content || "").trim().toLowerCase() !== "terminal interaction";
     if (isGenericActivity && isInternalRunnerActivity(item)) return true;
     if (!isGenericActivity) return true;
     if (hasLaterSubstantiveMessage) return false;

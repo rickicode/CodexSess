@@ -89,11 +89,11 @@ test("force stop does not surface websocket detached background as a composer er
   );
 });
 
-test("streaming status line reuses coding-streaming-note markup", () => {
-  assert.match(codingStatusLineSource, /coding-streaming-note/);
-  assert.doesNotMatch(codingStatusLineSource, /status-streaming-pulse/);
-  assert.doesNotMatch(codingStatusLineSource, /status-streaming-label/);
-  assert.doesNotMatch(codingStatusLineSource, /status-streaming-dots/);
+test("streaming status line uses inline status-specific animation markup", () => {
+  assert.doesNotMatch(codingStatusLineSource, /coding-streaming-note/);
+  assert.match(codingStatusLineSource, /status-streaming-pulse/);
+  assert.match(codingStatusLineSource, /status-streaming-label/);
+  assert.match(codingStatusLineSource, /status-streaming-dots/);
 });
 
 test("message pane keeps streaming note outside assistant bubbles", () => {
@@ -110,9 +110,17 @@ test("composer keeps controls in a footer below the textarea with send pinned as
   assert.match(appCssSource, /\.coding-composer-body\b/);
   assert.match(appCssSource, /\.coding-composer-footer\b/);
   assert.match(appCssSource, /\.coding-composer-secondary-actions\b/);
-  assert.match(appCssSource, /\.coding-composer-footer\s*\{[\s\S]*border-top:/);
+  assert.match(appCssSource, /\.coding-composer-footer\s*\{[\s\S]*background:\s*transparent/);
   assert.match(appCssSource, /\.coding-composer-actions \.btn\s*\{[\s\S]*border:\s*0/);
   assert.match(appCssSource, /\.btn-send\s*\{[\s\S]*margin-left:\s*auto/);
+  assert.match(
+    appCssSource,
+    /\.sandbox-mode-btn\.mode-write\s*\{[\s\S]*border-color:\s*rgba\(34,\s*142,\s*98,\s*0\.84\)[\s\S]*background:\s*rgba\(18,\s*63,\s*44,\s*0\.92\)/,
+  );
+  assert.match(
+    appCssSource,
+    /\.sandbox-mode-btn\.mode-full\s*\{[\s\S]*border-color:\s*rgba\(190,\s*64,\s*64,\s*0\.88\)[\s\S]*background:\s*rgba\(86,\s*28,\s*28,\s*0\.92\)/,
+  );
 });
 
 test("contract view preserves live order after snapshot replacement", () => {

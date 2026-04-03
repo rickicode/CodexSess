@@ -11,6 +11,18 @@ tags:
 
 ## 2026-04-02
 
+- Scope: stabilized `terminalInteraction` visibility and preserved streamed assistant commentary timing so transient live rows no longer disappear or collapse unnaturally at turn completion.
+- Files or subsystems touched: `internal/provider/codex_appserver_runner.go`, `internal/provider/codex_appserver_test.go`, `internal/service/coding_stream.go`, `internal/service/coding_test.go`, `web/src/views/coding/messageView.js`, and `web/src/views/coding/messageView.test.js`.
+- Behavior/runtime effect: `item/commandExecution/terminalInteraction` is now summarized as `Terminal interaction` and treated as a durable activity row instead of transient generic noise; streamed assistant commentary parts now keep their original stream timestamps when persisted, reducing the end-of-turn “messages bunch together” effect.
+- Validation status: `rtk timeout 120s go test ./internal/provider -run 'Test(SummarizeAppServerEvent_(MCPReadyIsSuppressed|CommandOutputDeltaEmptySuppressed|TerminalInteractionIsHumanized))$' -count=1` passed; `rtk timeout 120s go test ./internal/service -run 'Test(ResolveStreamAssistantRecords_PreservesStreamTimestamps|SendCodingMessageStream_PrioritizesSubagentAndMCPEventsOverCommandOutputSpam)$' -count=1` passed; `rtk timeout 120s node --test web/src/views/coding/messageView.test.js` passed (`35/35`).
+- Open follow-up items: none.
+
+- Scope: fixed provider app-server regressions and simplified non-account schema recovery so `coding_sessions` preserves canonical columns while disposable child state is reset.
+- Files or subsystems touched: `internal/provider/codex_appserver_runner.go`, `internal/store/store_schema.go`, `internal/store/store_schema_migration_test.go`, and `main_smoke_test.go`.
+- Behavior/runtime effect: canceled RPC calls now remove their pending waiter entry immediately; malformed app-server stdout is logged instead of being silently discarded; structured `error.data` from RPC responses is preserved in surfaced error text; cached persistent app-server processes are no longer tied to the caller context that created them; idle completion now stays open while post-assistant item activity continues; and `coding_sessions` rebuild now preserves supported canonical columns while resetting disposable child chat state (`coding_messages`, snapshots, view rows, ws dedup, and memory items) on schema drift.
+- Validation status: `rtk timeout 120s go test ./internal/provider -run 'Test(AppServerClient_(CallRemovesPendingOnContextCancellation|ReadLoopLogsMalformedStdoutLine|ReadLoopPreservesStructuredErrorData)|PersistentAppServerRuntimeCache_ClientSurvivesAcquireContextCancellation)$' -count=1` passed; `rtk timeout 120s go test ./internal/store -run 'TestGetCodingSession_(ExtraColumnsPreserveCanonicalSessionFields|ExtraLegacyColumnsPreserveSessionButDropCodingData|KnownLegacyColumnsPreserveSessionButDropChildState)$' -count=1` passed; `rtk timeout 120s go test . -run 'TestAppStartup_ResetsLegacyCodingSessionsAndPreservesFreshChatLifecycle$' -count=1` passed.
+- Open follow-up items: none.
+
 - Scope: ignored local Playwright MCP verification artifacts so browser-debug output stays out of the repository while keeping real `/chat` verification available during development.
 - Files or subsystems touched: repository `.gitignore` and verification workflow hygiene.
 - Behavior/runtime effect: `.playwright-mcp/` is now excluded from git status, so local Playwright MCP snapshots/logs no longer pollute the worktree when running real browser verification against `/chat`.

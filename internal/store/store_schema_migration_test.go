@@ -76,7 +76,7 @@ func TestCodingSessionsSchema_UsesChatOnlyColumns(t *testing.T) {
 	}
 }
 
-func TestGetCodingSession_ExtraColumnsMigrateAndPreserveCodingSessions(t *testing.T) {
+func TestGetCodingSession_ExtraColumnsPreserveCanonicalSessionFields(t *testing.T) {
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "coding-legacy-reset.db")
@@ -131,17 +131,17 @@ func TestGetCodingSession_ExtraColumnsMigrateAndPreserveCodingSessions(t *testin
 
 	session, err := st.GetCodingSession(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("expected coding session with extra columns to survive schema migration: %v", err)
+		t.Fatalf("expected coding session with extra columns to survive canonical-column rebuild: %v", err)
 	}
 	if session.CodexThreadID != "thread_main" {
 		t.Fatalf("expected canonical thread id preserved, got %q", session.CodexThreadID)
 	}
 	sessions, err := st.ListCodingSessions(context.Background())
 	if err != nil {
-		t.Fatalf("list sessions after migration: %v", err)
+		t.Fatalf("list sessions after rebuild: %v", err)
 	}
 	if len(sessions) != 1 {
-		t.Fatalf("expected preserved coding session after extra-column migration, got %d", len(sessions))
+		t.Fatalf("expected rebuilt coding session to remain, got %d", len(sessions))
 	}
 	columns, err := st.codingSessionsColumns(context.Background())
 	if err != nil {
@@ -158,7 +158,7 @@ func TestGetCodingSession_ExtraColumnsMigrateAndPreserveCodingSessions(t *testin
 	}
 }
 
-func TestGetCodingSession_ExtraLegacyColumnsMigrateAndPreserveCodingData(t *testing.T) {
+func TestGetCodingSession_ExtraLegacyColumnsPreserveSessionButDropCodingData(t *testing.T) {
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "coding-runtime-columns-reset.db")
@@ -234,20 +234,17 @@ func TestGetCodingSession_ExtraLegacyColumnsMigrateAndPreserveCodingData(t *test
 
 	session, err := st.GetCodingSession(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("expected session with extra legacy columns to survive schema migration: %v", err)
+		t.Fatalf("expected session with extra legacy columns to survive canonical-column rebuild: %v", err)
 	}
 	if session.CodexThreadID != "thread_keep" {
 		t.Fatalf("expected canonical thread id preserved, got %q", session.CodexThreadID)
 	}
 	messages, err := st.ListCodingMessages(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("list messages after extra-column migration: %v", err)
+		t.Fatalf("list messages after child-table reset: %v", err)
 	}
-	if len(messages) != 1 {
-		t.Fatalf("expected messages to be preserved across extra-column migration, got %#v", messages)
-	}
-	if messages[0].Content != "still here" {
-		t.Fatalf("expected preserved message content, got %#v", messages[0])
+	if len(messages) != 0 {
+		t.Fatalf("expected messages to be dropped across child-table reset, got %#v", messages)
 	}
 	columns, err := st.codingSessionsColumns(context.Background())
 	if err != nil {
@@ -258,5 +255,86 @@ func TestGetCodingSession_ExtraLegacyColumnsMigrateAndPreserveCodingData(t *test
 	}
 	if _, ok := columns["obsolete_status"]; ok {
 		t.Fatalf("expected obsolete_status dropped after migration")
+	}
+}
+
+func TestGetCodingSession_KnownLegacyColumnsPreserveSessionButDropChildState(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "coding-known-legacy-reset.db")
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	t.Cleanup(func() { _ = rawDB.Close() })
+	if _, err := rawDB.Exec(`
+		CREATE TABLE coding_sessions (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			reasoning_level TEXT NOT NULL DEFAULT 'medium',
+			work_dir TEXT NOT NULL DEFAULT '~/',
+			sandbox_mode TEXT NOT NULL DEFAULT 'full-access',
+			codex_thread_id TEXT NOT NULL DEFAULT '',
+			restart_pending INTEGER NOT NULL DEFAULT 0,
+			legacy_enabled INTEGER NOT NULL DEFAULT 0,
+			chat_codex_thread_id TEXT NOT NULL DEFAULT '',
+			legacy_supervisor_thread_id TEXT NOT NULL DEFAULT '',
+			legacy_executor_thread_id TEXT NOT NULL DEFAULT '',
+			chat_needs_hydration INTEGER NOT NULL DEFAULT 0,
+			chat_context_version INTEGER NOT NULL DEFAULT 0,
+			last_hydrated_chat_context_version INTEGER NOT NULL DEFAULT 0,
+			last_mode_transition_summary TEXT NOT NULL DEFAULT '',
+			artifact_version INTEGER NOT NULL DEFAULT 0,
+			last_applied_event_seq INTEGER NOT NULL DEFAULT 0,
+			legacy_plan_artifact_path TEXT NOT NULL DEFAULT '',
+			legacy_plan_updated_at TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_message_at TEXT NOT NULL
+		)
+	`); err != nil {
+		t.Fatalf("create legacy coding_sessions table: %v", err)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	sessionID := uuid.NewString()
+	if _, err := rawDB.Exec(`
+		INSERT INTO coding_sessions(
+			id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,restart_pending,
+			legacy_enabled,chat_codex_thread_id,legacy_supervisor_thread_id,legacy_executor_thread_id,
+			chat_needs_hydration,chat_context_version,last_hydrated_chat_context_version,last_mode_transition_summary,
+			artifact_version,last_applied_event_seq,legacy_plan_artifact_path,legacy_plan_updated_at,
+			created_at,updated_at,last_message_at
+		) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	`,
+		sessionID, "Legacy", "gpt-5.2-codex", "medium", "~/legacy", "workspace-write", "thread_legacy_runtime", 0,
+		1, "thread_legacy_chat", "thread_legacy_aux_a", "thread_legacy_aux_b",
+		1, 4, 3, "resume chat from legacy runtime", 7, 19, ".omx/plans/legacy-smoke.md", now,
+		now, now, now,
+	); err != nil {
+		t.Fatalf("insert legacy coding session: %v", err)
+	}
+	_ = rawDB.Close()
+
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	session, err := st.GetCodingSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("expected known legacy coding session to survive canonical-column rebuild: %v", err)
+	}
+	if session.CodexThreadID != "thread_legacy_runtime" {
+		t.Fatalf("expected canonical thread id preserved, got %q", session.CodexThreadID)
+	}
+	sessions, err := st.ListCodingSessions(context.Background())
+	if err != nil {
+		t.Fatalf("list sessions after rebuild: %v", err)
+	}
+	if len(sessions) != 1 {
+		t.Fatalf("expected rebuilt legacy coding session to remain, got %d", len(sessions))
 	}
 }

@@ -314,7 +314,7 @@ func (s *Store) codingSessionsColumns(ctx context.Context) (map[string]struct{},
 }
 
 func codingSessionsSchemaNeedsRebuild(columns map[string]struct{}) bool {
-	return codingSessionsSchemaCanMigrate(columns) || codingSessionsSchemaNeedsReset(columns)
+	return codingSessionsSchemaNeedsReset(columns)
 }
 
 func codingSessionsSchemaNeedsReset(columns map[string]struct{}) bool {
@@ -337,28 +337,6 @@ func codingSessionsSchemaNeedsReset(columns map[string]struct{}) bool {
 		if _, ok := columns[name]; !ok {
 			return true
 		}
-	}
-	return false
-}
-
-func codingSessionsSchemaCanMigrate(columns map[string]struct{}) bool {
-	if codingSessionsSchemaNeedsReset(columns) {
-		return false
-	}
-	required := map[string]struct{}{
-		"id":                     {},
-		"title":                  {},
-		"model":                  {},
-		"reasoning_level":        {},
-		"work_dir":               {},
-		"sandbox_mode":           {},
-		"codex_thread_id":        {},
-		"restart_pending":        {},
-		"artifact_version":       {},
-		"last_applied_event_seq": {},
-		"created_at":             {},
-		"updated_at":             {},
-		"last_message_at":        {},
 	}
 	for name := range columns {
 		if _, ok := required[name]; !ok {
@@ -403,19 +381,17 @@ func (s *Store) ensureChatOnlyCodingSessionsSchema(ctx context.Context) error {
 	`); err != nil {
 		return err
 	}
-	if !codingSessionsSchemaNeedsReset(columns) {
-		if _, err := txExecWithRetry(ctx, tx, `
-			INSERT INTO coding_sessions_chat_only(
-				id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,restart_pending,
-				artifact_version,last_applied_event_seq,created_at,updated_at,last_message_at
-			)
-			SELECT
-				id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,restart_pending,
-				artifact_version,last_applied_event_seq,created_at,updated_at,last_message_at
-			FROM coding_sessions
-		`); err != nil {
-			return err
-		}
+	if _, err := txExecWithRetry(ctx, tx, `
+		INSERT INTO coding_sessions_chat_only(
+			id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,restart_pending,
+			artifact_version,last_applied_event_seq,created_at,updated_at,last_message_at
+		)
+		SELECT
+			id,title,model,reasoning_level,work_dir,sandbox_mode,codex_thread_id,restart_pending,
+			artifact_version,last_applied_event_seq,created_at,updated_at,last_message_at
+		FROM coding_sessions
+	`); err != nil {
+		return err
 	}
 	if _, err := txExecWithRetry(ctx, tx, `DROP TABLE coding_sessions`); err != nil {
 		return err
@@ -423,16 +399,15 @@ func (s *Store) ensureChatOnlyCodingSessionsSchema(ctx context.Context) error {
 	if _, err := txExecWithRetry(ctx, tx, `ALTER TABLE coding_sessions_chat_only RENAME TO coding_sessions`); err != nil {
 		return err
 	}
-	if codingSessionsSchemaNeedsReset(columns) {
-		for _, table := range []string{
-			"coding_messages",
-			"coding_message_snapshots",
-			"coding_view_messages",
-			"coding_ws_request_dedup",
-		} {
-			if _, err := txExecWithRetry(ctx, tx, `DELETE FROM `+table); err != nil {
-				return err
-			}
+	for _, table := range []string{
+		"coding_messages",
+		"coding_message_snapshots",
+		"coding_view_messages",
+		"coding_ws_request_dedup",
+		"memory_items",
+	} {
+		if _, err := txExecWithRetry(ctx, tx, `DELETE FROM `+table); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()

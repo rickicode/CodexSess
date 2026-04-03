@@ -208,8 +208,12 @@ func TestAppStartup_ResetsLegacyCodingSessionsAndPreservesFreshChatLifecycle(t *
 
 	initialList := smokeGetJSON(t, client, baseURL+"/api/coding/sessions")
 	initialSessions := mustSessions(t, initialList)
-	if len(initialSessions) != 0 {
-		t.Fatalf("expected legacy coding sessions to be dropped on startup, got %d body=%v", len(initialSessions), initialList)
+	if len(initialSessions) != 1 {
+		t.Fatalf("expected preserved legacy coding session row on startup, got %d body=%v", len(initialSessions), initialList)
+	}
+	assertNoLegacySessionFields(t, initialSessions[0])
+	if got := stringFromMap(initialSessions[0], "thread_id"); got != "thread_legacy_runtime" {
+		t.Fatalf("expected preserved canonical thread id for legacy session, got %q", got)
 	}
 
 	createResp := smokePostJSON(t, client, baseURL+"/api/coding/sessions", map[string]any{
@@ -237,11 +241,22 @@ func TestAppStartup_ResetsLegacyCodingSessionsAndPreservesFreshChatLifecycle(t *
 
 	afterCreateList := smokeGetJSON(t, client, baseURL+"/api/coding/sessions")
 	afterCreateSessions := mustSessions(t, afterCreateList)
-	if len(afterCreateSessions) != 1 {
-		t.Fatalf("expected one fresh session after create, got %d body=%v", len(afterCreateSessions), afterCreateList)
+	if len(afterCreateSessions) != 2 {
+		t.Fatalf("expected preserved legacy session plus one fresh session after create, got %d body=%v", len(afterCreateSessions), afterCreateList)
 	}
+	foundFresh := false
+	foundLegacy := false
 	for _, session := range afterCreateSessions {
 		assertNoLegacySessionFields(t, session)
+		switch stringFromMap(session, "id") {
+		case createdSessionID:
+			foundFresh = true
+		case "sess_legacy_chat_session":
+			foundLegacy = true
+		}
+	}
+	if !foundFresh || !foundLegacy {
+		t.Fatalf("expected both fresh and legacy session rows after create, got %#v", afterCreateSessions)
 	}
 
 	wsConn := openSmokeWebSocket(t, client, baseURL, "/api/coding/ws")
@@ -654,10 +669,18 @@ func verifyMigratedSchemaState(t *testing.T, dbPath string) {
 
 	var codingSessionCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM coding_sessions WHERE id=?`, "sess_legacy_chat_session").Scan(&codingSessionCount); err != nil {
-		t.Fatalf("count legacy row after reset: %v", err)
+		t.Fatalf("count legacy row after rebuild: %v", err)
 	}
-	if codingSessionCount != 0 {
-		t.Fatalf("expected legacy coding session row to be deleted after reset, got count=%d", codingSessionCount)
+	if codingSessionCount != 1 {
+		t.Fatalf("expected legacy coding session row to survive canonical-column rebuild, got count=%d", codingSessionCount)
+	}
+
+	var codingMessageCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM coding_messages WHERE session_id=?`, "sess_legacy_chat_session").Scan(&codingMessageCount); err != nil {
+		t.Fatalf("count legacy messages after child reset: %v", err)
+	}
+	if codingMessageCount != 0 {
+		t.Fatalf("expected legacy coding messages to be cleared after child-table reset, got count=%d", codingMessageCount)
 	}
 }
 

@@ -25,6 +25,10 @@ const codingStatusLineSource = readFileSync(
   new URL("./CodingStatusLine.svelte", import.meta.url),
   "utf8",
 );
+const runStateMachineSource = readFileSync(
+  new URL("./runStateMachine.js", import.meta.url),
+  "utf8",
+);
 const appCssSource = readFileSync(
   new URL("../../app.css", import.meta.url),
   "utf8",
@@ -81,11 +85,19 @@ test("chat stylesheet drops leftover legacy lane selectors", () => {
 test("force stop does not surface websocket detached background as a composer error", () => {
   assert.match(
     codingViewSource,
-    /const stopDrivenDetach = detachedBackground && \(stopRequested \|\| expectedWSDetach\);[\s\S]*if \(busy \|\| detachedBackground\) \{[\s\S]*if \(inFlight\) \{[\s\S]*viewStatus = stopDrivenDetach \? \(forceStopArmed \? 'Force stopping\.\.\.' : 'Stopping\.\.\.'\) : 'Streaming\.\.\.';[\s\S]*\} else if \(stopDrivenDetach\) \{[\s\S]*composerLockedUntilAssistant = false;[\s\S]*composerError = '';[\s\S]*viewStatus = 'Stopped\.';[\s\S]*backgroundProcessing = false;/,
+    /const stopDrivenDetach = detachedBackground && \(stopRequested \|\| expectedWSDetach\);[\s\S]*const failureState = createSendFailureState\(\{[\s\S]*stopDrivenDetach,[\s\S]*forceStopArmed,[\s\S]*inFlight,[\s\S]*stopRequested,[\s\S]*aborted,[\s\S]*failReason,[\s\S]*\}\);[\s\S]*applyRunStatePatch\(failureState\);/,
   );
   assert.match(
     codingViewSource,
-    /let effectiveViewStatus = \$derived\.by\(\(\) => \{[\s\S]*const recoveryStatus = currentRecoveryStatus\(messages\);[\s\S]*if \(sending \|\| backgroundProcessing\) \{[\s\S]*return recoveryStatus \|\| 'Streaming\.\.\.';/,
+    /let effectiveViewStatus = \$derived\.by\(\(\) => \{[\s\S]*return computeEffectiveViewStatus\(\{[\s\S]*recoveryStatus: currentRecoveryStatus\(messages\),[\s\S]*viewStatus[\s\S]*\}\);[\s\S]*\}\);/,
+  );
+  assert.match(
+    runStateMachineSource,
+    /function computeEffectiveViewStatus\(state = \{\}\) \{[\s\S]*if \(phase === 'force_stopping' \|\| phase === 'stopping'\) \{[\s\S]*return 'Stopping\.\.\.';[\s\S]*if \(phase === 'streaming'\) \{[\s\S]*return recoveryStatus \|\| 'Streaming\.\.\.';/,
+  );
+  assert.match(
+    runStateMachineSource,
+    /function createSendFailureState\([\s\S]*if \(busy \|\| detachedBackground\) \{[\s\S]*if \(inFlight\) \{[\s\S]*viewStatus: stopDrivenDetach[\s\S]*'Streaming\.\.\.'[\s\S]*if \(stopDrivenDetach\) \{[\s\S]*viewStatus: 'Stopped\.'/,
   );
 });
 

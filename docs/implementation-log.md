@@ -11,6 +11,12 @@ tags:
 
 ## 2026-04-03
 
+- Scope: extracted `/chat` frontend run lifecycle logic out of the monolithic view into dedicated state, transport, stop, and send-completion helpers without changing the chat-first UI contract.
+- Files or subsystems touched: `web/src/views/CodingView.svelte`, `web/src/views/coding/CodingView.contract.test.js`, `web/src/views/coding/runStateMachine.js`, `web/src/views/coding/runStateMachine.test.js`, `web/src/views/coding/streamTransport.js`, `web/src/views/coding/stopOrchestration.js`, `web/src/views/coding/stopOrchestration.test.js`, `web/src/views/coding/sendCompletion.js`, and `web/src/views/coding/sendCompletion.test.js`.
+- Behavior/runtime effect: `/chat` keeps the same send/stream/stop user flow, but the view now delegates run-phase derivation, state patches, websocket transport, stop handling, and successful completion handling to focused helper modules. This reduces state coupling inside `CodingView.svelte` and makes the run lifecycle testable without rendering the whole view.
+- Validation status: `rtk timeout 120s npm run test:unit -- src/views/coding/runStateMachine.test.js src/views/coding/stopOrchestration.test.js src/views/coding/sendCompletion.test.js src/views/coding/CodingView.contract.test.js` passed from `web/`.
+- Open follow-up items: the health websocket and the remaining `sendMessage()` orchestration still live in `CodingView.svelte`; they can be extracted later if the team wants a fuller reducer-style state machine.
+
 - Scope: carried subagent identity into wait-completion bubbles and re-verified that assistant timeline ordering stays stable after page refresh in the rebuilt one-origin `/chat` app.
 - Files or subsystems touched: `internal/httpapi/server_coding_compact.go`, `internal/httpapi/server_coding_compact_test.go`, `web/src/views/coding/liveMessagePipeline.test.js`, and final rebuilt `/chat` verification flows.
 - Behavior/runtime effect: compact/canonical subagent rows now infer nicknames from additional prompt forms such as `Nickname Anda: ...` and `You are nicknamed ...`, allowing `wait_agent` completion rows to render as `Finished waiting for <nickname>` instead of the generic `Subagent wait completed`; rebuilt `make run RUN_PORT=3061` verification also confirmed that assistant bubbles did not collapse to the end of the timeline after refreshing the page in the tested `/chat` scenario.

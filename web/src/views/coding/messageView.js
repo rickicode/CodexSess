@@ -849,6 +849,52 @@ function dedupeAdjacentStderrMessages(input) {
   return out;
 }
 
+function dedupeAdjacentAssistantMessages(input) {
+  const src = Array.isArray(input) ? input : [];
+  const out = [];
+  for (const row of src) {
+    const current = row || {};
+    const role = String(current?.role || "").trim().toLowerCase();
+    if (role !== "assistant") {
+      out.push(current);
+      continue;
+    }
+    const content = String(current?.content || "").trim();
+    if (!content) {
+      out.push(current);
+      continue;
+    }
+    const prev = out.length > 0 ? out[out.length - 1] : null;
+    const prevRole = String(prev?.role || "").trim().toLowerCase();
+    if (prevRole !== "assistant") {
+      out.push(current);
+      continue;
+    }
+    const prevContent = String(prev?.content || "").trim();
+    const prevActor = String(prev?.actor || "").trim().toLowerCase();
+    const currentActor = String(current?.actor || "").trim().toLowerCase();
+    if (!prevContent || prevContent !== content || prevActor !== currentActor) {
+      out.push(current);
+      continue;
+    }
+    const prevMs = Date.parse(String(prev?.updated_at || prev?.created_at || "").trim());
+    const currentMs = Date.parse(String(current?.updated_at || current?.created_at || "").trim());
+    if (!Number.isNaN(prevMs) && !Number.isNaN(currentMs) && Math.abs(currentMs - prevMs) > 10_000) {
+      out.push(current);
+      continue;
+    }
+    out[out.length - 1] = {
+      ...prev,
+      ...current,
+      id: String(current?.id || prev?.id || ""),
+      content,
+      created_at: String(prev?.created_at || current?.created_at || ""),
+      updated_at: String(current?.updated_at || current?.created_at || prev?.updated_at || prev?.created_at || ""),
+    };
+  }
+  return out;
+}
+
 function collapseRecoveryActivityBursts(inputMessages) {
   const src = Array.isArray(inputMessages) ? inputMessages : [];
   const out = [];
@@ -1529,6 +1575,7 @@ function projectMessagesForView(
     rendered = collapseTransientActivityMessages(rendered);
     rendered = dedupeAdjacentFileOperationActivities(rendered);
     rendered = dedupeAdjacentExecMessages(rendered);
+    rendered = dedupeAdjacentAssistantMessages(rendered);
     rendered = dedupeAdjacentStderrMessages(rendered);
     rendered = collapseAdjacentSubagentMessages(rendered);
     rendered = collapseNearbyNamedSubagentMessages(rendered);
@@ -1554,6 +1601,7 @@ function projectMessagesForView(
   rendered = collapseTransientActivityMessages(rendered);
   rendered = dedupeAdjacentFileOperationActivities(rendered);
   rendered = dedupeAdjacentExecMessages(rendered);
+  rendered = dedupeAdjacentAssistantMessages(rendered);
   rendered = dedupeAdjacentStderrMessages(rendered);
   return rendered;
 }

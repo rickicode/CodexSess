@@ -883,12 +883,23 @@ func extractAppServerEventMeta(method string, params map[string]any) appServerEv
 	thread, _ := params["thread"].(map[string]any)
 	turn, _ := params["turn"].(map[string]any)
 	item, _ := params["item"].(map[string]any)
+	itemType := firstNonEmpty(firstStringFromMap(params, "itemType"), firstStringFromMap(item, "type"))
+	if strings.TrimSpace(itemType) == "" {
+		switch strings.TrimSpace(method) {
+		case "item/agentMessage/delta":
+			itemType = "agent_message"
+		case "item/commandExecution/outputDelta":
+			itemType = "command_execution"
+		case "item/fileChange/outputDelta":
+			itemType = "file_change"
+		}
+	}
 	return appServerEventMeta{
 		SourceEventType: strings.TrimSpace(method),
 		SourceThreadID:  firstNonEmpty(firstStringFromMap(params, "threadId"), firstStringFromMap(thread, "id")),
 		SourceTurnID:    firstNonEmpty(firstStringFromMap(params, "turnId"), firstStringFromMap(turn, "id")),
 		SourceItemID:    firstNonEmpty(firstStringFromMap(params, "itemId"), firstStringFromMap(item, "id")),
-		SourceItemType:  firstNonEmpty(firstStringFromMap(params, "itemType"), firstStringFromMap(item, "type")),
+		SourceItemType:  itemType,
 		EventSeq: firstNonZeroInt64(
 			firstInt64FromMap(params, "sequence", "seq", "eventSeq", "event_seq"),
 			firstInt64FromMap(item, "sequence", "seq", "eventSeq", "event_seq"),

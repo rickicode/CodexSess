@@ -1265,3 +1265,179 @@ test("assistant delta only updates the matching source item bubble", () => {
   assert.equal(merged[0]?.source_item_id, "item-assistant-1");
   assert.equal(merged[1]?.source_item_id, "item-assistant-2");
 });
+
+test("assistant source identity matches across agent_message and agentMessage variants", () => {
+  const current = [
+    {
+      id: "stream-assistant-1",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Saya akan cek instruksi sesi dulu.",
+      pending: true,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agent_message",
+      created_at: "2026-04-02T12:20:00.000Z",
+      updated_at: "2026-04-02T12:20:00.000Z",
+    },
+  ];
+  const persisted = [
+    {
+      id: "db-assistant-1",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Saya akan cek instruksi sesi dulu.",
+      pending: false,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agentMessage",
+      created_at: "2026-04-02T12:20:03.000Z",
+      updated_at: "2026-04-02T12:20:03.000Z",
+    },
+  ];
+
+  const merged = reconcileLiveMessagesWithPersisted(
+    current,
+    persisted,
+    collectLiveMessageIDs(current),
+  );
+
+  assert.deepEqual(merged.map((row) => row.id), ["db-assistant-1"]);
+});
+
+test("projected timeline keeps assistant bubbles split around terminal activity after persisted merge", () => {
+  const current = [
+    {
+      id: "stream-assistant-1",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Saya audit alur /chat.",
+      pending: true,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.000Z",
+      updated_at: "2026-04-02T12:20:00.000Z",
+    },
+    {
+      id: "stream-exec-1",
+      role: "exec",
+      actor: "",
+      lane: "",
+      content: "sed -n '1,220p' backend/internal/bootstrap/migrate.go",
+      exec_command: "sed -n '1,220p' backend/internal/bootstrap/migrate.go",
+      exec_status: "done",
+      exec_output: "",
+      created_at: "2026-04-02T12:20:00.050Z",
+      updated_at: "2026-04-02T12:20:00.050Z",
+    },
+    {
+      id: "stream-assistant-2",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Ada gap struktural jelas di bootstrap.",
+      pending: true,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.100Z",
+      updated_at: "2026-04-02T12:20:00.100Z",
+    },
+  ];
+
+  const persisted = [
+    {
+      id: "db-assistant-1",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Saya audit alur /chat.",
+      pending: false,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-1",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.000Z",
+      updated_at: "2026-04-02T12:20:00.000Z",
+    },
+    {
+      id: "db-assistant-2",
+      role: "assistant",
+      actor: "",
+      lane: "",
+      content: "Ada gap struktural jelas di bootstrap.",
+      pending: false,
+      source_turn_id: "turn-chat-1",
+      source_item_id: "item-assistant-2",
+      source_item_type: "agentmessage",
+      created_at: "2026-04-02T12:20:00.100Z",
+      updated_at: "2026-04-02T12:20:00.100Z",
+    },
+  ];
+
+  const merged = reconcileLiveMessagesWithPersisted(
+    current,
+    persisted,
+    collectLiveMessageIDs(current),
+  );
+  const rendered = projectMessagesForView(merged, {
+    buildExecAwareMessages,
+    rawMode: false,
+    alreadyCanonical: true,
+  });
+
+  assert.deepEqual(
+    rendered.map((row) => row.id),
+    ["db-assistant-1", "stream-exec-1", "db-assistant-2"],
+  );
+  assert.equal(rendered[0]?.content, "Saya audit alur /chat.");
+  assert.equal(rendered[1]?.role, "exec");
+  assert.equal(rendered[2]?.content, "Ada gap struktural jelas di bootstrap.");
+});
+
+test("canonical view dedupes adjacent identical assistant bubbles from the same actor", () => {
+  const rendered = projectMessagesForView(
+    [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        actor: "",
+        content: "Saya akan cek instruksi sesi dulu.",
+        created_at: "2026-04-02T12:20:00.000Z",
+        updated_at: "2026-04-02T12:20:00.000Z",
+      },
+      {
+        id: "assistant-2",
+        role: "assistant",
+        actor: "",
+        content: "Saya akan cek instruksi sesi dulu.",
+        created_at: "2026-04-02T12:20:03.000Z",
+        updated_at: "2026-04-02T12:20:03.000Z",
+      },
+      {
+        id: "exec-1",
+        role: "exec",
+        actor: "",
+        content: "rtk read AGENTS.md",
+        exec_command: "rtk read AGENTS.md",
+        exec_status: "done",
+        exec_output: "",
+        created_at: "2026-04-02T12:20:04.000Z",
+        updated_at: "2026-04-02T12:20:04.000Z",
+      },
+    ],
+    {
+      buildExecAwareMessages,
+      rawMode: false,
+      alreadyCanonical: true,
+    },
+  );
+
+  assert.deepEqual(
+    rendered.map((row) => row.id),
+    ["assistant-2", "exec-1"],
+  );
+});

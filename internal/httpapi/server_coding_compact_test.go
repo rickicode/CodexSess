@@ -726,8 +726,239 @@ func TestCodingCompactBuilder_SubagentSpawnCompletionMergesAndWaitFinalizesRunni
 	if got := stringFromAny(waitRow["subagent_status"]); got != "done" {
 		t.Fatalf("expected wait row done, got %q", got)
 	}
+	if got := stringFromAny(waitRow["content"]); !strings.Contains(got, "Planck") {
+		t.Fatalf("expected wait row content to retain nickname, got %q", got)
+	}
 	if _, exists := waitRow["subagent_raw"]; exists {
 		t.Fatalf("expected wait compact row without subagent_raw field: %#v", waitRow)
+	}
+}
+
+func TestCodingCompactBuilder_SpawnPromptCarriesNicknameIntoWaitCompletion(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 3, 24, 1, 2, 3, 0, time.UTC)
+
+	startArgs, err := json.Marshal(map[string]any{
+		"message": "Your nickname for this task is Planck. Read AGENTS.md only.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start args: %v", err)
+	}
+	startPayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "spawn_agent",
+			"arguments": string(startArgs),
+			"output": map[string]any{
+				"agent_id": "agent-123",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(startPayload)}, now) {
+		t.Fatalf("expected spawn completion to be applied")
+	}
+
+	waitArgs, err := json.Marshal(map[string]any{"id": "agent-123"})
+	if err != nil {
+		t.Fatalf("marshal wait args: %v", err)
+	}
+	waitDonePayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "wait_agent",
+			"arguments": string(waitArgs),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal wait payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(waitDonePayload)}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected wait completion to be applied")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(snapshot))
+	}
+	waitRow := snapshot[1]
+	if got := stringFromAny(waitRow["content"]); !strings.Contains(got, "Planck") {
+		t.Fatalf("expected wait completion to include inferred nickname, got %q", got)
+	}
+}
+
+func TestCodingCompactBuilder_IndonesianSpawnPromptCarriesNicknameIntoWaitCompletion(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 3, 24, 1, 2, 3, 0, time.UTC)
+
+	startArgs, err := json.Marshal(map[string]any{
+		"message": "Nickname Anda: Planck. Baca AGENTS.md saja.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start args: %v", err)
+	}
+	startPayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "spawn_agent",
+			"arguments": string(startArgs),
+			"output": map[string]any{
+				"agent_id": "agent-123",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(startPayload)}, now) {
+		t.Fatalf("expected spawn completion to be applied")
+	}
+
+	waitArgs, err := json.Marshal(map[string]any{"id": "agent-123"})
+	if err != nil {
+		t.Fatalf("marshal wait args: %v", err)
+	}
+	waitDonePayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "wait_agent",
+			"arguments": string(waitArgs),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal wait payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(waitDonePayload)}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected wait completion to be applied")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(snapshot))
+	}
+	waitRow := snapshot[1]
+	if got := stringFromAny(waitRow["content"]); !strings.Contains(got, "Planck") {
+		t.Fatalf("expected wait completion to include inferred nickname from Indonesian prompt, got %q", got)
+	}
+}
+
+func TestCodingCompactBuilder_NicknamedPromptCarriesNicknameIntoWaitCompletion(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 3, 24, 1, 2, 3, 0, time.UTC)
+
+	startArgs, err := json.Marshal(map[string]any{
+		"message": "You are nicknamed Planck. Read AGENTS.md only.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start args: %v", err)
+	}
+	startPayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "spawn_agent",
+			"arguments": string(startArgs),
+			"output": map[string]any{
+				"agent_id": "agent-123",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(startPayload)}, now) {
+		t.Fatalf("expected spawn completion to be applied")
+	}
+
+	waitArgs, err := json.Marshal(map[string]any{"id": "agent-123"})
+	if err != nil {
+		t.Fatalf("marshal wait args: %v", err)
+	}
+	waitDonePayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "wait_agent",
+			"arguments": string(waitArgs),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal wait payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(waitDonePayload)}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected wait completion to be applied")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(snapshot))
+	}
+	waitRow := snapshot[1]
+	if got := stringFromAny(waitRow["content"]); !strings.Contains(got, "Planck") {
+		t.Fatalf("expected wait completion to include inferred nickname from nicknamed prompt, got %q", got)
+	}
+}
+
+func TestCodingCompactBuilder_YouArePromptCarriesNicknameIntoWaitCompletion(t *testing.T) {
+	b := newCodingCompactBuilder()
+	now := time.Date(2026, 3, 24, 1, 2, 3, 0, time.UTC)
+
+	startArgs, err := json.Marshal(map[string]any{
+		"message": "You are Planck. Read AGENTS.md only.",
+	})
+	if err != nil {
+		t.Fatalf("marshal start args: %v", err)
+	}
+	startPayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "spawn_agent",
+			"arguments": string(startArgs),
+			"output": map[string]any{
+				"agent_id": "agent-123",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal start payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(startPayload)}, now) {
+		t.Fatalf("expected spawn completion to be applied")
+	}
+
+	waitArgs, err := json.Marshal(map[string]any{"id": "agent-123"})
+	if err != nil {
+		t.Fatalf("marshal wait args: %v", err)
+	}
+	waitDonePayload, err := json.Marshal(map[string]any{
+		"type": "item.completed",
+		"item": map[string]any{
+			"type":      "tool_call",
+			"tool_name": "wait_agent",
+			"arguments": string(waitArgs),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal wait payload: %v", err)
+	}
+	if !b.Apply(provider.ChatEvent{Type: "raw_event", Text: string(waitDonePayload)}, now.Add(10*time.Millisecond)) {
+		t.Fatalf("expected wait completion to be applied")
+	}
+
+	snapshot := b.Snapshot()
+	if len(snapshot) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(snapshot))
+	}
+	waitRow := snapshot[1]
+	if got := stringFromAny(waitRow["content"]); got != "Finished waiting for Planck" {
+		t.Fatalf("expected wait completion to include inferred nickname from 'You are' prompt, got %q", got)
 	}
 }
 

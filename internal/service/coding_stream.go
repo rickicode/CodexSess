@@ -271,6 +271,7 @@ func (s *Service) persistAssistantParts(
 type assistantPartRecord struct {
 	Content   string
 	CreatedAt time.Time
+	SourceKey string
 }
 
 func assistantPartRecordsFromStrings(parts []string, createdAt time.Time) []assistantPartRecord {
@@ -282,6 +283,24 @@ func assistantPartRecordsFromStrings(parts []string, createdAt time.Time) []assi
 		})
 	}
 	return out
+}
+
+func assistantStreamSourceKey(turnID, itemID, itemType string) string {
+	turn := strings.TrimSpace(turnID)
+	item := strings.TrimSpace(itemID)
+	kind := strings.ToLower(strings.TrimSpace(itemType))
+	switch kind {
+	case "agentmessage", "agent_message":
+		kind = "agentmessage"
+	case "commandexecution", "command_execution":
+		kind = "commandexecution"
+	case "filechange", "file_change":
+		kind = "filechange"
+	}
+	if item == "" {
+		return ""
+	}
+	return strings.Join([]string{turn, item, kind}, "|")
 }
 
 func assistantRecordTime(raw string) time.Time {
@@ -700,6 +719,8 @@ func (s *Service) SendCodingMessageStream(
 
 	streamedParts := make([]assistantPartRecord, 0, 4)
 	var streamedText strings.Builder
+	firstAssistantDeltaAt := time.Time{}
+	firstAssistantDeltaBySource := map[string]time.Time{}
 	persistedEvents := make([]store.CodingMessage, 0, codingEventPersistMax+1)
 	droppedEvents := 0
 	subagentState := &subagentIdentityState{}
@@ -719,13 +740,28 @@ func (s *Service) SendCodingMessageStream(
 		if delta == "" {
 			return nil
 		}
+		sourceKey := assistantStreamSourceKey(evt.SourceTurnID, evt.SourceItemID, evt.SourceItemType)
 		if eventType == "assistant_message" {
+			createdAt := assistantRecordTime(evt.CreatedAt)
+			if first := firstAssistantDeltaBySource[sourceKey]; !first.IsZero() && (createdAt.IsZero() || first.Before(createdAt)) {
+				createdAt = first
+			}
 			streamedParts = append(streamedParts, assistantPartRecord{
 				Content:   delta,
-				CreatedAt: assistantRecordTime(evt.CreatedAt),
+				CreatedAt: createdAt,
+				SourceKey: sourceKey,
 			})
 		}
 		if eventType == "delta" {
+			deltaAt := assistantRecordTime(evt.CreatedAt)
+			if firstAssistantDeltaAt.IsZero() {
+				firstAssistantDeltaAt = deltaAt
+			}
+			if sourceKey != "" {
+				if existing := firstAssistantDeltaBySource[sourceKey]; existing.IsZero() || (!deltaAt.IsZero() && deltaAt.Before(existing)) {
+					firstAssistantDeltaBySource[sourceKey] = deltaAt
+				}
+			}
 			streamedText.WriteString(delta)
 		}
 		if eventType != "assistant_message" {
@@ -786,7 +822,7 @@ func (s *Service) SendCodingMessageStream(
 		return CodingChatResult{}, err
 	}
 
-	assistantRecords := resolveStreamAssistantRecords(reply, streamedText.String(), streamedParts)
+	assistantRecords := resolveStreamAssistantRecords(reply, streamedText.String(), streamedParts, firstAssistantDeltaAt)
 	assistantParts := make([]string, 0, len(assistantRecords))
 	for _, part := range assistantRecords {
 		assistantParts = append(assistantParts, part.Content)
@@ -861,20 +897,73 @@ func resolveStreamAssistantParts(reply provider.ChatResult, streamedText string,
 	return nil
 }
 
-func resolveStreamAssistantRecords(reply provider.ChatResult, streamedText string, streamedParts []assistantPartRecord) []assistantPartRecord {
+func alignAssistantPartRecordTimes(parts []string, streamedParts []assistantPartRecord) []assistantPartRecord {
+	if len(parts) == 0 {
+		return nil
+	}
+	out := make([]assistantPartRecord, 0, len(parts))
+	if len(streamedParts) == 0 {
+		return assistantPartRecordsFromStrings(parts, time.Now().UTC())
+	}
+	matchIndex := 0
+	lastKnown := assistantRecordTime("")
+	for _, part := range parts {
+		partText := strings.TrimSpace(part)
+		bestMatchIndex := -1
+		for scan := matchIndex; scan < len(streamedParts); scan++ {
+			candidate := streamedParts[scan]
+			candidateText := strings.TrimSpace(candidate.Content)
+			if candidateText == "" {
+				continue
+			}
+			if candidateText == partText || strings.Contains(candidateText, partText) || strings.Contains(partText, candidateText) {
+				bestMatchIndex = scan
+			}
+		}
+		if bestMatchIndex >= 0 {
+			lastKnown = streamedParts[bestMatchIndex].CreatedAt.UTC()
+			matchIndex = bestMatchIndex + 1
+		} else if matchIndex < len(streamedParts) {
+			candidate := streamedParts[matchIndex]
+			candidateText := strings.TrimSpace(candidate.Content)
+			if candidateText != "" {
+				lastKnown = candidate.CreatedAt.UTC()
+			}
+			matchIndex++
+		}
+		createdAt := lastKnown
+		if createdAt.IsZero() {
+			createdAt = streamedParts[len(streamedParts)-1].CreatedAt.UTC()
+		}
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		out = append(out, assistantPartRecord{
+			Content:   part,
+			CreatedAt: createdAt,
+		})
+	}
+	return out
+}
+
+func resolveStreamAssistantRecords(reply provider.ChatResult, streamedText string, streamedParts []assistantPartRecord, firstDeltaAt time.Time) []assistantPartRecord {
 	assistantParts := normalizedAssistantParts(reply.Messages, reply.Text)
 	if len(assistantParts) > 0 {
 		if len(streamedParts) == len(assistantParts) {
 			out := make([]assistantPartRecord, 0, len(assistantParts))
 			for idx, part := range assistantParts {
+				createdAt := streamedParts[idx].CreatedAt
+				if idx == 0 && !firstDeltaAt.IsZero() && (createdAt.IsZero() || firstDeltaAt.Before(createdAt)) {
+					createdAt = firstDeltaAt
+				}
 				out = append(out, assistantPartRecord{
 					Content:   part,
-					CreatedAt: streamedParts[idx].CreatedAt,
+					CreatedAt: createdAt,
 				})
 			}
 			return out
 		}
-		return assistantPartRecordsFromStrings(assistantParts, time.Now().UTC())
+		return alignAssistantPartRecordTimes(assistantParts, streamedParts)
 	}
 	if len(streamedParts) > 0 {
 		textParts := make([]string, 0, len(streamedParts))
@@ -893,11 +982,15 @@ func resolveStreamAssistantRecords(reply provider.ChatResult, streamedText strin
 			return out
 		}
 		if len(assistantParts) > 0 {
-			return assistantPartRecordsFromStrings(assistantParts, time.Now().UTC())
+			return alignAssistantPartRecordTimes(assistantParts, streamedParts)
 		}
 	}
 	if merged := strings.TrimSpace(streamedText); merged != "" {
-		return []assistantPartRecord{{Content: merged, CreatedAt: time.Now().UTC()}}
+		createdAt := firstDeltaAt
+		if createdAt.IsZero() {
+			createdAt = time.Now().UTC()
+		}
+		return []assistantPartRecord{{Content: merged, CreatedAt: createdAt}}
 	}
 	return nil
 }

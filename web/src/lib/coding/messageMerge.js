@@ -115,14 +115,33 @@ function normalizeMessageMatchPart(value) {
     .replace(/\s+/g, ' ')
 }
 
+function normalizeSourceItemType(value) {
+  let itemType = String(value || '').trim().toLowerCase()
+  switch (itemType) {
+    case 'agentmessage':
+    case 'agent_message':
+      itemType = 'agentmessage'
+      break
+    case 'commandexecution':
+    case 'command_execution':
+      itemType = 'commandexecution'
+      break
+    case 'filechange':
+    case 'file_change':
+      itemType = 'filechange'
+      break
+    default:
+      break
+  }
+  return itemType
+}
+
 function sourceIdentityKey(item) {
   const role = String(item?.role || '').trim().toLowerCase()
   const itemID = String(item?.source_item_id ?? item?.sourceItemID ?? '').trim()
   if (!role || !itemID) return ''
   const turnID = String(item?.source_turn_id ?? item?.sourceTurnID ?? '').trim()
-  const itemType = String(item?.source_item_type ?? item?.sourceItemType ?? '')
-    .trim()
-    .toLowerCase()
+  const itemType = normalizeSourceItemType(item?.source_item_type ?? item?.sourceItemType ?? '')
   return `${role}|${turnID}|${itemID}|${itemType}`
 }
 

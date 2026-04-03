@@ -77,6 +77,7 @@
     parseSubagentEventFromPayload
   } from './coding/liveMessagePipeline.js';
   import { findActiveLiveMessageID } from './coding/liveState.js';
+  import { findAssistantStreamTargetIndex } from './coding/assistantStreamState.js';
   import {
     collectLiveMessageIDs,
     completedViewStatus,
@@ -595,7 +596,23 @@
     const normalizedRole = String(role || '').trim().toLowerCase();
     const normalizedTurnID = String(turnID || '').trim();
     const normalizedItemID = String(itemID || '').trim();
-    const normalizedItemType = String(itemType || '').trim().toLowerCase();
+    let normalizedItemType = String(itemType || '').trim().toLowerCase();
+    switch (normalizedItemType) {
+      case 'agentmessage':
+      case 'agent_message':
+        normalizedItemType = 'agentmessage';
+        break;
+      case 'commandexecution':
+      case 'command_execution':
+        normalizedItemType = 'commandexecution';
+        break;
+      case 'filechange':
+      case 'file_change':
+        normalizedItemType = 'filechange';
+        break;
+      default:
+        break;
+    }
     if (!normalizedRole || !normalizedItemID) return '';
     return [normalizedRole, normalizedTurnID, normalizedItemID, normalizedItemType].join('|');
   }
@@ -651,41 +668,10 @@
     if (!text) return;
     const normalizedActor = String(actor || '').trim().toLowerCase();
     const normalizedAssistantKey = String(assistantKey || '').trim();
-    let index = -1;
-    if (normalizedAssistantKey) {
-      for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
-        const candidate = messages[idx];
-        if (!candidate) continue;
-        if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
-        if (String(candidate?.stream_identity_key || '').trim() !== normalizedAssistantKey) continue;
-        index = idx;
-        break;
-      }
-      if (index < 0) {
-        for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
-          const candidate = messages[idx];
-          if (!candidate) continue;
-          if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
-          if (!candidate?.pending) continue;
-          if (String(candidate?.stream_identity_key || '').trim()) continue;
-          if (String(candidate?.content || '').trim()) continue;
-          index = idx;
-          break;
-        }
-      }
-    } else {
-      for (let idx = messages.length - 1; idx >= 0; idx -= 1) {
-        const candidate = messages[idx];
-        if (!candidate) continue;
-        if (String(candidate?.role || '').trim().toLowerCase() !== 'assistant') continue;
-        const candidateActor = String(candidate?.actor || '').trim().toLowerCase();
-        if (candidateActor !== normalizedActor) continue;
-        if (candidate?.pending) {
-          index = idx;
-          break;
-        }
-      }
-    }
+    const index = findAssistantStreamTargetIndex(messages, {
+      actor: normalizedActor,
+      assistantKey: normalizedAssistantKey
+    });
     if (index >= 0) {
       const current = messages[index];
       const base = String(current?.content || '');

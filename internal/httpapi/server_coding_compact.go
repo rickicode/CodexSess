@@ -386,10 +386,12 @@ func parseCodingCompactSubagentActivity(text string) map[string]string {
 		status := "done"
 		phase := "completed"
 		title := "Subagent wait completed"
+		target := raw
 		if isWaiting {
 			status = "running"
 			phase = "started"
 			title = "Waiting for agents"
+			target = raw
 		}
 		return map[string]string{
 			"title":   title,
@@ -397,7 +399,7 @@ func parseCodingCompactSubagentActivity(text string) map[string]string {
 			"summary": raw,
 			"tool":    "wait_agent",
 			"phase":   phase,
-			"target":  raw,
+			"target":  target,
 		}
 	}
 	lines := strings.Split(raw, "\n")
@@ -433,7 +435,8 @@ func parseCodingCompactSubagentActivity(text string) map[string]string {
 		target = strings.TrimSpace(strings.TrimPrefix(target, "waiting"))
 	case strings.HasPrefix(lower, "subagent wait completed"):
 		tool = "wait_agent"
-		target = title
+		target = strings.TrimSpace(strings.TrimPrefix(title, "Subagent wait completed"))
+		target = strings.TrimSpace(strings.TrimPrefix(target, ":"))
 	case strings.HasPrefix(lower, "sent input to subagent"):
 		tool = "send_input"
 		target = title
@@ -500,6 +503,31 @@ func parseCodingCompactArgs(value any) map[string]any {
 		}
 	}
 	return map[string]any{}
+}
+
+func inferCompactSubagentIdentityFromPrompt(prompt string) (nickname, role string) {
+	text := strings.TrimSpace(prompt)
+	if text == "" {
+		return "", ""
+	}
+	if m := regexp.MustCompile(`(?i)\bnickname(?:\s+for\s+this\s+task|\s+anda)?\s*(?::|is|=)\s*([A-Za-z0-9._-]+)`).FindStringSubmatch(text); len(m) == 2 {
+		nickname = strings.TrimSpace(m[1])
+	}
+	if nickname == "" {
+		if m := regexp.MustCompile(`(?i)\bnicknamed\s+([A-Za-z0-9._-]+)`).FindStringSubmatch(text); len(m) == 2 {
+			nickname = strings.TrimSpace(m[1])
+		}
+	}
+	if nickname == "" {
+		if m := regexp.MustCompile(`(?i)\byou are\s+([A-Za-z0-9._-]+)`).FindStringSubmatch(text); len(m) == 2 {
+			nickname = strings.TrimSpace(m[1])
+		}
+	}
+	nickname = strings.TrimRight(strings.TrimSpace(nickname), ".,:;!?")
+	if m := regexp.MustCompile(`\[(.+?)\]`).FindStringSubmatch(text); len(m) == 2 {
+		role = strings.TrimSpace(m[1])
+	}
+	return nickname, role
 }
 
 func firstStringFromAnyMap(m map[string]any, keys ...string) string {
@@ -741,6 +769,12 @@ func parseCodingCompactSubagentEvent(payload map[string]any) map[string]any {
 	model := firstStringFromAnyMap(args, "model")
 	reasoning := firstStringFromAnyMap(args, "reasoning_effort", "reasoning")
 	prompt := firstStringFromAnyMap(args, "message", "prompt")
+	if inferredNickname, inferredRole := inferCompactSubagentIdentityFromPrompt(prompt); strings.TrimSpace(nickname) == "" && strings.TrimSpace(inferredNickname) != "" {
+		nickname = inferredNickname
+		if strings.TrimSpace(role) == "" {
+			role = inferredRole
+		}
+	}
 	ids := extractStringSliceFromAnyCompact(args["ids"])
 	if len(ids) == 0 {
 		ids = extractStringSliceFromAnyCompact(args["agent_ids"])
@@ -778,10 +812,19 @@ func parseCodingCompactSubagentEvent(payload map[string]any) map[string]any {
 			title += " [" + role + "]"
 		}
 	case "wait_agent", "wait":
+		displayName := firstNonEmpty(nickname, agentName, target)
 		if status == "running" {
-			title = "Waiting subagent"
+			if displayName != "" {
+				title = "Waiting for " + displayName
+			} else {
+				title = "Waiting for agents"
+			}
 		} else {
-			title = "Subagent wait completed"
+			if displayName != "" {
+				title = "Finished waiting for " + displayName
+			} else {
+				title = "Subagent wait completed"
+			}
 		}
 	case "send_input":
 		title = "Sent input to subagent"
@@ -1278,10 +1321,83 @@ func (b *codingCompactBuilder) resumableInternalRunnerIndexBySourceIdentity(thre
 	return -1
 }
 
+func (b *codingCompactBuilder) knownSubagentDisplayName(target string, ids []string) string {
+	target = strings.TrimSpace(target)
+	idSet := map[string]struct{}{}
+	for _, id := range ids {
+		clean := strings.TrimSpace(id)
+		if clean != "" {
+			idSet[clean] = struct{}{}
+		}
+	}
+	for idx := len(b.messages) - 1; idx >= 0; idx-- {
+		entry := b.messages[idx]
+		if !strings.EqualFold(stringFromAny(entry["role"]), "subagent") {
+			continue
+		}
+		if target != "" && strings.EqualFold(stringFromAny(entry["subagent_target_id"]), target) {
+			displayName := firstNonEmpty(stringFromAny(entry["subagent_nickname"]), stringFromAny(entry["subagent_name"]))
+			if strings.TrimSpace(displayName) == "" {
+				inferredNickname, _ := inferCompactSubagentIdentityFromPrompt(stringFromAny(entry["subagent_prompt"]))
+				displayName = inferredNickname
+			}
+			if strings.TrimSpace(displayName) != "" {
+				return displayName
+			}
+		}
+		rawIDs, _ := entry["subagent_ids"].([]string)
+		for _, existingID := range rawIDs {
+			if _, ok := idSet[strings.TrimSpace(existingID)]; ok {
+				displayName := firstNonEmpty(stringFromAny(entry["subagent_nickname"]), stringFromAny(entry["subagent_name"]))
+				if strings.TrimSpace(displayName) == "" {
+					inferredNickname, _ := inferCompactSubagentIdentityFromPrompt(stringFromAny(entry["subagent_prompt"]))
+					displayName = inferredNickname
+				}
+				if strings.TrimSpace(displayName) != "" {
+					return displayName
+				}
+			}
+		}
+	}
+	for idx := len(b.messages) - 1; idx >= 0; idx-- {
+		entry := b.messages[idx]
+		if !strings.EqualFold(stringFromAny(entry["role"]), "subagent") {
+			continue
+		}
+		if !strings.EqualFold(stringFromAny(entry["subagent_tool"]), "spawn_agent") {
+			continue
+		}
+		displayName := firstNonEmpty(stringFromAny(entry["subagent_nickname"]), stringFromAny(entry["subagent_name"]))
+		if strings.TrimSpace(displayName) == "" {
+			inferredNickname, _ := inferCompactSubagentIdentityFromPrompt(stringFromAny(entry["subagent_prompt"]))
+			displayName = inferredNickname
+		}
+		if strings.TrimSpace(displayName) != "" {
+			return displayName
+		}
+	}
+	return ""
+}
+
 func (b *codingCompactBuilder) upsertSubagent(evt provider.ChatEvent, key, lifecycleKey, title, summary, status, phase, tool, target, prompt, nickname, agentName, role, model, reasoning string, ids []string, _ any, createdAt string) {
 	normalizedActor := strings.TrimSpace(evt.Actor)
 	if idx, ok := b.subagentIndexByKey[key]; ok && idx >= 0 && idx < len(b.messages) && strings.EqualFold(stringFromAny(b.messages[idx]["role"]), "subagent") {
 		entry := b.messages[idx]
+		if (strings.EqualFold(tool, "wait_agent") || strings.EqualFold(tool, "wait")) && !strings.EqualFold(status, "running") {
+			knownName := b.knownSubagentDisplayName(target, ids)
+			displayName := firstNonEmpty(
+				nickname,
+				agentName,
+				stringFromAny(entry["subagent_nickname"]),
+				stringFromAny(entry["subagent_name"]),
+				knownName,
+				target,
+				stringFromAny(entry["subagent_target_id"]),
+			)
+			if strings.TrimSpace(displayName) != "" {
+				title = "Finished waiting for " + displayName
+			}
+		}
 		entry["updated_at"] = createdAt
 		if normalizedActor != "" {
 			entry["actor"] = normalizedActor
@@ -1764,6 +1880,16 @@ func (b *codingCompactBuilder) Apply(evt provider.ChatEvent, createdAt time.Time
 		payload := decodeCodingCompactRawEvent(evt.Text)
 		if subagent := parseCodingCompactSubagentEvent(payload); subagent != nil {
 			ids, _ := subagent["ids"].([]string)
+			tool := stringFromAny(subagent["tool"])
+			status := stringFromAny(subagent["status"])
+			target := stringFromAny(subagent["target"])
+			nickname := stringFromAny(subagent["nickname"])
+			if (strings.EqualFold(tool, "wait_agent") || strings.EqualFold(tool, "wait")) && !strings.EqualFold(status, "running") && strings.TrimSpace(nickname) == "" {
+				if knownName := b.knownSubagentDisplayName(target, ids); strings.TrimSpace(knownName) != "" {
+					subagent["nickname"] = knownName
+					subagent["title"] = "Finished waiting for " + knownName
+				}
+			}
 			b.upsertSubagent(
 				evt,
 				stringFromAny(subagent["key"]),

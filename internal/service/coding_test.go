@@ -887,12 +887,61 @@ func TestResolveStreamAssistantRecords_PreservesStreamTimestamps(t *testing.T) {
 	got := resolveStreamAssistantRecords(reply, "", []assistantPartRecord{
 		{Content: "First", CreatedAt: now},
 		{Content: "Second", CreatedAt: now.Add(2 * time.Second)},
-	})
+	}, time.Time{})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 assistant records, got %#v", got)
 	}
 	if !got[0].CreatedAt.Equal(now) || !got[1].CreatedAt.Equal(now.Add(2*time.Second)) {
 		t.Fatalf("expected assistant timestamps to be preserved, got %#v", got)
+	}
+}
+
+func TestResolveStreamAssistantRecords_PreservesKnownTimestampsOnCountMismatch(t *testing.T) {
+	now := time.Date(2026, 4, 2, 12, 0, 0, 0, time.UTC)
+	reply := provider.ChatResult{
+		Messages: []string{
+			"Saya audit dulu.\n\nMenemukan akar masalah.",
+			"Fix backend siap.",
+		},
+		Text: "Fix backend siap.",
+	}
+
+	got := resolveStreamAssistantRecords(reply, "", []assistantPartRecord{
+		{Content: "Saya audit dulu.", CreatedAt: now},
+		{Content: "Saya audit dulu.\n\nMenemukan akar masalah.", CreatedAt: now.Add(2 * time.Second)},
+		{Content: "Fix backend siap.", CreatedAt: now.Add(4 * time.Second)},
+	}, time.Time{})
+
+	if len(got) != 2 {
+		t.Fatalf("expected 2 assistant records after normalization, got %#v", got)
+	}
+	if !got[0].CreatedAt.Equal(now.Add(2 * time.Second)) {
+		t.Fatalf("expected first normalized assistant timestamp to reuse streamed time, got %#v", got)
+	}
+	if !got[1].CreatedAt.Equal(now.Add(4 * time.Second)) {
+		t.Fatalf("expected second normalized assistant timestamp to reuse latest streamed time, got %#v", got)
+	}
+}
+
+func TestResolveStreamAssistantRecords_PrefersFirstDeltaTimestampForCompletedAssistant(t *testing.T) {
+	now := time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC)
+	reply := provider.ChatResult{
+		Messages: []string{"Saya mulai cek."},
+		Text:     "Saya mulai cek.",
+	}
+
+	got := resolveStreamAssistantRecords(
+		reply,
+		"Saya mulai cek.",
+		[]assistantPartRecord{{Content: "Saya mulai cek.", CreatedAt: now.Add(8 * time.Second)}},
+		now,
+	)
+
+	if len(got) != 1 {
+		t.Fatalf("expected one assistant record, got %#v", got)
+	}
+	if !got[0].CreatedAt.Equal(now) {
+		t.Fatalf("expected assistant record to keep first delta timestamp %s, got %s", now.Format(time.RFC3339), got[0].CreatedAt.Format(time.RFC3339))
 	}
 }
 
@@ -1150,6 +1199,77 @@ exit 1
 	}
 	if len(streamed) == 0 {
 		t.Fatalf("expected streamed events")
+	}
+}
+
+func TestSendCodingMessageStream_PersistsAssistantAtFirstDeltaTime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script codex test runner is unix-only")
+	}
+	svc, st, cry, cfg := newCodingTestService(t)
+	account := seedCodingTestAccount(t, st, cry, cfg, "acc_delta_time", "delta-time@example.com", false)
+	activateCodingTestCLIAccount(t, svc, st, account)
+	svc.Codex.Binary = writeFakeCodexAppServerScript(t, `
+if [ "${1:-}" = "app-server" ]; then
+  while IFS= read -r line; do
+    if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+      echo '{"id":"1","result":{"userAgent":"codexsess/test","codexHome":"/tmp/codex-home","platformFamily":"unix","platformOs":"linux"}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"initialized"'; then
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"thread/resume"'; then
+      echo '{"id":"2","result":{"thread":{"id":"thread_delta_time"}}}'
+      continue
+    fi
+    if printf '%s' "$line" | grep -q '"method":"turn/start"'; then
+      echo '{"id":"3","result":{"turn":{"id":"turn_delta_time","status":"inProgress"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"thread_delta_time","turn":{"id":"turn_delta_time"}}}'
+      echo '{"method":"item/agentMessage/delta","params":{"threadId":"thread_delta_time","turnId":"turn_delta_time","itemId":"item_agent_delta","createdAt":"2026-04-02T12:00:01Z","delta":"Saya "}}'
+      echo '{"method":"item/agentMessage/delta","params":{"threadId":"thread_delta_time","turnId":"turn_delta_time","itemId":"item_agent_delta","createdAt":"2026-04-02T12:00:02Z","delta":"mulai cek."}}'
+      echo '{"method":"item/completed","params":{"threadId":"thread_delta_time","turnId":"turn_delta_time","item":{"type":"agentMessage","id":"item_agent_delta","createdAt":"2026-04-02T12:00:09Z","text":"Saya mulai cek."}}}'
+      echo '{"method":"turn/completed","params":{"threadId":"thread_delta_time","turn":{"id":"turn_delta_time","status":"completed"}}}'
+      exit 0
+    fi
+  done
+fi
+exit 1
+`)
+	_, err := st.CreateCodingSession(t.Context(), store.CodingSession{
+		ID:             "session_delta_time",
+		Title:          "Delta Time",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "full-access",
+		CodexThreadID:  "thread_delta_time",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+		LastMessageAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("CreateCodingSession: %v", err)
+	}
+
+	result, err := svc.SendCodingMessageStream(
+		t.Context(),
+		"session_delta_time",
+		"delta timing prompt",
+		"gpt-5.2-codex",
+		"medium",
+		"~/",
+		"full-access",
+		"chat",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("SendCodingMessageStream: %v", err)
+	}
+
+	wantCreatedAt := time.Date(2026, 4, 2, 12, 0, 1, 0, time.UTC)
+	if !result.Assistant.CreatedAt.Equal(wantCreatedAt) {
+		t.Fatalf("expected assistant created_at %s from first delta, got %s", wantCreatedAt.Format(time.RFC3339), result.Assistant.CreatedAt.Format(time.RFC3339))
 	}
 }
 

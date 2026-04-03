@@ -7,6 +7,10 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 ## [Unreleased]
 
 ### Changed
+- `/chat` now preserves streamed assistant bubble timestamps across normalized multi-part replies, preventing commentary bubbles from collapsing to the end of the timeline beneath terminal activity.
+- `/chat` live streaming now keeps source-identified assistant commentary in separate bubbles instead of merging it into a generic pending assistant placeholder.
+- `/chat` now normalizes assistant source identity across delta/completion events and collapses adjacent duplicate assistant commentary bubbles in the final timeline.
+- `/chat` subagent wait-completion bubbles now carry the known subagent identity when available, rendering labels like `Finished waiting for Planck.` instead of a generic completion row.
 - Chat session persistence now keeps only the active chat-only schema, prunes the unused `usage_snapshots` table, and no longer relies on `runtime_*` session columns.
 - Account autoswitch now retries additional backup accounts when the best candidate cannot be activated, and autoswitch refresh failures log account emails instead of opaque `codex_*` ids when available.
 - Coding template/runtime skill bootstrap now uses only the configured `superpowers` repository and no longer falls back to bundled local `codex-skills` assets.

@@ -9,6 +9,38 @@ tags:
 
 # Implementation Log
 
+## 2026-04-03
+
+- Scope: carried subagent identity into wait-completion bubbles and re-verified that assistant timeline ordering stays stable after page refresh in the rebuilt one-origin `/chat` app.
+- Files or subsystems touched: `internal/httpapi/server_coding_compact.go`, `internal/httpapi/server_coding_compact_test.go`, `web/src/views/coding/liveMessagePipeline.test.js`, and final rebuilt `/chat` verification flows.
+- Behavior/runtime effect: compact/canonical subagent rows now infer nicknames from additional prompt forms such as `Nickname Anda: ...` and `You are nicknamed ...`, allowing `wait_agent` completion rows to render as `Finished waiting for <nickname>` instead of the generic `Subagent wait completed`; rebuilt `make run RUN_PORT=3061` verification also confirmed that assistant bubbles did not collapse to the end of the timeline after refreshing the page in the tested `/chat` scenario.
+- Validation status: `rtk timeout 120s go test ./internal/httpapi -run 'TestCodingCompactBuilder_(NicknamedPromptCarriesNicknameIntoWaitCompletion|IndonesianSpawnPromptCarriesNicknameIntoWaitCompletion|SpawnPromptCarriesNicknameIntoWaitCompletion|SubagentSpawnCompletionMergesAndWaitFinalizesRunningRow)$'` passed; `rtk timeout 120s node --test web/src/views/coding/liveMessagePipeline.test.js` passed; rebuilt `make run RUN_PORT=3061` real browser test showed session `71319753-b88d-4c3b-9593-5a9a05162d85` rendering `Finished waiting for Planck.` and session `475782f5-f73d-497b-9350-818be4aad4cc` preserving assistant order across refresh.
+- Open follow-up items: none for the verified `/chat` scenarios; any remaining issues would need a new reproducible case.
+
+- Scope: normalized assistant source identity across delta/completion events, preserved first-delta timing per assistant item, and deduped adjacent identical assistant commentary bubbles in the canonical `/chat` timeline.
+- Files or subsystems touched: `internal/provider/codex_appserver_runner.go`, `internal/provider/codex_appserver_test.go`, `internal/service/coding_stream.go`, `internal/service/coding_test.go`, `web/src/lib/coding/messageMerge.js`, `web/src/views/coding/messageView.js`, and `web/src/views/coding/messageView.test.js`.
+- Behavior/runtime effect: assistant delta events now infer a stable source item type when the app-server omits it; assistant persistence tracks the first delta timestamp per source item so final persisted bubbles stay anchored ahead of later terminal rows; and canonical projection collapses adjacent identical assistant bubbles emitted in a tight window. Real browser verification on the rebuilt one-origin binary (`http://127.0.0.1:3061/chat`) showed a fresh session (`34655dc7-c00c-4f97-8433-06cff4d5a514`) rendering the opening assistant bubble once, before terminal rows, with the follow-up assistant update remaining separate.
+- Validation status: `rtk timeout 120s go test ./internal/provider -run 'TestMapAppServerEvent_(PreservesAssistantItemIdentity|InfersAssistantItemTypeFromDeltaMethod)$'` passed; `rtk timeout 120s go test ./internal/service -run 'TestResolveStreamAssistantRecords_(PreservesKnownTimestampsOnCountMismatch|PrefersFirstDeltaTimestampForCompletedAssistant|PreservesStreamTimestamps)$'` passed; `rtk timeout 120s npm --prefix web run test:unit` passed; rebuilt binary + Playwright browser run against `http://127.0.0.1:3061/chat` completed with the duplicate opening assistant bubble removed.
+- Open follow-up items: dev-mode frontend on `3051` still attempts websocket connections against the Vite origin instead of the backend origin; that transport bug is separate from the fixed `/chat` bubble-ordering issue.
+
+- Scope: added full timeline regression coverage for the `/chat` bubble-order bug so persisted assistant rows are locked around terminal activity in the rendered canonical timeline.
+- Files or subsystems touched: `web/src/views/coding/messageView.test.js`.
+- Behavior/runtime effect: coverage now asserts the rendered canonical timeline preserves `assistant -> terminal -> assistant` ordering after live-to-persisted merge, preventing future regressions that would collapse both assistant bubbles to the tail of the turn.
+- Validation status: `rtk timeout 120s node --test web/src/views/coding/messageView.test.js` passed.
+- Open follow-up items: none.
+
+- Scope: tightened `/chat` live assistant stream merge rules so source-identified assistant commentary opens its own bubble instead of being absorbed into a generic pending placeholder.
+- Files or subsystems touched: `web/src/views/CodingView.svelte`, `web/src/views/coding/assistantStreamState.js`, and `web/src/views/coding/assistantStreamState.test.js`.
+- Behavior/runtime effect: live assistant events that already carry `source_turn_id`/`source_item_id` identity now only update the matching assistant stream row; if no identity-matched row exists, the UI creates a new assistant bubble instead of reusing an empty generic placeholder, reducing pre-persistence bubble merging during active streaming.
+- Validation status: `rtk timeout 120s node --test web/src/views/coding/assistantStreamState.test.js` passed; `rtk timeout 120s npm --prefix web run test:unit` passed.
+- Open follow-up items: none.
+
+- Scope: stabilized `/chat` assistant bubble ordering at turn completion so streamed commentary no longer bunches at the end of the timeline after terminal/runtime bubbles.
+- Files or subsystems touched: `internal/service/coding_stream.go` and `internal/service/coding_test.go`.
+- Behavior/runtime effect: when normalized persisted assistant parts do not have a 1:1 count match with streamed assistant parts, CodexSess now reuses the best available streamed timestamps instead of assigning a fresh `time.Now()` to every assistant bubble; this keeps assistant commentary ordered near its original stream time relative to terminal bubbles.
+- Validation status: `rtk timeout 120s go test ./internal/service -run 'TestResolveStreamAssistant'` passed; `rtk timeout 120s npm --prefix web run test:unit` passed.
+- Open follow-up items: frontend live assistant fallback-by-actor heuristics were not changed in this patch and should only be revisited if a separate repro shows bubble merging before persistence/final reload.
+
 ## 2026-04-02
 
 - Scope: stabilized `terminalInteraction` visibility and preserved streamed assistant commentary timing so transient live rows no longer disappear or collapse unnaturally at turn completion.

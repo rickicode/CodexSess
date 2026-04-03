@@ -849,11 +849,12 @@ function parseSubagentEventFromPayload(payload) {
   if (toolName === 'spawn_agent') {
     title = nickname ? `Spawned ${nickname}${agentType ? ` [${agentType}]` : ''}` : 'Spawned subagent';
   } else if (toolName === 'wait_agent' || toolName === 'wait') {
+    const waitTargetLabel = nickname
+      ? `${nickname}${agentType ? ` [${agentType}]` : ''}`
+      : (idsWithHints.length === 1 ? idsWithHints[0] : (idsWithHints.length > 1 ? `${idsWithHints.length} agents` : targetID));
     title = isCompleted
-      ? 'Subagent wait completed'
-      : (nickname
-        ? `Waiting ${nickname}${agentType ? ` [${agentType}]` : ''}`
-        : (idsWithHints.length === 1 ? `Waiting ${idsWithHints[0]}` : (idsWithHints.length > 1 ? `Waiting ${idsWithHints.length} agents` : 'Waiting for agents')));
+      ? (waitTargetLabel ? `Finished waiting for ${waitTargetLabel}` : 'Subagent wait completed')
+      : (waitTargetLabel ? `Waiting ${waitTargetLabel}` : 'Waiting for agents');
   } else if (toolName === 'send_input') {
     title = 'Sent input to subagent';
   } else if (toolName === 'resume_agent') {

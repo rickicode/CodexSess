@@ -736,6 +736,37 @@ func TestMapAppServerEvent_PreservesAssistantItemIdentity(t *testing.T) {
 	}
 }
 
+func TestMapAppServerEvent_InfersAssistantItemTypeFromDeltaMethod(t *testing.T) {
+	out := ChatResult{}
+	var captured []ChatEvent
+
+	evt := rpcEnvelope{
+		Method: "item/agentMessage/delta",
+		Params: mustJSON(map[string]any{
+			"threadId":  "thread-chat-1",
+			"turnId":    "turn-chat-1",
+			"itemId":    "item-assistant-1",
+			"sequence":  17,
+			"createdAt": "2026-04-02T10:11:12Z",
+			"delta":     "hello",
+		}),
+	}
+
+	err := mapAppServerEvent(evt, &out, "chat", func(event ChatEvent) error {
+		captured = append(captured, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("mapAppServerEvent: %v", err)
+	}
+	if len(captured) != 1 {
+		t.Fatalf("expected one event, got %d", len(captured))
+	}
+	if got := captured[0].SourceItemType; got != "agent_message" {
+		t.Fatalf("expected source item type to be inferred as agent_message, got %#v", captured[0])
+	}
+}
+
 func TestMapAppServerEvent_PreservesCompletedToolIdentity(t *testing.T) {
 	out := ChatResult{}
 	var captured []ChatEvent

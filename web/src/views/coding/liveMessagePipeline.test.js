@@ -141,7 +141,7 @@ test("parseSubagentEventFromPayload marks completed wait_agent as done", () => {
   assert.ok(parsed);
   assert.equal(parsed.toolName, "wait_agent");
   assert.equal(parsed.status, "done");
-  assert.equal(parsed.title, "Subagent wait completed");
+  assert.match(parsed.title, /^Finished waiting for /);
 });
 
 test("parseSubagentEventFromPayload maps subagent thread.started to a subagent lifecycle row", () => {

@@ -56,11 +56,7 @@ func (s *Server) handleWebCodingMessages(w http.ResponseWriter, r *http.Request)
 		canonical := sanitizeCompactViewRows(builder.Snapshot())
 		if compactSnapshotNeedsCanonicalRebuild(rows) || compactSnapshotIsIncomplete(rows, canonical) {
 			rows = canonical
-			if err := s.svc.Store.ReplaceCodingViewMessages(r.Context(), sessionID, "compact", canonical); err == nil {
-				if encoded, marshalErr := json.Marshal(canonical); marshalErr == nil {
-					_ = s.svc.Store.UpsertCodingMessageSnapshot(r.Context(), sessionID, "compact", string(encoded))
-				}
-			}
+			_ = s.persistCompactCodingView(r.Context(), sessionID, "compact", canonical)
 		}
 	}
 	oldestID := ""
@@ -79,23 +75,45 @@ func (s *Server) handleWebCodingMessages(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+func (s *Server) persistCompactCodingView(ctx context.Context, sessionID, viewMode string, rows []map[string]any) error {
+	sanitized := sanitizeCompactViewRows(rows)
+	if err := s.svc.Store.ReplaceCodingViewMessages(ctx, sessionID, viewMode, sanitized); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		return err
+	}
+	return s.svc.Store.UpsertCodingMessageSnapshot(ctx, sessionID, viewMode, string(encoded))
+}
+
+func (s *Server) rebuildCompactCodingViewFromRawHistory(ctx context.Context, sessionID, viewMode string) ([]map[string]any, error) {
+	history, err := s.svc.Store.ListCodingMessages(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	builder := newCodingCompactBuilder()
+	builder.SeedFromRawMessages(history)
+	snapshot := sanitizeCompactViewRows(builder.Snapshot())
+	if len(snapshot) == 0 {
+		return []map[string]any{}, nil
+	}
+	if err := s.persistCompactCodingView(ctx, sessionID, viewMode, snapshot); err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
 func (s *Server) loadCompactCodingMessagesPage(ctx context.Context, sessionID, viewMode string, limit int, beforeID string) ([]map[string]any, bool, string, error) {
 	if rows, hasMore, err := s.svc.Store.ListCodingViewMessagesPage(ctx, sessionID, viewMode, limit, beforeID); err != nil {
 		return nil, false, "", err
 	} else if len(rows) > 0 {
 		if session, sessionErr := s.svc.Store.GetCodingSession(ctx, sessionID); sessionErr == nil && compactRowsAreStale(rows, session.LastMessageAt) {
-			if err := s.svc.Store.ReplaceCodingViewMessages(ctx, sessionID, viewMode, []map[string]any{}); err == nil {
-				if encoded, marshalErr := json.Marshal([]map[string]any{}); marshalErr == nil {
-					_ = s.svc.Store.UpsertCodingMessageSnapshot(ctx, sessionID, viewMode, string(encoded))
-				}
-			}
+			_ = s.persistCompactCodingView(ctx, sessionID, viewMode, []map[string]any{})
 		} else {
 			if fullRows, fullErr := s.svc.Store.ListCodingViewMessages(ctx, sessionID, viewMode); fullErr == nil && compactRowsNeedSanitization(fullRows) {
 				sanitized := sanitizeCompactViewRows(fullRows)
-				if persistErr := s.svc.Store.ReplaceCodingViewMessages(ctx, sessionID, viewMode, sanitized); persistErr == nil {
-					if encoded, err := json.Marshal(sanitized); err == nil {
-						_ = s.svc.Store.UpsertCodingMessageSnapshot(ctx, sessionID, viewMode, string(encoded))
-					}
+				if persistErr := s.persistCompactCodingView(ctx, sessionID, viewMode, sanitized); persistErr == nil {
 					if refreshed, refreshedHasMore, refreshedErr := s.svc.Store.ListCodingViewMessagesPage(ctx, sessionID, viewMode, limit, beforeID); refreshedErr == nil {
 						return refreshed, refreshedHasMore, "canonical", nil
 					}
@@ -113,35 +131,22 @@ func (s *Server) loadCompactCodingMessagesPage(ctx context.Context, sessionID, v
 			return nil, false, "", fmt.Errorf("stored coding snapshot is invalid")
 		}
 		snapshot = sanitizeCompactViewRows(snapshot)
-		if encoded, err := json.Marshal(snapshot); err == nil {
-			_ = s.svc.Store.UpsertCodingMessageSnapshot(ctx, sessionID, viewMode, string(encoded))
-		}
+		_ = s.persistCompactCodingView(ctx, sessionID, viewMode, snapshot)
 		if len(snapshot) > 0 {
-			if persistErr := s.svc.Store.ReplaceCodingViewMessages(ctx, sessionID, viewMode, snapshot); persistErr == nil {
-				if rows, hasMore, err := s.svc.Store.ListCodingViewMessagesPage(ctx, sessionID, viewMode, limit, beforeID); err == nil && len(rows) > 0 {
-					return rows, hasMore, "canonical", nil
-				}
+			if rows, hasMore, err := s.svc.Store.ListCodingViewMessagesPage(ctx, sessionID, viewMode, limit, beforeID); err == nil && len(rows) > 0 {
+				return rows, hasMore, "canonical", nil
 			}
 			page, hasMore := paginateCodingSnapshot(snapshot, limit, beforeID)
 			return page, hasMore, "snapshot", nil
 		}
 	}
 
-	history, err := s.svc.Store.ListCodingMessages(ctx, sessionID)
+	snapshot, err := s.rebuildCompactCodingViewFromRawHistory(ctx, sessionID, viewMode)
 	if err != nil {
 		return nil, false, "", err
 	}
-	builder := newCodingCompactBuilder()
-	builder.SeedFromRawMessages(history)
-	snapshot := sanitizeCompactViewRows(builder.Snapshot())
 	if len(snapshot) == 0 {
 		return []map[string]any{}, false, "canonical", nil
-	}
-	if err := s.svc.Store.ReplaceCodingViewMessages(ctx, sessionID, viewMode, snapshot); err != nil {
-		return nil, false, "", err
-	}
-	if encoded, err := json.Marshal(snapshot); err == nil {
-		_ = s.svc.Store.UpsertCodingMessageSnapshot(ctx, sessionID, viewMode, string(encoded))
 	}
 	if rows, hasMore, err := s.svc.Store.ListCodingViewMessagesPage(ctx, sessionID, viewMode, limit, beforeID); err == nil && len(rows) > 0 {
 		return rows, hasMore, "canonical", nil
@@ -277,16 +282,7 @@ func (s *Server) handleWebCodingMessageSnapshot(w http.ResponseWriter, r *http.R
 			decoded = canonical
 		}
 	}
-	if err := s.svc.Store.ReplaceCodingViewMessages(r.Context(), sessionID, viewMode, decoded); err != nil {
-		respondSanitizedCodingError(w, 500, "runtime_unavailable", "runtime_unavailable", err, true)
-		return
-	}
-	encoded, err := json.Marshal(decoded)
-	if err != nil {
-		respondSanitizedCodingError(w, 500, "runtime_unavailable", "runtime_unavailable", err, true)
-		return
-	}
-	if err := s.svc.Store.UpsertCodingMessageSnapshot(r.Context(), sessionID, viewMode, string(encoded)); err != nil {
+	if err := s.persistCompactCodingView(r.Context(), sessionID, viewMode, decoded); err != nil {
 		respondSanitizedCodingError(w, 500, "runtime_unavailable", "runtime_unavailable", err, true)
 		return
 	}

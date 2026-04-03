@@ -50,10 +50,7 @@ func (s *Server) handleWebCodingMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	rows = sanitizeCompactViewRows(rows)
-	if history, err := s.svc.Store.ListCodingMessages(r.Context(), sessionID); err == nil {
-		builder := newCodingCompactBuilder()
-		builder.SeedFromRawMessages(history)
-		canonical := sanitizeCompactViewRows(builder.Snapshot())
+	if canonical, err := s.buildCanonicalCompactRowsFromRawHistory(r.Context(), sessionID); err == nil {
 		if compactSnapshotNeedsCanonicalRebuild(rows) || compactSnapshotIsIncomplete(rows, canonical) {
 			rows = canonical
 			_ = s.persistCompactCodingView(r.Context(), sessionID, "compact", canonical)
@@ -88,13 +85,10 @@ func (s *Server) persistCompactCodingView(ctx context.Context, sessionID, viewMo
 }
 
 func (s *Server) rebuildCompactCodingViewFromRawHistory(ctx context.Context, sessionID, viewMode string) ([]map[string]any, error) {
-	history, err := s.svc.Store.ListCodingMessages(ctx, sessionID)
+	snapshot, err := s.buildCanonicalCompactRowsFromRawHistory(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	builder := newCodingCompactBuilder()
-	builder.SeedFromRawMessages(history)
-	snapshot := sanitizeCompactViewRows(builder.Snapshot())
 	if len(snapshot) == 0 {
 		return []map[string]any{}, nil
 	}
@@ -102,6 +96,16 @@ func (s *Server) rebuildCompactCodingViewFromRawHistory(ctx context.Context, ses
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+func (s *Server) buildCanonicalCompactRowsFromRawHistory(ctx context.Context, sessionID string) ([]map[string]any, error) {
+	history, err := s.svc.Store.ListCodingMessages(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	builder := newCodingCompactBuilder()
+	builder.SeedFromRawMessages(history)
+	return sanitizeCompactViewRows(builder.Snapshot()), nil
 }
 
 func (s *Server) loadCompactCodingMessagesPage(ctx context.Context, sessionID, viewMode string, limit int, beforeID string) ([]map[string]any, bool, string, error) {
@@ -272,10 +276,7 @@ func (s *Server) handleWebCodingMessageSnapshot(w http.ResponseWriter, r *http.R
 		return
 	}
 	decoded = sanitizeCompactViewRows(decoded)
-	if history, err := s.svc.Store.ListCodingMessages(r.Context(), sessionID); err == nil {
-		builder := newCodingCompactBuilder()
-		builder.SeedFromRawMessages(history)
-		canonical := sanitizeCompactViewRows(builder.Snapshot())
+	if canonical, err := s.buildCanonicalCompactRowsFromRawHistory(r.Context(), sessionID); err == nil {
 		if compactSnapshotNeedsCanonicalRebuild(decoded) || compactSnapshotIsIncomplete(decoded, canonical) {
 			decoded = canonical
 		}

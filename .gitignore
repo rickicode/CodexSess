@@ -1,5 +1,6 @@
 .codex/
 .codexsess/
+.worktrees/
 tmp/
 web/node_modules/
 web/dist/

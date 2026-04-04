@@ -106,6 +106,27 @@
     hiddenRenderedMessagesCount,
     isViewportNearBottom
   } from './coding/chatViewport.js';
+  import {
+    computeEffectiveViewStatus,
+    computeStopButtonLabel,
+    createSendFailureState,
+    createSendFinallyState,
+    createSendSuccessState,
+    createRunStartState,
+    createStopRejectedState,
+    createStopRequestState,
+    createStopSettledState,
+  } from './coding/runStateMachine.js';
+  import {
+    sendWSControlCommand as sendWSControlCommandWithTransport,
+    streamChatViaWebSocket as streamChatViaWebSocketWithTransport,
+  } from './coding/streamTransport.js';
+  import {
+    cancelStreamingFlow,
+  } from './coding/stopOrchestration.js';
+  import {
+    completeSendFlow,
+  } from './coding/sendCompletion.js';
 
   let sessions = $state([]);
   let activeSessionID = $state('');
@@ -751,6 +772,18 @@
     return true;
   }
 
+  function applyRunStatePatch(patch = {}) {
+    const next = patch && typeof patch === 'object' ? patch : {};
+    if ('sending' in next) sending = next.sending;
+    if ('streamingPending' in next) streamingPending = next.streamingPending;
+    if ('backgroundProcessing' in next) backgroundProcessing = next.backgroundProcessing;
+    if ('stopRequested' in next) stopRequested = next.stopRequested;
+    if ('forceStopArmed' in next) forceStopArmed = next.forceStopArmed;
+    if ('expectedWSDetach' in next) expectedWSDetach = next.expectedWSDetach;
+    if ('composerLockedUntilAssistant' in next) composerLockedUntilAssistant = next.composerLockedUntilAssistant;
+    if ('viewStatus' in next) viewStatus = next.viewStatus;
+  }
+
   function appendStreamEventMessage(evt) {
     if (!evt) return;
     const streamType = String(evt?.stream_type || evt?.payload?.stream_type || '').trim().toLowerCase();
@@ -1092,20 +1125,23 @@
   }
 
   let stopButtonLabel = $derived.by(() => {
-    if (!(sending || backgroundProcessing)) return 'Send';
-    if (forceStopArmed) return 'Force Stop';
-    return 'Stop';
+    return computeStopButtonLabel({
+      sending,
+      backgroundProcessing,
+      stopRequested,
+      forceStopArmed
+    });
   });
 
   let effectiveViewStatus = $derived.by(() => {
-    const recoveryStatus = currentRecoveryStatus(messages);
-    if (stopRequested) {
-      return 'Stopping...';
-    }
-    if (sending || backgroundProcessing) {
-      return recoveryStatus || 'Streaming...';
-    }
-    return viewStatus;
+    return computeEffectiveViewStatus({
+      sending,
+      backgroundProcessing,
+      stopRequested,
+      forceStopArmed,
+      recoveryStatus: currentRecoveryStatus(messages),
+      viewStatus
+    });
   });
 
   function renderedMessagesForView() {
@@ -2148,18 +2184,10 @@
     messages = [...messages, pendingMessage];
     ensureStreamAssistantPlaceholder(liveAssistantActor, sendStartedAt);
     autoFollowBottom = true;
-    sending = true;
-    stopRequested = false;
-    forceStopArmed = false;
-    expectedWSDetach = false;
-    backgroundProcessing = false;
+    applyRunStatePatch(createRunStartState());
     await tick();
     scrollMessagesToBottom(true);
-
-    streamingPending = true;
-    composerLockedUntilAssistant = true;
     draftMessage = '';
-    viewStatus = 'Streaming...';
     let monitorAfterSend = false;
     try {
       let donePayload = null;
@@ -2195,36 +2223,41 @@
         throw new Error('Streaming ended before completion.');
       }
       flushCompactSnapshotQueue();
-
-      const userMessage = donePayload?.user;
-      streamingPending = false;
-      if (userMessage) {
-        mergePendingUserMessage(pendingID, userMessage);
-      } else {
-        messages = messages.filter((item) => item?.id !== pendingID);
-      }
-      mergeDoneAssistantRows(donePayload);
       messageLoadSource = 'canonical';
-      clearSessionDraft(draftStoragePrefix, session.id);
-      clearCompactSnapshotPersistTimer();
-      composerLockedUntilAssistant = false;
-
-      if (donePayload?.session?.id) {
-        const updated = donePayload.session;
-        sessions = sessions.map((item) => (item.id === updated.id ? updated : item));
-        sessions = [...sessions].sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')));
-        syncComposerControlsFromSession(updated, { preserveMode: true });
-      }
-      await loadMessages(session.id, { silent: true, preserveViewport: false, preserveLoadedHistory: historyExpandedManually });
-      if (hasPendingAssistantPlaceholder(liveAssistantActor) || !hasVisibleOutcomeAfterLatestUser(messages)) {
-        await waitForSettledVisibleOutcome(session.id, { actor: liveAssistantActor });
-      } else if (!hasSettledAssistantSince(sendStartedAt, liveAssistantActor)) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        await loadMessages(session.id, { silent: true, preserveViewport: false, preserveLoadedHistory: historyExpandedManually });
-      }
-      await tick();
-      scrollMessagesToBottom();
-      viewStatus = completedViewStatus(messages, { messageActor });
+      streamingPending = false;
+      await completeSendFlow({
+        donePayload,
+        sessionID: session.id,
+        pendingID,
+        liveAssistantActor,
+        sendStartedAt,
+        historyExpandedManually,
+        draftStoragePrefix,
+        messageActor,
+        applyRunStatePatch,
+        createSendSuccessState,
+        mergePendingUserMessage,
+        removePendingUserMessage: (pendingMessageID) => {
+          messages = messages.filter((item) => item?.id !== pendingMessageID);
+        },
+        mergeDoneAssistantRows,
+        clearSessionDraft,
+        clearCompactSnapshotPersistTimer,
+        updateSessions: (updated) => {
+          sessions = sessions.map((item) => (item.id === updated.id ? updated : item));
+          sessions = [...sessions].sort((a, b) => String(b.last_message_at || '').localeCompare(String(a.last_message_at || '')));
+        },
+        syncComposerControlsFromSession,
+        loadMessages,
+        hasPendingAssistantPlaceholder,
+        hasVisibleOutcomeAfterLatestUser,
+        hasSettledAssistantSince,
+        waitForSettledVisibleOutcome,
+        tick,
+        scrollMessagesToBottom,
+        completedViewStatus,
+        messages,
+      });
       composerError = '';
     } catch (error) {
       flushCompactSnapshotQueue();
@@ -2251,45 +2284,34 @@
       const aborted =
         String(error?.name || '').trim() === 'AbortError' ||
         String(error?.message || '').toLowerCase().includes('aborted');
-      if (busy || detachedBackground) {
-        composerError = '';
-        const inFlight = await refreshBackgroundStatus(session.id, { syncMessages: true }).catch(() => false);
-        if (inFlight) {
-          viewStatus = stopDrivenDetach ? (forceStopArmed ? 'Force stopping...' : 'Stopping...') : 'Streaming...';
-          monitorAfterSend = true;
-        } else if (stopDrivenDetach) {
-          composerLockedUntilAssistant = false;
-          composerError = '';
-          viewStatus = 'Stopped.';
-          backgroundProcessing = false;
-        } else {
-          composerLockedUntilAssistant = false;
-          composerError = aborted ? '' : failReason;
-          viewStatus = aborted ? (stopRequested ? 'Stopped.' : 'Streaming canceled.') : failReason;
-          backgroundProcessing = false;
-        }
-      } else if (stopRequested) {
-        composerLockedUntilAssistant = false;
-        composerError = '';
-        viewStatus = 'Stopped.';
-        backgroundProcessing = false;
-      } else {
-        composerLockedUntilAssistant = false;
-        composerError = aborted ? '' : failReason;
-        viewStatus = aborted ? (stopRequested ? 'Stopped.' : 'Streaming canceled.') : failReason;
-        backgroundProcessing = false;
+      const inFlight = (busy || detachedBackground)
+        ? await refreshBackgroundStatus(session.id, { syncMessages: true }).catch(() => false)
+        : false;
+      const failureState = createSendFailureState({
+        busy,
+        detachedBackground,
+        stopDrivenDetach,
+        forceStopArmed,
+        inFlight,
+        stopRequested,
+        aborted,
+        failReason,
+      });
+      applyRunStatePatch(failureState);
+      composerError = failureState.composerError ?? composerError;
+      if ('backgroundProcessing' in failureState) {
+        backgroundProcessing = failureState.backgroundProcessing;
       }
+      monitorAfterSend = Boolean(failureState.monitorAfterSend);
       streamingPending = false;
     } finally {
-      sending = false;
-      if (streamingPending) streamingPending = false;
+      applyRunStatePatch(createSendFinallyState({
+        stopRequested,
+        monitorAfterSend
+      }));
       if (!stopRequested && monitorAfterSend) {
         startBackgroundMonitor(session.id);
-      } else {
-        backgroundProcessing = false;
       }
-      stopRequested = false;
-      forceStopArmed = false;
     }
   }
 
@@ -2308,51 +2330,29 @@
   }
 
   async function cancelStreaming() {
-    if (!sending && !backgroundProcessing) return;
-    const force = forceStopArmed;
-    stopRequested = true;
-    if (force) {
-      viewStatus = 'Force stopping...';
-    } else {
-      forceStopArmed = true;
-      viewStatus = 'Stopping... press Force Stop to kill immediately.';
-    }
     const session = activeSession();
-    if (session?.id) {
-      const stopResponse = await requestStop(session.id, force);
-      if (stopResponse && stopResponse.stopped === false) {
-        stopRequested = false;
-        forceStopArmed = false;
-        expectedWSDetach = false;
-        viewStatus = 'No active run to stop.';
-        return;
-      }
-    }
-    try {
-      if (wsStreamSocket) {
-        expectedWSDetach = true;
-        wsStreamSocket.close();
-      }
-    } catch {
-    }
-    if (session?.id) {
-      viewStatus = 'Stopping...';
-      const settled = await waitForBackgroundSettle(session.id, {
-        timeoutMs: force ? 3000 : 1800,
-        intervalMs: 120
-      }).catch(() => false);
-      if (settled) {
-        sending = false;
-        streamingPending = false;
-        backgroundProcessing = false;
-        composerLockedUntilAssistant = false;
-        forceStopArmed = false;
-        stopRequested = false;
-        expectedWSDetach = false;
-        return;
-      }
-      startBackgroundMonitor(session.id, { intervalMs: 400 });
-    }
+    await cancelStreamingFlow({
+      sending,
+      backgroundProcessing,
+      forceStopArmed,
+      sessionID: session?.id || '',
+      requestStop,
+      closeActiveStream: () => {
+        try {
+          if (wsStreamSocket) {
+            expectedWSDetach = true;
+            wsStreamSocket.close();
+          }
+        } catch {
+        }
+      },
+      waitForBackgroundSettle,
+      startBackgroundMonitor,
+      applyRunStatePatch,
+      createStopRequestState,
+      createStopRejectedState,
+      createStopSettledState,
+    });
   }
 
   function onComposerKeydown(event) {
@@ -2388,85 +2388,11 @@
   }
 
   async function sendWSControlCommand(payload, { waitFor = [], laneHint = '' } = {}) {
-    const sid = String(payload?.session_id || '').trim();
-    if (!sid) throw new Error('session_id is required');
-    const requestID = String(payload?.request_id || nextWSRequestID(String(payload?.type || 'ws'))).trim();
-    const candidates = buildWSURLCandidates('/api/coding/ws');
-    if (candidates.length === 0) {
-      throw new Error('WebSocket endpoint unavailable.');
-    }
-    const expected = new Set((Array.isArray(waitFor) ? waitFor : []).map((item) => String(item || '').trim().toLowerCase()).filter(Boolean));
-    return new Promise((resolve, reject) => {
-      let attemptIndex = 0;
-      let settled = false;
-      let ws = null;
-      const finish = (fn, value) => {
-        if (settled) return;
-        settled = true;
-        try {
-          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
-        } catch {
-        }
-        fn(value);
-      };
-      const connect = () => {
-        if (settled) return;
-        if (attemptIndex >= candidates.length) {
-          finish(reject, new Error('WebSocket control command failed.'));
-          return;
-        }
-        ws = new WebSocket(candidates[attemptIndex]);
-        attemptIndex += 1;
-        let didOpen = false;
-        ws.onopen = () => {
-          didOpen = true;
-          try {
-            ws.send(JSON.stringify({ ...payload, request_id: requestID }));
-          } catch (error) {
-            finish(reject, error instanceof Error ? error : new Error('Failed to send control command.'));
-          }
-        };
-        ws.onmessage = (event) => {
-          let evt = {};
-          try {
-            evt = JSON.parse(String(event?.data || '{}'));
-          } catch {
-            return;
-          }
-          const eventType = String(evt?.event || evt?.event_type || '').trim().toLowerCase();
-          const evtRequestID = String(evt?.request_id || evt?.payload?.request_id || '').trim();
-          const evtLane = String(evt?.lane || evt?.payload?.lane || '').trim().toLowerCase();
-          if (evtRequestID && evtRequestID !== requestID) return;
-          if (laneHint && evtLane && evtLane !== laneHint) return;
-          if (eventType === 'session.error') {
-            const msg = String(evt?.message || evt?.payload?.message || 'Command failed.');
-            finish(reject, new Error(msg));
-            return;
-          }
-          if (eventType === 'session.duplicate_request') {
-            finish(resolve, evt);
-            return;
-          }
-          if (expected.size === 0 || expected.has(eventType)) {
-            finish(resolve, evt);
-          }
-        };
-        ws.onerror = () => {
-          try {
-            ws.close();
-          } catch {
-          }
-        };
-        ws.onclose = () => {
-          if (settled) return;
-          if (!didOpen) {
-            connect();
-            return;
-          }
-          finish(reject, new Error('WebSocket control command closed before completion.'));
-        };
-      };
-      connect();
+    return sendWSControlCommandWithTransport(payload, {
+      waitFor,
+      laneHint,
+      buildWSURLCandidates,
+      nextWSRequestID,
     });
   }
 
@@ -2498,126 +2424,17 @@
   }
 
   function streamChatViaWebSocket(payload, onEvent) {
-    return new Promise((resolve, reject) => {
-      const candidates = buildWSURLCandidates('/api/coding/ws');
-      if (candidates.length === 0) {
-        reject(new Error('WebSocket endpoint unavailable.'));
-        return;
-      }
-
-      let settled = false;
-      let attemptIndex = 0;
-      let ws = null;
-      let startedAck = false;
-      let runtimeStatusDoneTimer = null;
-      const cancelRuntimeStatusDoneTimer = () => {
-        if (!runtimeStatusDoneTimer) return;
-        clearTimeout(runtimeStatusDoneTimer);
-        runtimeStatusDoneTimer = null;
-      };
-      const requestID = nextWSRequestID('send');
-      const expectedSessionID = String(payload?.session_id || '').trim();
-      const finish = (fn, value) => {
-        if (settled) return;
-        settled = true;
-        cancelRuntimeStatusDoneTimer();
+    return streamChatViaWebSocketWithTransport(payload, onEvent, {
+      buildWSURLCandidates,
+      nextWSRequestID,
+      setActiveStreamSocket: (ws) => {
+        wsStreamSocket = ws;
+      },
+      clearActiveStreamSocket: (ws) => {
         if (wsStreamSocket === ws) {
           wsStreamSocket = null;
         }
-        try {
-          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-            ws.close();
-          }
-        } catch {
-        }
-        fn(value);
-      };
-
-      const connectAttempt = () => {
-        if (settled) return;
-        if (attemptIndex >= candidates.length) {
-          finish(reject, new Error('WebSocket stream error.'));
-          return;
-        }
-        const wsURL = candidates[attemptIndex];
-        attemptIndex += 1;
-        ws = new WebSocket(wsURL);
-        wsStreamSocket = ws;
-        let didOpen = false;
-
-        ws.onopen = () => {
-          didOpen = true;
-          try {
-            ws.send(JSON.stringify({
-              type: 'session.send',
-              request_id: requestID,
-              session_id: expectedSessionID,
-              content: payload.content,
-              model: payload.model,
-              reasoning_level: payload.reasoning_level,
-              work_dir: payload.work_dir,
-              sandbox_mode: payload.sandbox_mode,
-              command: 'chat',
-              last_seen_event_seq: Number(payload?.last_seen_event_seq || 0)
-            }));
-          } catch (err) {
-            finish(reject, err instanceof Error ? err : new Error('Failed to send websocket payload.'));
-          }
-        };
-
-        ws.onmessage = (event) => {
-          let evt = {};
-          try {
-            evt = JSON.parse(String(event?.data || '{}'));
-          } catch {
-            return;
-          }
-          const eventType = String(evt?.event || evt?.event_type || '').trim().toLowerCase();
-          if (runtimeStatusDoneTimer) {
-            if (eventType === 'session.stream' || eventType === 'session.snapshot' || eventType === 'session.started') {
-              cancelRuntimeStatusDoneTimer();
-            }
-          }
-          if (String(evt?.session_id || '').trim() && String(evt?.session_id || '').trim() !== expectedSessionID) {
-            return;
-          }
-          if (onEvent) onEvent(evt);
-          if (eventType === 'session.started') {
-            startedAck = true;
-            return;
-          }
-          if (eventType === 'session.done') {
-            cancelRuntimeStatusDoneTimer();
-            finish(resolve, evt);
-            return;
-          }
-          if (eventType === 'session.error') {
-            finish(reject, new Error(String(evt?.message || evt?.payload?.message || 'Streaming failed.')));
-          }
-        };
-
-        ws.onerror = () => {
-          try {
-            ws.close();
-          } catch {
-          }
-        };
-
-        ws.onclose = (event) => {
-          if (settled) return;
-          if (!didOpen) {
-            connectAttempt();
-            return;
-          }
-          if (startedAck) {
-            finish(reject, new Error('websocket_detached_background'));
-            return;
-          }
-          finish(reject, new Error('WebSocket connection failed before run start.'));
-        };
-      };
-
-      connectAttempt();
+      },
     });
   }
 

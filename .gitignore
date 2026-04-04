@@ -15,4 +15,4 @@ internal/webui/assets/assets/
 assets/assets/*
 .omx/
 .playwright-mcp/
-docs/
+docs/superpowers/

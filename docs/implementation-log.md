@@ -11,6 +11,12 @@ tags:
 
 ## 2026-04-03
 
+- Scope: added a reusable markdown smoke-test checklist for `/chat` post-merge verification.
+- Files or subsystems touched: `docs/chat-smoke-test-checklist.md`.
+- Behavior/runtime effect: no product/runtime behavior changed; the repository now includes a documented manual verification template for `/chat` session bootstrap, assistant/exec/subagent streaming, stop handling, disconnect recovery, session switching, and canonical history checks.
+- Validation status: template written and reviewed in-session; no automated verification required for this docs-only addition.
+- Open follow-up items: update the checklist commands if future `/chat` test file names or verification scope change.
+
 - Scope: carried subagent identity into wait-completion bubbles and re-verified that assistant timeline ordering stays stable after page refresh in the rebuilt one-origin `/chat` app.
 - Files or subsystems touched: `internal/httpapi/server_coding_compact.go`, `internal/httpapi/server_coding_compact_test.go`, `web/src/views/coding/liveMessagePipeline.test.js`, and final rebuilt `/chat` verification flows.
 - Behavior/runtime effect: compact/canonical subagent rows now infer nicknames from additional prompt forms such as `Nickname Anda: ...` and `You are nicknamed ...`, allowing `wait_agent` completion rows to render as `Finished waiting for <nickname>` instead of the generic `Subagent wait completed`; rebuilt `make run RUN_PORT=3061` verification also confirmed that assistant bubbles did not collapse to the end of the timeline after refreshing the page in the tested `/chat` scenario.

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +91,105 @@ func TestCodingCompactBuilder_AssistantIdentitySeparatesItems(t *testing.T) {
 	}
 	if got := stringFromAny(snapshot[1]["source_item_id"]); got != "item-assistant-2" {
 		t.Fatalf("expected second assistant source_item_id, got %q", got)
+	}
+}
+
+func TestBuildCompactRowFromChatEvent_AssistantDeltaUsesCanonicalFields(t *testing.T) {
+	builder := newCodingCompactBuilder()
+	createdAt := time.Date(2026, 4, 3, 10, 0, 0, 0, time.UTC)
+
+	evt := provider.ChatEvent{
+		Type:            "delta",
+		Text:            "hello",
+		Actor:           "chat",
+		SourceEventType: "item/delta",
+		SourceThreadID:  "thread-1",
+		SourceTurnID:    "turn-1",
+		SourceItemID:    "item-1",
+		SourceItemType:  "agent_message",
+		EventSeq:        42,
+	}
+
+	row, ok := buildCompactRowFromChatEvent(builder, evt, createdAt)
+	if !ok {
+		t.Fatalf("expected compact row")
+	}
+	if got := strings.TrimSpace(stringFromAny(row["role"])); got != "assistant" {
+		t.Fatalf("role = %q, want assistant", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(row["content"])); got != "hello" {
+		t.Fatalf("content = %q, want hello", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(row["source_turn_id"])); got != "turn-1" {
+		t.Fatalf("source_turn_id = %q, want turn-1", got)
+	}
+	if got := intFromAny(row["event_seq"]); got != 42 {
+		t.Fatalf("event_seq = %d, want 42", got)
+	}
+}
+
+func TestBuildCompactRowFromChatEvent_ExecEventProducesExecRow(t *testing.T) {
+	builder := newCodingCompactBuilder()
+	createdAt := time.Date(2026, 4, 3, 10, 1, 0, 0, time.UTC)
+
+	raw := `{"type":"item.started","item":{"type":"command_execution","command":"rtk git status --short"}}`
+	row, ok := buildCompactRowFromChatEvent(builder, provider.ChatEvent{
+		Type:  "raw_event",
+		Text:  raw,
+		Actor: "chat",
+	}, createdAt)
+	if !ok {
+		t.Fatalf("expected compact row")
+	}
+	if got := strings.TrimSpace(stringFromAny(row["role"])); got != "exec" {
+		t.Fatalf("role = %q, want exec", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(row["exec_command"])); got != "rtk git status --short" {
+		t.Fatalf("exec_command = %q", got)
+	}
+}
+
+func TestBuildCompactRowFromChatEvent_SubagentEventProducesSubagentRow(t *testing.T) {
+	builder := newCodingCompactBuilder()
+	createdAt := time.Date(2026, 4, 3, 10, 2, 0, 0, time.UTC)
+
+	raw := `{"type":"item.completed","item":{"type":"function_call","name":"spawn_agent","arguments":"{\"agent_type\":\"explorer\",\"message\":\"inspect backend\"}","output_text":"Spawned Rawls"}}`
+	row, ok := buildCompactRowFromChatEvent(builder, provider.ChatEvent{
+		Type:  "raw_event",
+		Text:  raw,
+		Actor: "chat",
+	}, createdAt)
+	if !ok {
+		t.Fatalf("expected compact row")
+	}
+	if got := strings.TrimSpace(stringFromAny(row["role"])); got != "subagent" {
+		t.Fatalf("role = %q, want subagent", got)
+	}
+	if got := strings.TrimSpace(stringFromAny(row["subagent_tool"])); got != "spawn_agent" {
+		t.Fatalf("subagent_tool = %q", got)
+	}
+}
+
+func TestCompactRowMatchesCanonicalProjectionForSingleEvent(t *testing.T) {
+	builder := newCodingCompactBuilder()
+	evt := provider.ChatEvent{
+		Type:  "activity",
+		Text:  "Command started: rtk git status --short",
+		Actor: "chat",
+	}
+	createdAt := time.Date(2026, 4, 3, 10, 3, 0, 0, time.UTC)
+
+	row, ok := buildCompactRowFromChatEvent(builder, evt, createdAt)
+	if !ok {
+		t.Fatalf("expected compact row")
+	}
+	snapshot := builder.Snapshot()
+	if len(snapshot) == 0 {
+		t.Fatalf("expected canonical snapshot rows")
+	}
+	last := snapshot[len(snapshot)-1]
+	if !reflect.DeepEqual(row, last) {
+		t.Fatalf("live row mismatch\nlive=%#v\ncanonical=%#v", row, last)
 	}
 }
 

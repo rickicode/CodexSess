@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -44,6 +45,33 @@ func newCodingCompactBuilder() *codingCompactBuilder {
 		subagentIndexByKey: make(map[string]int),
 		messages:           make([]map[string]any, 0, 16),
 	}
+}
+
+func buildCompactRowFromChatEvent(builder *codingCompactBuilder, evt provider.ChatEvent, createdAt time.Time) (map[string]any, bool) {
+	if builder == nil {
+		builder = newCodingCompactBuilder()
+	}
+	before := builder.Snapshot()
+	if !builder.Apply(evt, createdAt) {
+		return nil, false
+	}
+	after := builder.Snapshot()
+	return compactRowDiff(before, after)
+}
+
+func compactRowDiff(before, after []map[string]any) (map[string]any, bool) {
+	if len(after) == 0 {
+		return nil, false
+	}
+	if len(after) > len(before) {
+		return after[len(after)-1], true
+	}
+	for i := len(after) - 1; i >= 0; i-- {
+		if i >= len(before) || !reflect.DeepEqual(before[i], after[i]) {
+			return after[i], true
+		}
+	}
+	return nil, false
 }
 
 func (b *codingCompactBuilder) Seed(messages []map[string]any) {

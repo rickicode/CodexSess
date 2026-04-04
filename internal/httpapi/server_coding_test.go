@@ -147,6 +147,132 @@ func TestHandleWebCodingMessages_CompactFallbackBuildsCanonicalFromRawHistory_En
 	}
 }
 
+func TestPersistCompactCodingView_SanitizesAndPersistsBothStores(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "coding-compact-persist-helper.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	sessionID := "sess-persist-helper"
+	if _, err := st.CreateCodingSession(ctx, store.CodingSession{
+		ID:             sessionID,
+		Title:          "Persist Helper",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "workspace-write",
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	s := &Server{svc: &service.Service{Store: st}}
+	rows := []map[string]any{
+		{
+			"id":           "exec-helper-1",
+			"role":         "exec",
+			"exec_command": "rtk go test ./...",
+			"exec_status":  "done",
+			"exec_output":  "SECRET-HELPER-123",
+			"subagent_raw": map[string]any{"secret": "SECRET-SUBAGENT-123"},
+		},
+	}
+
+	if err := s.persistCompactCodingView(ctx, sessionID, "compact", rows); err != nil {
+		t.Fatalf("persistCompactCodingView: %v", err)
+	}
+
+	canonicalRows, _, err := st.ListCodingViewMessagesPage(ctx, sessionID, "compact", 50, "")
+	if err != nil {
+		t.Fatalf("list canonical rows: %v", err)
+	}
+	if len(canonicalRows) != 1 {
+		t.Fatalf("expected 1 canonical row, got %d", len(canonicalRows))
+	}
+	if got := stringFromAny(canonicalRows[0]["exec_output"]); got != "[redacted]" {
+		t.Fatalf("expected sanitized exec output, got %q", got)
+	}
+	if _, exists := canonicalRows[0]["subagent_raw"]; exists {
+		t.Fatalf("expected sanitized row without subagent_raw: %#v", canonicalRows[0])
+	}
+
+	snapshotPayload, ok, err := st.GetCodingMessageSnapshot(ctx, sessionID, "compact")
+	if err != nil {
+		t.Fatalf("get snapshot: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected snapshot persisted")
+	}
+	if strings.Contains(snapshotPayload, "SECRET-HELPER-123") || strings.Contains(snapshotPayload, "SECRET-SUBAGENT-123") {
+		t.Fatalf("expected sanitized snapshot payload, got %s", snapshotPayload)
+	}
+}
+
+func TestRebuildCompactCodingViewFromRawHistory_PersistsCanonicalRows(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "coding-compact-rebuild-helper.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	sessionID := "sess-rebuild-helper"
+	if _, err := st.CreateCodingSession(ctx, store.CodingSession{
+		ID:             sessionID,
+		Title:          "Rebuild Helper",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "workspace-write",
+	}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+
+	now := time.Date(2026, 4, 3, 10, 15, 0, 0, time.UTC)
+	if _, err := st.AppendCodingMessage(ctx, store.CodingMessage{
+		ID:        "msg-user-helper",
+		SessionID: sessionID,
+		Role:      "user",
+		Content:   "hello",
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatalf("append user: %v", err)
+	}
+	if _, err := st.AppendCodingMessage(ctx, store.CodingMessage{
+		ID:        "msg-assistant-helper",
+		SessionID: sessionID,
+		Role:      "assistant",
+		Content:   "world",
+		CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("append assistant: %v", err)
+	}
+
+	s := &Server{svc: &service.Service{Store: st}}
+	rows, err := s.rebuildCompactCodingViewFromRawHistory(ctx, sessionID, "compact")
+	if err != nil {
+		t.Fatalf("rebuildCompactCodingViewFromRawHistory: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 compact rows, got %d", len(rows))
+	}
+	if got := stringFromAny(rows[0]["role"]); got != "user" {
+		t.Fatalf("expected first row user, got %q", got)
+	}
+	if got := stringFromAny(rows[1]["role"]); got != "assistant" {
+		t.Fatalf("expected second row assistant, got %q", got)
+	}
+
+	canonicalRows, _, err := st.ListCodingViewMessagesPage(ctx, sessionID, "compact", 50, "")
+	if err != nil {
+		t.Fatalf("list canonical rows: %v", err)
+	}
+	if len(canonicalRows) != 2 {
+		t.Fatalf("expected canonical rows persisted, got %d", len(canonicalRows))
+	}
+}
+
 func TestHandleWebCodingMessages_RedactsLegacyUnsanitizedExecOutput(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "coding-compact-legacy-redact.db"))
@@ -566,6 +692,57 @@ func TestHandleWebCodingMessages_RePersistsSanitizedSnapshotRows(t *testing.T) {
 	}
 	if strings.Contains(snapshotPayload, "subagent_raw") {
 		t.Fatalf("expected sanitized snapshot without subagent_raw field, got %s", snapshotPayload)
+	}
+}
+
+func TestHandleWebCodingMessages_SnapshotRehydrationStillReturnsCanonicalSource(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(filepath.Join(t.TempDir(), "coding-compact-snapshot-canonical-source.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	sessionID := "sess-snapshot-canonical-source"
+	if _, err := st.CreateCodingSession(ctx, store.CodingSession{
+		ID:             sessionID,
+		Title:          "Snapshot Canonical Source",
+		Model:          "gpt-5.2-codex",
+		ReasoningLevel: "medium",
+		WorkDir:        "~/",
+		SandboxMode:    "workspace-write",
+	}); err != nil {
+		t.Fatalf("create coding session: %v", err)
+	}
+
+	snapshot := `[{"id":"assistant-snap-1","role":"assistant","content":"hello from snapshot","created_at":"2026-04-03T10:00:00Z","updated_at":"2026-04-03T10:00:00Z"}]`
+	if err := st.UpsertCodingMessageSnapshot(ctx, sessionID, "compact", snapshot); err != nil {
+		t.Fatalf("seed compact snapshot: %v", err)
+	}
+
+	s := &Server{svc: &service.Service{Store: st}}
+	req := httptest.NewRequest(http.MethodGet, "/api/coding/messages?session_id="+sessionID+"&view=compact&limit=50", nil)
+	rec := httptest.NewRecorder()
+
+	s.handleWebCodingMessages(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := stringFromAny(body["source"]); got != "canonical" {
+		t.Fatalf("expected source canonical after snapshot rehydration, got %q", got)
+	}
+	items, _ := body["messages"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("expected 1 message after snapshot rehydration, got %d", len(items))
+	}
+	row, _ := items[0].(map[string]any)
+	if got := stringFromAny(row["content"]); got != "hello from snapshot" {
+		t.Fatalf("expected snapshot content preserved, got %q", got)
 	}
 }
 

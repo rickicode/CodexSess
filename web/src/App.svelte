@@ -1127,6 +1127,27 @@
     }
   }
 
+  async function exportAllAccountTokens() {
+    busy = true;
+    try {
+      const payload = await req('/api/accounts/export-tokens');
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const href = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = href;
+      anchor.download = `codexsess-accounts-export-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(href);
+      setStatus('Export tokens berhasil diunduh.', 'success');
+    } catch (error) {
+      setStatus(error.message, 'error');
+    } finally {
+      busy = false;
+    }
+  }
+
   async function restoreAccounts(file) {
     if (!file) return;
     busy = true;
@@ -2000,6 +2021,7 @@
         onSetAccountStatusFilter={setAccountStatusFilter}
         onOpenAddAccountModal={openAddAccountModal}
         onBackupAccounts={backupAllAccounts}
+        onExportAccountTokens={exportAllAccountTokens}
         onRestoreAccounts={restoreAccounts}
         onDeleteRevokedAccounts={deleteRevokedAccounts}
         onUseApiAccount={useAccount}

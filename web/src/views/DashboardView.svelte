@@ -27,6 +27,7 @@
     onSetAccountStatusFilter,
     onOpenAddAccountModal,
     onBackupAccounts,
+    onExportAccountTokens,
     onRestoreAccounts,
     onDeleteRevokedAccounts,
     onUseApiAccount,
@@ -55,6 +56,7 @@
   <div class="panel-actions">
     <button class="btn btn-primary" onclick={onOpenAddAccountModal} disabled={busy}>Add Account</button>
     <button class="btn btn-secondary" onclick={onBackupAccounts} disabled={busy}>Backup All Accounts</button>
+    <button class="btn btn-secondary" onclick={onExportAccountTokens} disabled={busy}>Export Tokens</button>
     <label class="btn btn-secondary btn-file {busy ? 'is-disabled' : ''}">
       Restore Accounts
       <input type="file" accept=".json,application/json" onchange={pickRestoreFile} disabled={busy} />

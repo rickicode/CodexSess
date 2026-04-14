@@ -7,6 +7,7 @@ The format follows Keep a Changelog and uses semantic version tags (`vMAJOR.MINO
 ## [Unreleased]
 
 ### Changed
+- Dashboard accounts now include an `Export Tokens` action that downloads every stored Codex account as a JSON array containing `email`, `access_token`, `refresh_token`, and `id_token`.
 - `/chat` live streaming now emits backend-normalized compact rows for assistant, terminal, and subagent updates, reducing divergence between the active stream and the canonical timeline after reload.
 - `/chat` now preserves streamed assistant bubble timestamps across normalized multi-part replies, preventing commentary bubbles from collapsing to the end of the timeline beneath terminal activity.
 - `/chat` live streaming now keeps source-identified assistant commentary in separate bubbles instead of merging it into a generic pending assistant placeholder.

@@ -9,6 +9,20 @@ tags:
 
 # Implementation Log
 
+## 2026-04-14
+
+- Scope: enforced unique-email export semantics for the raw token export.
+- Files or subsystems touched: `internal/service/accounts_backup.go` and `internal/service/accounts_backup_test.go`.
+- Behavior/runtime effect: `/api/accounts/export-tokens` now guarantees at most one exported row per normalized email, keeping the freshest account record for duplicate emails instead of emitting repeated entries.
+- Validation status: `rtk timeout 120s go test ./internal/service -run 'TestExportAccountTokens_(ReturnsEmailAndTokens|DeduplicatesByEmail)' -count=1` passed; `rtk timeout 120s go test ./internal/httpapi -run 'TestHandleWebExportAccountTokens_ReturnsJSONDownload' -count=1` passed; `rtk timeout 120s npm run build:web` passed from `web/`.
+- Open follow-up items: none.
+
+- Scope: added a dashboard export flow for raw Codex account tokens.
+- Files or subsystems touched: `internal/service/accounts.go`, `internal/service/accounts_backup.go`, `internal/service/accounts_backup_test.go`, `internal/httpapi/server.go`, `internal/httpapi/server_accounts.go`, `internal/httpapi/server_test.go`, `web/src/App.svelte`, and `web/src/views/DashboardView.svelte`.
+- Behavior/runtime effect: the Accounts dashboard now shows an `Export Tokens` action that downloads every stored Codex account as a JSON array containing only `email`, `access_token`, `refresh_token`, and `id_token`; the backend exposes a dedicated `/api/accounts/export-tokens` download endpoint for that export without changing the existing backup/restore payload contract.
+- Validation status: `rtk timeout 120s go test ./internal/service ./internal/httpapi -run 'TestExportAccountTokens_ReturnsEmailAndTokens|TestHandleWebExportAccountTokens_ReturnsJSONDownload' -count=1` passed; `rtk timeout 120s npm run build:web` passed from `web/`.
+- Open follow-up items: no frontend dashboard-specific automated test was added because the current web test suite only covers the coding views.
+
 ## 2026-04-03
 
 - Scope: added a reusable markdown smoke-test checklist for `/chat` post-merge verification.

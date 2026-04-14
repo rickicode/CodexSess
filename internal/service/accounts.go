@@ -57,6 +57,13 @@ type AccountBackupEntry struct {
 	Usage          *store.UsageSnapshot `json:"usage,omitempty"`
 }
 
+type AccountTokenExportEntry struct {
+	Email        string `json:"email"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	IDToken      string `json:"id_token"`
+}
+
 type AccountsBackupPayload struct {
 	Version          string               `json:"version"`
 	ExportedAt       time.Time            `json:"exported_at"`

@@ -66,6 +66,70 @@ func (s *Service) ExportAccountsBackup(ctx context.Context) (AccountsBackupPaylo
 	return payload, nil
 }
 
+func (s *Service) ExportAccountTokens(ctx context.Context) ([]AccountTokenExportEntry, error) {
+	accounts, err := s.Store.ListAccounts(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	type selectedEntry struct {
+		entry    AccountTokenExportEntry
+		freshest time.Time
+	}
+
+	selectFreshest := func(account store.Account) time.Time {
+		if !account.LastUsedAt.IsZero() {
+			return account.LastUsedAt
+		}
+		if !account.CreatedAt.IsZero() {
+			return account.CreatedAt
+		}
+		return account.UpdatedAt
+	}
+
+	byEmail := make(map[string]selectedEntry, len(accounts))
+	for _, account := range accounts {
+		idTokenRaw, err := s.Crypto.Decrypt(account.TokenID)
+		if err != nil {
+			return nil, err
+		}
+		accessTokenRaw, err := s.Crypto.Decrypt(account.TokenAccess)
+		if err != nil {
+			return nil, err
+		}
+		refreshTokenRaw, err := s.Crypto.Decrypt(account.TokenRefresh)
+		if err != nil {
+			return nil, err
+		}
+
+		entry := AccountTokenExportEntry{
+			Email:        strings.TrimSpace(account.Email),
+			AccessToken:  string(accessTokenRaw),
+			RefreshToken: string(refreshTokenRaw),
+			IDToken:      string(idTokenRaw),
+		}
+		key := strings.ToLower(strings.TrimSpace(entry.Email))
+		if key == "" {
+			key = strings.TrimSpace(account.ID)
+		}
+		current := selectedEntry{
+			entry:    entry,
+			freshest: selectFreshest(account),
+		}
+		if existing, exists := byEmail[key]; exists && !current.freshest.After(existing.freshest) {
+			continue
+		}
+		byEmail[key] = current
+	}
+
+	entries := make([]AccountTokenExportEntry, 0, len(byEmail))
+	for _, selected := range byEmail {
+		entries = append(entries, selected.entry)
+	}
+
+	return entries, nil
+}
+
 func (s *Service) RestoreAccountsBackup(ctx context.Context, payload AccountsBackupPayload) (RestoreAccountsResult, error) {
 	result := RestoreAccountsResult{}
 	if v := strings.TrimSpace(payload.Version); v != "" && v != accountsBackupVersion {

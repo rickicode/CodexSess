@@ -389,6 +389,28 @@ func (s *Server) handleWebBackupAccounts(w http.ResponseWriter, r *http.Request)
 	_, _ = w.Write(b)
 }
 
+func (s *Server) handleWebExportAccountTokens(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	payload, err := s.svc.ExportAccountTokens(r.Context())
+	if err != nil {
+		respondErr(w, 500, "internal_error", err.Error())
+		return
+	}
+
+	name := "codexsess-accounts-export-" + time.Now().UTC().Format("20060102-150405") + ".json"
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		respondErr(w, 500, "internal_error", err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+	_, _ = w.Write(b)
+}
+
 func (s *Server) handleWebRestoreAccounts(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondErr(w, 405, "method_not_allowed", "method not allowed")

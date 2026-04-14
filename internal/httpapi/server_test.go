@@ -854,6 +854,91 @@ func TestHandleWebAccounts_ReturnsGlobalActiveIDsWhenActiveRowsAreOutsidePage(t 
 	}
 }
 
+func TestHandleWebExportAccountTokens_ReturnsJSONDownload(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	st, err := store.Open(filepath.Join(root, "accounts.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = st.Close()
+	})
+
+	cry, err := icrypto.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatalf("create crypto: %v", err)
+	}
+
+	cfg := config.Default()
+	cfg.AuthStoreDir = filepath.Join(root, "auth-accounts")
+	cfg.CodexHome = filepath.Join(root, "codex-home")
+	svc := service.New(cfg, st, cry)
+	s := &Server{svc: svc}
+
+	tokenID, err := cry.Encrypt([]byte("id-token-export"))
+	if err != nil {
+		t.Fatalf("encrypt id token: %v", err)
+	}
+	tokenAccess, err := cry.Encrypt([]byte("access-token-export"))
+	if err != nil {
+		t.Fatalf("encrypt access token: %v", err)
+	}
+	tokenRefresh, err := cry.Encrypt([]byte("refresh-token-export"))
+	if err != nil {
+		t.Fatalf("encrypt refresh token: %v", err)
+	}
+	if err := st.UpsertAccount(ctx, store.Account{
+		ID:           "acc-export",
+		Email:        "user@example.com",
+		TokenID:      tokenID,
+		TokenAccess:  tokenAccess,
+		TokenRefresh: tokenRefresh,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+		LastUsedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("upsert account: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/accounts/export-tokens", nil)
+	rec := httptest.NewRecorder()
+	s.handleWebExportAccountTokens(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("expected json content type, got %q", got)
+	}
+	if got := rec.Header().Get("Content-Disposition"); !strings.Contains(got, "attachment;") {
+		t.Fatalf("expected attachment content disposition, got %q", got)
+	}
+
+	var body []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body) != 1 {
+		t.Fatalf("expected 1 export entry, got %d", len(body))
+	}
+	row := body[0]
+	if got, _ := row["email"].(string); got != "user@example.com" {
+		t.Fatalf("expected email user@example.com, got %q", got)
+	}
+	if got, _ := row["access_token"].(string); got != "access-token-export" {
+		t.Fatalf("expected access token, got %q", got)
+	}
+	if got, _ := row["refresh_token"].(string); got != "refresh-token-export" {
+		t.Fatalf("expected refresh token, got %q", got)
+	}
+	if got, _ := row["id_token"].(string); got != "id-token-export" {
+		t.Fatalf("expected id token, got %q", got)
+	}
+	if _, exists := row["account_id"]; exists {
+		t.Fatalf("did not expect account_id field in export payload")
+	}
+}
+
 func TestHandleWebAccounts_InvalidAccountsTotalIncludesUsageErrorPattern(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

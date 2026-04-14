@@ -92,6 +92,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/api/account/remove", s.handleWebRemoveAccount)
 	mux.HandleFunc("/api/account/import", s.handleWebImportAccount)
 	mux.HandleFunc("/api/accounts/backup", s.handleWebBackupAccounts)
+	mux.HandleFunc("/api/accounts/export-tokens", s.handleWebExportAccountTokens)
 	mux.HandleFunc("/api/accounts/restore", s.handleWebRestoreAccounts)
 	mux.HandleFunc("/api/usage/refresh", s.handleWebRefreshUsage)
 	mux.HandleFunc("/api/usage/automation", s.handleWebUsageAutomationStatus)

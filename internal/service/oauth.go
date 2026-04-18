@@ -69,6 +69,14 @@ type BrowserWebLogin struct {
 	AuthURL string `json:"auth_url"`
 }
 
+type BrowserWebLoginStatus struct {
+	Status      string         `json:"status"`
+	Session     map[string]any `json:"session,omitempty"`
+	Account     map[string]any `json:"account,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	CompletedAt time.Time      `json:"completed_at,omitempty"`
+}
+
 type DeviceLogin struct {
 	LoginID                 string    `json:"login_id"`
 	DeviceCode              string    `json:"device_code"`
@@ -92,13 +100,27 @@ type DevicePollResult struct {
 type activeBrowserWebSession struct {
 	LoginID string
 	AuthURL string
-	stopFn  func()
+}
+
+type browserWebTerminalResult struct {
+	Status       string
+	LoginID      string
+	Alias        string
+	CreatedAt    time.Time
+	CompletedAt  time.Time
+	AccountID    string
+	AccountEmail string
+	Error        string
 }
 
 var (
 	activeBrowserWebMu    sync.Mutex
 	activeBrowserWebState *activeBrowserWebSession
+	browserWebTerminalMu  sync.Mutex
+	browserWebTerminal    = map[string]browserWebTerminalResult{}
 )
+
+const browserWebTerminalTTL = 10 * time.Minute
 
 func (s *Service) StartBrowserLogin(ctx context.Context) (BrowserLogin, error) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", oauthCBPort))
@@ -217,49 +239,57 @@ func (s *Service) StartBrowserLoginWeb(ctx context.Context, externalBaseURL stri
 	activeBrowserWebMu.Unlock()
 
 	_ = externalBaseURL
-	login, err := s.StartBrowserLogin(ctx)
+	redirectURI := fmt.Sprintf("http://localhost:%d/auth/callback", oauthCBPort)
+	loginID, err := randomBase64URL(16)
 	if err != nil {
 		return BrowserWebLogin{}, err
 	}
-	trimmedAlias := strings.TrimSpace(alias)
-	if trimmedAlias != "" {
-		pending, err := s.loadPending(login.LoginID)
-		if err == nil {
-			pending.Alias = trimmedAlias
-			_ = s.savePending(pending)
-		}
+	state, err := randomBase64URL(24)
+	if err != nil {
+		return BrowserWebLogin{}, err
 	}
+	verifier, err := randomBase64URL(32)
+	if err != nil {
+		return BrowserWebLogin{}, err
+	}
+	challenge := codeChallenge(verifier)
+	q := url.Values{}
+	q.Set("response_type", "code")
+	q.Set("client_id", oauthClientID)
+	q.Set("redirect_uri", redirectURI)
+	q.Set("scope", "openid profile email offline_access")
+	q.Set("code_challenge", challenge)
+	q.Set("code_challenge_method", "S256")
+	q.Set("id_token_add_organizations", "true")
+	q.Set("codex_cli_simplified_flow", "true")
+	q.Set("state", state)
+	q.Set("originator", "codex_vscode")
+	authURL := authEndpoint + "?" + q.Encode()
 
-	go func(login BrowserLogin, alias string) {
-		defer func() {
-			activeBrowserWebMu.Lock()
-			if activeBrowserWebState != nil && activeBrowserWebState.LoginID == login.LoginID {
-				activeBrowserWebState = nil
-			}
-			activeBrowserWebMu.Unlock()
-		}()
-		select {
-		case cb := <-login.Callback:
-			_, _ = s.CompleteBrowserLogin(context.Background(), login.LoginID, cb, alias)
-		case <-time.After(5 * time.Minute):
-			_ = s.deletePending(login.LoginID)
-			if login.stopFn != nil {
-				login.stopFn()
-			}
-		}
-	}(login, trimmedAlias)
+	trimmedAlias := strings.TrimSpace(alias)
+	pending := OAuthPending{
+		LoginID:      loginID,
+		State:        state,
+		CodeVerifier: verifier,
+		RedirectURI:  redirectURI,
+		Alias:        trimmedAlias,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := s.savePending(pending); err != nil {
+		return BrowserWebLogin{}, err
+	}
 
 	activeBrowserWebMu.Lock()
 	activeBrowserWebState = &activeBrowserWebSession{
-		LoginID: login.LoginID,
-		AuthURL: login.AuthURL,
-		stopFn:  login.stopFn,
+		LoginID: loginID,
+		AuthURL: authURL,
 	}
 	activeBrowserWebMu.Unlock()
+	s.clearBrowserWebTerminal(loginID)
 
 	return BrowserWebLogin{
-		LoginID: login.LoginID,
-		AuthURL: login.AuthURL,
+		LoginID: loginID,
+		AuthURL: authURL,
 	}, nil
 }
 
@@ -278,9 +308,121 @@ func (s *Service) CancelBrowserLoginWeb(loginID string) {
 	activeBrowserWebMu.Unlock()
 
 	_ = s.deletePending(current.LoginID)
-	if current.stopFn != nil {
-		current.stopFn()
+	s.recordBrowserWebTerminal(browserWebTerminalResult{
+		Status:      "cancelled",
+		LoginID:     current.LoginID,
+		CompletedAt: time.Now().UTC(),
+		Error:       "browser login cancelled",
+	})
+}
+
+func (s *Service) BrowserLoginWebStatus(loginID string) BrowserWebLoginStatus {
+	s.pruneBrowserWebTerminal()
+	target := strings.TrimSpace(loginID)
+	activeBrowserWebMu.Lock()
+	current := activeBrowserWebState
+	activeBrowserWebMu.Unlock()
+
+	if target == "" && current != nil {
+		target = current.LoginID
 	}
+	if target == "" {
+		return BrowserWebLoginStatus{Status: "idle"}
+	}
+	if terminal, ok := s.loadBrowserWebTerminal(target); ok {
+		status := BrowserWebLoginStatus{
+			Status:      terminal.Status,
+			CompletedAt: terminal.CompletedAt,
+			Session: map[string]any{
+				"login_id":   terminal.LoginID,
+				"alias":      terminal.Alias,
+				"created_at": terminal.CreatedAt,
+				"is_pending": false,
+				"is_active":  false,
+			},
+		}
+		if terminal.AccountID != "" || terminal.AccountEmail != "" {
+			status.Account = map[string]any{
+				"id":    terminal.AccountID,
+				"email": terminal.AccountEmail,
+			}
+		}
+		if strings.TrimSpace(terminal.Error) != "" {
+			status.Error = terminal.Error
+		}
+		return status
+	}
+
+	pending, err := s.loadPending(target)
+	if err != nil {
+		if current != nil && strings.TrimSpace(current.LoginID) == target {
+			return BrowserWebLoginStatus{
+				Status: "missing",
+				Session: map[string]any{
+					"login_id":   current.LoginID,
+					"auth_url":   current.AuthURL,
+					"is_active":  true,
+					"is_pending": false,
+				},
+			}
+		}
+		return BrowserWebLoginStatus{Status: "missing"}
+	}
+
+	session := map[string]any{
+		"login_id":     pending.LoginID,
+		"redirect_uri": pending.RedirectURI,
+		"alias":        pending.Alias,
+		"created_at":   pending.CreatedAt,
+		"is_pending":   true,
+		"is_active":    current != nil && strings.TrimSpace(current.LoginID) == pending.LoginID,
+	}
+	if current != nil && strings.TrimSpace(current.LoginID) == pending.LoginID {
+		session["auth_url"] = current.AuthURL
+	}
+	return BrowserWebLoginStatus{Status: "pending", Session: session}
+}
+
+func (s *Service) recordBrowserWebTerminal(result browserWebTerminalResult) {
+	loginID := strings.TrimSpace(result.LoginID)
+	if loginID == "" {
+		return
+	}
+	browserWebTerminalMu.Lock()
+	browserWebTerminal[loginID] = result
+	browserWebTerminalMu.Unlock()
+}
+
+func (s *Service) clearBrowserWebTerminal(loginID string) {
+	loginID = strings.TrimSpace(loginID)
+	if loginID == "" {
+		return
+	}
+	browserWebTerminalMu.Lock()
+	delete(browserWebTerminal, loginID)
+	browserWebTerminalMu.Unlock()
+}
+
+func (s *Service) loadBrowserWebTerminal(loginID string) (browserWebTerminalResult, bool) {
+	browserWebTerminalMu.Lock()
+	defer browserWebTerminalMu.Unlock()
+	result, ok := browserWebTerminal[strings.TrimSpace(loginID)]
+	return result, ok
+}
+
+func (s *Service) pruneBrowserWebTerminal() {
+	cutoff := time.Now().UTC().Add(-browserWebTerminalTTL)
+	browserWebTerminalMu.Lock()
+	for loginID, result := range browserWebTerminal {
+		completedAt := result.CompletedAt
+		if completedAt.IsZero() {
+			completedAt = result.CreatedAt
+		}
+		if !completedAt.IsZero() && completedAt.Before(cutoff) {
+			delete(browserWebTerminal, loginID)
+		}
+	}
+	browserWebTerminalMu.Unlock()
 }
 
 func (s *Service) CompleteBrowserLoginCode(ctx context.Context, loginID, code, state string) (store.Account, error) {
@@ -303,8 +445,25 @@ func (s *Service) CompleteBrowserLoginCode(ctx context.Context, loginID, code, s
 	}
 	acc, err := s.SaveAccountFromTokens(ctx, tokenSet, pending.Alias)
 	if err != nil {
+		s.recordBrowserWebTerminal(browserWebTerminalResult{
+			Status:      "error",
+			LoginID:     pending.LoginID,
+			Alias:       pending.Alias,
+			CreatedAt:   pending.CreatedAt,
+			CompletedAt: time.Now().UTC(),
+			Error:       err.Error(),
+		})
 		return store.Account{}, err
 	}
+	s.recordBrowserWebTerminal(browserWebTerminalResult{
+		Status:       "success",
+		LoginID:      pending.LoginID,
+		Alias:        pending.Alias,
+		CreatedAt:    pending.CreatedAt,
+		CompletedAt:  time.Now().UTC(),
+		AccountID:    acc.ID,
+		AccountEmail: acc.Email,
+	})
 	_ = s.deletePending(loginID)
 	return acc, nil
 }
@@ -342,8 +501,25 @@ func (s *Service) CompleteBrowserLoginCodeByState(ctx context.Context, code, sta
 		}
 		acc, err := s.SaveAccountFromTokens(ctx, tokenSet, pending.Alias)
 		if err != nil {
+			s.recordBrowserWebTerminal(browserWebTerminalResult{
+				Status:      "error",
+				LoginID:     pending.LoginID,
+				Alias:       pending.Alias,
+				CreatedAt:   pending.CreatedAt,
+				CompletedAt: time.Now().UTC(),
+				Error:       err.Error(),
+			})
 			return store.Account{}, err
 		}
+		s.recordBrowserWebTerminal(browserWebTerminalResult{
+			Status:       "success",
+			LoginID:      pending.LoginID,
+			Alias:        pending.Alias,
+			CreatedAt:    pending.CreatedAt,
+			CompletedAt:  time.Now().UTC(),
+			AccountID:    acc.ID,
+			AccountEmail: acc.Email,
+		})
 		_ = s.deletePending(loginID)
 		return acc, nil
 	}
@@ -655,8 +831,6 @@ func asString(v any) string {
 	s, _ := v.(string)
 	return strings.TrimSpace(s)
 }
-
-
 
 func (s *Service) cleanupPendingDevice(d DeviceLogin) {
 	_ = s.deletePendingDevice(d.LoginID)

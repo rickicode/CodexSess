@@ -31,13 +31,11 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		usageRefreshTimeoutSec := config.NormalizeUsageRefreshTimeoutSeconds(s.svc.Cfg.UsageRefreshTimeoutSec)
 		usageSwitchTimeoutSec := config.NormalizeUsageSwitchTimeoutSeconds(s.svc.Cfg.UsageSwitchTimeoutSec)
 		directAPIStrategy := config.NormalizeDirectAPIStrategy(s.svc.Cfg.DirectAPIStrategy)
-		zoStrategy := config.NormalizeZoAPIStrategy(s.svc.Cfg.ZoAPIStrategy)
 		s.mu.RUnlock()
 		updateInfo := s.getUpdateInfo(r.Context(), false)
 		claudeCodeStatus := s.claudeCodeIntegrationStatus(base)
 		respondJSON(w, 200, map[string]any{
 			"api_key":                          s.currentAPIKey(),
-			"api_mode":                         s.currentAPIMode(),
 			"openai_endpoint":                  strings.TrimRight(base, "/") + "/v1/chat/completions",
 			"claude_endpoint":                  strings.TrimRight(base, "/") + "/v1/messages",
 			"auth_json_endpoint":               strings.TrimRight(base, "/") + "/v1/auth.json",
@@ -45,8 +43,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			"openai_models_url":                strings.TrimRight(base, "/") + "/v1/models",
 			"openai_chat_url":                  strings.TrimRight(base, "/") + "/v1/chat/completions",
 			"openai_responses_url":             strings.TrimRight(base, "/") + "/v1/responses",
-			"zo_models_url":                    strings.TrimRight(base, "/") + "/zo/v1/models",
-			"zo_chat_url":                      strings.TrimRight(base, "/") + "/zo/v1/chat/completions",
 			"available_models":                 codexAvailableModels(),
 			"model_mappings":                   modelMappings,
 			"usage_alert_threshold":            usageAlertThreshold,
@@ -56,8 +52,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			"usage_refresh_timeout_seconds":    usageRefreshTimeoutSec,
 			"usage_switch_timeout_seconds":     usageSwitchTimeoutSec,
 			"direct_api_strategy":              directAPIStrategy,
-			"zo_api_strategy":                  zoStrategy,
-			"direct_api_inject_prompt":         true,
 			"claude_code":                      claudeCodeStatus,
 			"app_version":                      updateInfo.CurrentVersion,
 			"codex_version":                    firstNonEmpty(s.codexVersion, "unknown"),
@@ -71,7 +65,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	case http.MethodPost:
 		var req struct {
-			APIMode                  *string `json:"api_mode"`
 			UsageAlertThreshold      *int    `json:"usage_alert_threshold"`
 			UsageAutoSwitchThreshold *int    `json:"usage_auto_switch_threshold"`
 			UsageSchedulerEnabled    *bool   `json:"usage_scheduler_enabled"`
@@ -79,9 +72,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			UsageRefreshTimeoutSec   *int    `json:"usage_refresh_timeout_seconds"`
 			UsageSwitchTimeoutSec    *int    `json:"usage_switch_timeout_seconds"`
 			DirectAPIStrategy        *string `json:"direct_api_strategy"`
-			ZoAPIStrategy            *string `json:"zo_api_strategy"`
 			AdminPassword            *string `json:"admin_password"`
-			DirectAPIInjectPrompt    *bool   `json:"direct_api_inject_prompt"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			respondErr(w, 400, "bad_request", "invalid JSON")
@@ -90,9 +81,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		cfg := s.svc.Cfg
 		before := cfg
-		if req.APIMode != nil {
-			cfg.APIMode = config.NormalizeAPIMode(strings.TrimSpace(*req.APIMode))
-		}
 		if req.UsageAlertThreshold != nil {
 			v := *req.UsageAlertThreshold
 			if v < 0 || v > 100 {
@@ -127,9 +115,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		if req.DirectAPIStrategy != nil {
 			cfg.DirectAPIStrategy = config.NormalizeDirectAPIStrategy(strings.TrimSpace(*req.DirectAPIStrategy))
 		}
-		if req.ZoAPIStrategy != nil {
-			cfg.ZoAPIStrategy = config.NormalizeZoAPIStrategy(strings.TrimSpace(*req.ZoAPIStrategy))
-		}
 		var adminPasswordChanged bool
 		if req.AdminPassword != nil {
 			plain := strings.TrimSpace(*req.AdminPassword)
@@ -141,24 +126,11 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 			cfg.AdminPasswordHash = config.HashPassword(plain)
 			adminPasswordChanged = true
 		}
-		cfg.DirectAPIInjectPrompt = true
 		s.svc.Cfg = cfg
 		s.adminPasswordHash = strings.TrimSpace(cfg.AdminPasswordHash)
 		s.mu.Unlock()
-		if req.APIMode != nil {
-			if err := s.saveSetting(r.Context(), store.SettingAPIMode, cfg.APIMode); err != nil {
-				respondErr(w, 500, "internal_error", err.Error())
-				return
-			}
-		}
 		if req.DirectAPIStrategy != nil {
 			if err := s.saveSetting(r.Context(), store.SettingDirectAPIStrategy, cfg.DirectAPIStrategy); err != nil {
-				respondErr(w, 500, "internal_error", err.Error())
-				return
-			}
-		}
-		if req.ZoAPIStrategy != nil {
-			if err := s.saveSetting(r.Context(), store.SettingZoAPIStrategy, cfg.ZoAPIStrategy); err != nil {
 				respondErr(w, 500, "internal_error", err.Error())
 				return
 			}
@@ -207,9 +179,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		changed := map[string]map[string]any{}
-		if before.APIMode != cfg.APIMode {
-			changed["api_mode"] = map[string]any{"from": before.APIMode, "to": cfg.APIMode}
-		}
 		if before.UsageAlertThreshold != cfg.UsageAlertThreshold {
 			changed["usage_alert_threshold"] = map[string]any{"from": before.UsageAlertThreshold, "to": cfg.UsageAlertThreshold}
 		}
@@ -231,9 +200,6 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		if before.DirectAPIStrategy != cfg.DirectAPIStrategy {
 			changed["direct_api_strategy"] = map[string]any{"from": before.DirectAPIStrategy, "to": cfg.DirectAPIStrategy}
 		}
-		if before.ZoAPIStrategy != cfg.ZoAPIStrategy {
-			changed["zo_api_strategy"] = map[string]any{"from": before.ZoAPIStrategy, "to": cfg.ZoAPIStrategy}
-		}
 		if req.AdminPassword != nil {
 			changed["admin_password"] = map[string]any{"from": "updated", "to": "updated"}
 		}
@@ -245,10 +211,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 		}
 
 		respondJSON(w, 200, map[string]any{
-			"api_mode":                         cfg.APIMode,
 			"direct_api_strategy":              cfg.DirectAPIStrategy,
-			"zo_api_strategy":                  cfg.ZoAPIStrategy,
-			"direct_api_inject_prompt":         true,
 			"ok":                               true,
 			"usage_alert_threshold":            cfg.UsageAlertThreshold,
 			"usage_auto_switch_threshold":      cfg.UsageAutoSwitchThreshold,
@@ -265,7 +228,7 @@ func (s *Server) handleWebSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) shouldInjectDirectAPIPrompt() bool {
-	return true
+	return false
 }
 
 func (s *Server) handleWebClaudeCodeSettings(w http.ResponseWriter, r *http.Request) {
@@ -1005,6 +968,23 @@ func (s *Server) handleWebBrowserCancel(w http.ResponseWriter, r *http.Request) 
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	s.svc.CancelBrowserLoginWeb(strings.TrimSpace(req.LoginID))
 	respondJSON(w, 200, map[string]any{"ok": true})
+}
+
+func (s *Server) handleWebBrowserStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		respondErr(w, 405, "method_not_allowed", "method not allowed")
+		return
+	}
+	loginID := strings.TrimSpace(r.URL.Query().Get("login_id"))
+	status := s.svc.BrowserLoginWebStatus(loginID)
+	respondJSON(w, 200, map[string]any{
+		"ok":           true,
+		"status":       status.Status,
+		"session":      status.Session,
+		"account":      status.Account,
+		"error":        status.Error,
+		"completed_at": status.CompletedAt,
+	})
 }
 
 func (s *Server) handleWebBrowserCallback(w http.ResponseWriter, r *http.Request) {

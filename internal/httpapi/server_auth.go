@@ -45,8 +45,6 @@ func (s *Server) isPublicPath(path string) bool {
 		return true
 	case strings.HasPrefix(p, "/claude/v1"):
 		return true
-	case strings.HasPrefix(p, "/zo/v1"):
-		return true
 	case p == "/auth/callback":
 		return true
 	case p == "/api/auth/browser/callback":

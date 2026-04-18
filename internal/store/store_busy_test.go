@@ -46,13 +46,13 @@ func TestCriticalWritePaths_NoSQLiteBusyUnderContention(t *testing.T) {
 
 	sessionID := "sess_busy"
 	if _, err := stA.CreateCodingSession(context.Background(), CodingSession{
-		ID:           sessionID,
-		Title:        "Busy Session",
-		Model:        "gpt-5.2-codex",
-		WorkDir:      "~/",
-		SandboxMode:  "full-access",
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:            sessionID,
+		Title:         "Busy Session",
+		Model:         "gpt-5.2-codex",
+		WorkDir:       "~/",
+		SandboxMode:   "full-access",
+		CreatedAt:     now,
+		UpdatedAt:     now,
 		LastMessageAt: now,
 	}); err != nil {
 		t.Fatalf("seed coding session: %v", err)
@@ -122,14 +122,23 @@ func TestCriticalWritePaths_NoSQLiteBusyUnderContention(t *testing.T) {
 	})
 
 	run(func(i int) error {
-		_, err := stA.IncrementZoAPIKeyUsage(context.Background(), "missing-key", 1)
+		_, err := stA.CreateCodingSession(context.Background(), CodingSession{
+			ID:            fmt.Sprintf("sess_extra_%d", atomic.AddUint64(&counter, 1)),
+			Title:         fmt.Sprintf("Extra Session %d", i),
+			Model:         "gpt-5.2-codex",
+			WorkDir:       "~/",
+			SandboxMode:   "full-access",
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
+			LastMessageAt: time.Now().UTC(),
+		})
 		if err == nil {
-			return fmt.Errorf("expected missing key error")
+			return nil
 		}
 		if isSQLiteBusyError(err) {
 			return err
 		}
-		return nil
+		return err
 	})
 
 	run(func(i int) error {

@@ -174,19 +174,7 @@ func detectTrafficModelAndStream(path string, body []byte) (string, bool) {
 			stream, _ := anyBody["stream"].(bool)
 			return strings.TrimSpace(model), stream
 		}
-	case "/zo/v1":
-		var anyBody map[string]any
-		if err := json.Unmarshal(body, &anyBody); err == nil {
-			model, _ := anyBody["model"].(string)
-			stream, _ := anyBody["stream"].(bool)
-			return strings.TrimSpace(model), stream
-		}
 	case "/v1/chat/completions":
-		var req ChatCompletionsRequest
-		if err := json.Unmarshal(body, &req); err == nil {
-			return strings.TrimSpace(req.Model), req.Stream
-		}
-	case "/zo/v1/chat/completions":
 		var req ChatCompletionsRequest
 		if err := json.Unmarshal(body, &req); err == nil {
 			return strings.TrimSpace(req.Model), req.Stream
@@ -196,17 +184,7 @@ func detectTrafficModelAndStream(path string, body []byte) (string, bool) {
 		if err := json.Unmarshal(body, &req); err == nil {
 			return strings.TrimSpace(req.Model), req.Stream
 		}
-	case "/zo/v1/responses":
-		var req ResponsesRequest
-		if err := json.Unmarshal(body, &req); err == nil {
-			return strings.TrimSpace(req.Model), req.Stream
-		}
 	case "/v1/messages", "/claude/v1/messages":
-		var req ClaudeMessagesRequest
-		if err := json.Unmarshal(body, &req); err == nil {
-			return strings.TrimSpace(req.Model), req.Stream
-		}
-	case "/zo/v1/messages":
 		var req ClaudeMessagesRequest
 		if err := json.Unmarshal(body, &req); err == nil {
 			return strings.TrimSpace(req.Model), req.Stream

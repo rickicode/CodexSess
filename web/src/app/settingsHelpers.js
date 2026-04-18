@@ -1,13 +1,5 @@
-function normalizeAPIMode(value) {
-  return String(value || '').trim().toLowerCase() === 'direct_api' ? 'direct_api' : 'codex_cli'
-}
-
 function normalizeDirectAPIStrategy(value) {
   return String(value || '').trim().toLowerCase() === 'load_balance' ? 'load_balance' : 'round_robin'
-}
-
-function normalizeZoStrategy(value) {
-  return String(value || '').trim().toLowerCase() === 'manual' ? 'manual' : 'round_robin'
 }
 
 function buildClaudeCodeIntegration(data) {
@@ -19,14 +11,11 @@ function buildClaudeCodeIntegration(data) {
     profiles: Array.isArray(cc.profiles) ? cc.profiles : [],
     model_preset: (cc.model_preset && typeof cc.model_preset === 'object') ? cc.model_preset : {},
     activate_command: String(cc.activate_command || '').trim(),
-    provider: 'codex',
-    zo_model: ''
+    provider: 'codex'
   }
 }
 
 export {
   buildClaudeCodeIntegration,
-  normalizeAPIMode,
-  normalizeDirectAPIStrategy,
-  normalizeZoStrategy
+  normalizeDirectAPIStrategy
 }

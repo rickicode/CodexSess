@@ -75,19 +75,6 @@ func (s *Server) bootstrapSettingsFromStore(ctx context.Context) error {
 			s.setAPIKey(cfg.ProxyAPIKey)
 		}
 	}
-
-	apiMode, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingAPIMode)
-	if err != nil {
-		errs = append(errs, err.Error())
-	} else if ok {
-		cfg.APIMode = config.NormalizeAPIMode(apiMode)
-	} else {
-		cfg.APIMode = config.NormalizeAPIMode(cfg.APIMode)
-		if err := s.svc.Store.SetSetting(ctx, store.SettingAPIMode, cfg.APIMode); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-
 	directStrategy, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingDirectAPIStrategy)
 	if err != nil {
 		errs = append(errs, err.Error())
@@ -96,18 +83,6 @@ func (s *Server) bootstrapSettingsFromStore(ctx context.Context) error {
 	} else {
 		cfg.DirectAPIStrategy = config.NormalizeDirectAPIStrategy(cfg.DirectAPIStrategy)
 		if err := s.svc.Store.SetSetting(ctx, store.SettingDirectAPIStrategy, cfg.DirectAPIStrategy); err != nil {
-			errs = append(errs, err.Error())
-		}
-	}
-
-	zoStrategy, ok, err := s.svc.Store.MustGetSetting(ctx, store.SettingZoAPIStrategy)
-	if err != nil {
-		errs = append(errs, err.Error())
-	} else if ok {
-		cfg.ZoAPIStrategy = config.NormalizeZoAPIStrategy(zoStrategy)
-	} else {
-		cfg.ZoAPIStrategy = config.NormalizeZoAPIStrategy(cfg.ZoAPIStrategy)
-		if err := s.svc.Store.SetSetting(ctx, store.SettingZoAPIStrategy, cfg.ZoAPIStrategy); err != nil {
 			errs = append(errs, err.Error())
 		}
 	}
@@ -281,12 +256,8 @@ func (s *Server) saveSetting(ctx context.Context, key string, value string) erro
 	switch key {
 	case store.SettingAPIKey:
 		cfg.ProxyAPIKey = strings.TrimSpace(value)
-	case store.SettingAPIMode:
-		cfg.APIMode = config.NormalizeAPIMode(value)
 	case store.SettingDirectAPIStrategy:
 		cfg.DirectAPIStrategy = config.NormalizeDirectAPIStrategy(value)
-	case store.SettingZoAPIStrategy:
-		cfg.ZoAPIStrategy = config.NormalizeZoAPIStrategy(value)
 	case store.SettingCodexHome:
 		cfg.CodexHome = strings.TrimSpace(value)
 	case store.SettingUsageAlertThreshold:
@@ -335,12 +306,6 @@ func (s *Server) saveSetting(ctx context.Context, key string, value string) erro
 		return nil
 	}
 	return config.Save(cfg)
-}
-
-func (s *Server) currentAPIMode() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return config.NormalizeAPIMode(s.svc.Cfg.APIMode)
 }
 
 func (s *Server) currentDirectAPIStrategy() string {

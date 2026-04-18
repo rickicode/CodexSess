@@ -58,10 +58,6 @@ Untuk penggunaan normal, unduh binary/package dari halaman rilis terbaru:
   - bubble event bergaya Codex untuk balasan assistant, output terminal, aktivitas MCP/tool, subagent, dan operasi file
   - activity stream realtime berbasis WebSocket (`/api/coding/ws`) dengan auto reconnect dan indikator status koneksi (`[WS Connected/Connecting/Disconnected]`)
   - kontrol stop dua tahap (`Stop` lalu `Force Stop`), slash command (`/status`, `/review`), dan skill picker
-- Integrasi Zo kompatibel OpenAI:
-  - manajemen multi Zo API key di dashboard
-  - tracking request per key (`Requests` + `Last request`)
-  - cache daftar model Zo dan dukungan model mapping
 - Peningkatan direct API dan otomasi routing:
   - direct API mode untuk client kompatibel OpenAI + Claude
   - strategi Codex CLI: `round_robin` (rotasi terjadwal) dan `manual` (switch berbasis threshold)
@@ -99,10 +95,6 @@ Daripada mengelola script terpisah, edit token manual, dan dashboard yang berbed
   - threshold alert
   - perilaku auto-switch yang bisa dikonfigurasi
   - default auto-switch threshold 15% (bisa diubah di Settings/API)
-- Operasi Zo API key:
-  - tambah/hapus banyak Zo API key
-  - pantau jumlah request per key
-  - gunakan daftar model Zo untuk mapping
 - Workspace coding berbasis browser:
   - sesi `/chat` dengan context persisten, satu timeline chat-first, dan bubble event bergaya Codex
 

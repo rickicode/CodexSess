@@ -22,8 +22,7 @@
     buildAuthJSONExample,
     buildClaudeExample,
     buildOpenAIExample,
-    buildUsageStatusExample,
-    buildZoChatExample
+    buildUsageStatusExample
   } from './app/endpointExamples.js';
   import {
     accountStatusOptions,
@@ -68,8 +67,7 @@
     authJSONExample as buildAuthJSONExampleSelector,
     claudeExample as buildClaudeExampleSelector,
     openAIExample as buildOpenAIExampleSelector,
-    usageStatusExample as buildUsageStatusExampleSelector,
-    zoChatExample as buildZoChatExampleSelector
+    usageStatusExample as buildUsageStatusExampleSelector
   } from './app/endpointExampleSelectors.js';
   import {
     postClientEvent,
@@ -81,9 +79,7 @@
   } from './app/mappingHelpers.js';
   import {
     buildClaudeCodeIntegration,
-    normalizeAPIMode,
-    normalizeDirectAPIStrategy,
-    normalizeZoStrategy
+    normalizeDirectAPIStrategy
   } from './app/settingsHelpers.js';
   import {
     buildQueuedThresholdPayload,
@@ -100,12 +96,10 @@
   } from './app/usageSelectionHelpers.js';
   import {
     defaultCodexModels,
-    defaultZoModels,
     jsonHeaders,
     resolvedAPIBase as helperResolvedAPIBase,
     toAPIURL as helperToAPIURL,
-    uiPrefsKey,
-    zoModelsCacheKey
+    uiPrefsKey
   } from './app/appHelpers.js';
   import {
     clampPercent,
@@ -123,15 +117,12 @@
   let status = $state({ text: 'Initializing...', kind: 'info' });
 
   let apiKey = $state('');
-  let apiMode = $state('codex_cli');
   let directAPIStrategy = $state('round_robin');
   let openAIEndpoint = $state('');
   let openAIResponsesEndpoint = $state('');
   let claudeEndpoint = $state('');
   let authJSONEndpoint = $state('');
   let usageStatusEndpoint = $state('');
-  let zoChatEndpoint = $state('');
-  let zoModelsEndpoint = $state('');
   let isChatRoute = $state(typeof window !== 'undefined' && (window.location.pathname === '/chat' || window.location.pathname.startsWith('/chat/')));
   let activeMenu = $state('dashboard');
   let apiLogs = $state([]);
@@ -148,12 +139,6 @@
   let editingMappingAlias = $state('');
   let settingsBusy = $state(false);
   let copiedAction = $state('');
-  let zoKeys = $state([]);
-  let zoAvailableModels = $state([]);
-  let zoModelsLoading = $state(false);
-  let zoKeyName = $state('');
-  let zoKeyValue = $state('');
-  let zoStrategy = $state('round_robin');
   let showAccountEmail = $state(true);
   let usageAlertThreshold = $state(5);
   let usageAlertThresholdInput = $state('5');
@@ -171,8 +156,7 @@
     profiles: [],
     model_preset: {},
     activate_command: '',
-    provider: 'codex',
-    zo_model: ''
+    provider: 'codex'
   });
   let showClaudeEnableModal = $state(false);
   let appVersion = $state('dev');
@@ -213,6 +197,7 @@
   let browserWaiting = $state(false);
   let browserKnownIDs = $state([]);
   let browserCallbackURL = $state('');
+  let browserProgressStage = $state('idle');
 
   let deviceLogin = $state(null);
   let deviceCodeCopied = $state(false);
@@ -571,10 +556,6 @@
     return buildUsageStatusExampleSelector({ usageStatusEndpoint, apiKey, buildUsageStatusExample });
   }
 
-  function zoChatExample() {
-    return buildZoChatExampleSelector({ zoChatEndpoint, apiKey, buildZoChatExample });
-  }
-
   function openSystemLogDetail(entry) {
     const next = openSystemLogDetailState(entry);
     showSystemLogDetail = next.showSystemLogDetail;
@@ -695,16 +676,12 @@
   async function loadSettings() {
     const data = await req('/api/settings');
     apiKey = data.api_key || '';
-    apiMode = normalizeAPIMode(data.api_mode || 'codex_cli');
     directAPIStrategy = normalizeDirectAPIStrategy(data.direct_api_strategy || 'round_robin');
     openAIEndpoint = data.openai_endpoint || '';
     openAIResponsesEndpoint = data.openai_responses_url || '';
     claudeEndpoint = data.claude_endpoint || '';
     authJSONEndpoint = data.auth_json_endpoint || '';
     usageStatusEndpoint = data.usage_status_endpoint || '';
-    zoChatEndpoint = data.zo_chat_url || '';
-    zoModelsEndpoint = data.zo_models_url || '';
-    zoStrategy = normalizeZoStrategy(data.zo_api_strategy || 'round_robin');
     const fromAPI = Array.isArray(data.available_models) ? data.available_models : [];
     availableModels = fromAPI.length > 0 ? fromAPI : defaultCodexModels;
     modelMappings = (data.model_mappings && typeof data.model_mappings === 'object') ? data.model_mappings : {};
@@ -760,80 +737,6 @@
       setStatus(`Failed to update template home: ${error.message}`, 'error');
     } finally {
       codingTemplateHomeBusy = false;
-    }
-  }
-
-  async function loadZoKeys() {
-    const data = await req('/api/zo/keys');
-    zoKeys = Array.isArray(data.keys) ? data.keys : [];
-    zoStrategy = normalizeZoStrategy(data.strategy || 'round_robin');
-  }
-
-  async function loadZoModels() {
-    zoAvailableModels = [...defaultZoModels];
-    if (!Array.isArray(zoKeys) || zoKeys.length === 0) return;
-    if (!String(apiKey || '').trim()) return;
-    const keySignature = zoKeys
-      .map((item) => String(item?.id || '').trim())
-      .filter(Boolean)
-      .sort((a, b) => a.localeCompare(b))
-      .join('|');
-    if (typeof window !== 'undefined') {
-      try {
-        const raw = localStorage.getItem(zoModelsCacheKey);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          const cachedSig = String(parsed?.key_signature || '').trim();
-          const cachedModels = Array.isArray(parsed?.models)
-            ? parsed.models.map((item) => String(item || '').trim()).filter(Boolean)
-            : [];
-          if (cachedSig && cachedSig === keySignature && cachedModels.length > 0) {
-            zoAvailableModels = cachedModels;
-            return;
-          }
-        }
-      } catch {
-        // ignore cache read issues
-      }
-    }
-    const endpoint = '/zo/v1/models';
-    if (!endpoint) return;
-    zoModelsLoading = true;
-    try {
-      const res = await fetch(toAPIURL(endpoint), {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${apiKey}`
-        },
-        credentials: 'same-origin'
-      });
-      if (!res.ok) {
-        throw new Error(`failed to load Zo models (${res.status})`);
-      }
-      const data = await res.json();
-      const parsed = Array.isArray(data?.data)
-        ? data.data.map((item) => String(item?.id || '').trim()).filter(Boolean)
-        : [];
-      if (parsed.length > 0) {
-        zoAvailableModels = parsed;
-        if (typeof window !== 'undefined') {
-          try {
-            localStorage.setItem(zoModelsCacheKey, JSON.stringify({
-              key_signature: keySignature,
-              models: parsed,
-              updated_at: Date.now()
-            }));
-          } catch {
-            // ignore cache write issues
-          }
-        }
-      }
-    } catch (error) {
-      sendClientEvent('zo-models-load-failed', String(error?.message || 'failed to load Zo models'), {
-        endpoint: toAPIURL(endpoint)
-      }, 'error');
-    } finally {
-      zoModelsLoading = false;
     }
   }
 
@@ -893,96 +796,6 @@
     }
   }
 
-  async function addZoKey() {
-    if (!String(zoKeyValue || '').trim()) {
-      setStatus('Zo API key is required.', 'error');
-      return;
-    }
-    settingsBusy = true;
-    try {
-      await req('/api/zo/keys', {
-        method: 'POST',
-        body: JSON.stringify({ name: zoKeyName, api_key: zoKeyValue })
-      });
-      zoKeyName = '';
-      zoKeyValue = '';
-      await loadZoKeys();
-      await loadZoModels();
-      setStatus('Zo API key saved.', 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      settingsBusy = false;
-    }
-  }
-
-  async function activateZoKey(id) {
-    settingsBusy = true;
-    try {
-      await req('/api/zo/keys/activate', {
-        method: 'POST',
-        body: JSON.stringify({ id })
-      });
-      await loadZoKeys();
-      await loadZoModels();
-      setStatus('Zo API key activated.', 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      settingsBusy = false;
-    }
-  }
-
-  async function resetZoKeyUsage(id) {
-    settingsBusy = true;
-    try {
-      await req('/api/zo/keys/reset', {
-        method: 'POST',
-        body: JSON.stringify({ id })
-      });
-      await loadZoKeys();
-      setStatus('Zo API key usage reset.', 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      settingsBusy = false;
-    }
-  }
-
-  async function deleteZoKey(id) {
-    settingsBusy = true;
-    try {
-      await req('/api/zo/keys/delete', {
-        method: 'POST',
-        body: JSON.stringify({ id })
-      });
-      await loadZoKeys();
-      await loadZoModels();
-      setStatus('Zo API key removed.', 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      settingsBusy = false;
-    }
-  }
-
-  async function setZoStrategy(strategy) {
-    const next = String(strategy || '').trim().toLowerCase() === 'manual' ? 'manual' : 'round_robin';
-    settingsBusy = true;
-    try {
-      await req('/api/zo/keys/strategy', {
-        method: 'POST',
-        body: JSON.stringify({ strategy: next })
-      });
-      zoStrategy = next;
-      setStatus(`Zo API strategy set to ${next}.`, 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      settingsBusy = false;
-    }
-  }
-
   async function refreshUsageForSelectors(selectors) {
     const uniqueSelectors = [...new Set((selectors || []).map((v) => String(v || '').trim()).filter(Boolean))];
     let refreshed = 0;
@@ -1027,10 +840,9 @@
       }
     };
 
-    refreshAllInFlight = Promise.all([loadTotalTask(), loadAccounts(), loadAccountTypeOptions(), loadSettings(), loadZoKeys(), loadCodingTemplateHomeStatus()]);
+    refreshAllInFlight = Promise.all([loadTotalTask(), loadAccounts(), loadAccountTypeOptions(), loadSettings(), loadCodingTemplateHomeStatus()]);
     try {
       await refreshAllInFlight;
-      await loadZoModels();
       lastRefreshAllAt = Date.now();
     } finally {
       refreshAllInFlight = null;
@@ -1268,24 +1080,6 @@
       setTimeout(() => {
         playNotificationTone('switch');
       }, 140);
-    }
-  }
-
-  async function setAPIMode(nextMode) {
-    const normalized = normalizeAPIMode(nextMode);
-    if (apiMode === normalized) return;
-    settingsBusy = true;
-    try {
-      const data = await req('/api/settings', {
-        method: 'POST',
-        body: JSON.stringify({ api_mode: normalized })
-      });
-      apiMode = normalizeAPIMode(data.api_mode || normalized);
-      setStatus(`API mode changed to ${apiMode === 'direct_api' ? 'Direct API' : 'Codex CLI'}.`, 'success');
-    } catch (error) {
-      setStatus(error.message, 'error');
-    } finally {
-      settingsBusy = false;
     }
   }
 
@@ -1585,6 +1379,7 @@
     browserLoginURL = '';
     browserLoginID = '';
     browserCallbackURL = '';
+    browserProgressStage = 'idle';
     deviceLogin = null;
     deviceCodeCopied = false;
     clearPollTimer();
@@ -1608,8 +1403,9 @@
       browserLoginID = loginID;
       browserCallbackURL = '';
       browserWaiting = false;
+      browserProgressStage = 'ready';
       browserKnownIDs = accounts.map((a) => a.id);
-      setStatus('Browser login URL ready. Click Open New Tab.', 'success');
+      setStatus('Browser login is ready. Open the link on this machine; OpenAI should return to localhost:1455 after sign-in.', 'success');
     } catch (error) {
       setStatus(error.message, 'error');
     } finally {
@@ -1627,10 +1423,43 @@
   async function checkBrowserLoginResult() {
     if (!browserWaiting) return;
     try {
-      await loadAccounts();
+	    const statusData = await req(`/api/auth/browser/status?login_id=${encodeURIComponent(browserLoginID || '')}`);
+      if (browserProgressStage === 'opened') {
+        browserProgressStage = 'waiting';
+      }
+	    if (statusData?.status === 'pending') {
+	      return;
+	    }
+	    if (statusData?.status === 'success') {
+	      const accountID = String(statusData?.account?.id || '').trim();
+	      browserProgressStage = 'success';
+	      browserWaiting = false;
+	      browserLoginURL = '';
+	      browserLoginID = '';
+	      clearBrowserWaitTimer();
+	      await loadAccounts();
+	      closeAddAccountModal();
+	      setStatus('Browser callback login success. Account added.', 'success');
+	      if (accountID) {
+	        const usageRefresh = await refreshUsageForSelectors([accountID]);
+	        if (usageRefresh.refreshed > 0) {
+	          setStatus(`Browser callback login success. Usage refreshed for ${usageRefresh.refreshed}/${usageRefresh.total} account(s).`, 'success');
+	        }
+	      }
+	      return;
+	    }
+	    if (statusData?.status === 'error' || statusData?.status === 'cancelled') {
+	      browserWaiting = false;
+	      clearBrowserWaitTimer();
+	      browserProgressStage = 'recovery';
+	      setStatus(String(statusData?.error || 'Browser login did not complete.'), 'error');
+	      return;
+	    }
+	    await loadAccounts();
       const nowIDs = accounts.map((a) => a.id);
       const newIDs = nowIDs.filter((id) => !browserKnownIDs.includes(id));
       if (newIDs.length > 0) {
+        browserProgressStage = 'success';
         browserWaiting = false;
         browserLoginURL = '';
         browserLoginID = '';
@@ -1651,8 +1480,32 @@
     if (!browserLoginURL) return;
     window.open(browserLoginURL, '_blank', 'noopener,noreferrer');
     browserWaiting = true;
-    setStatus('Waiting callback from browser login...', 'info');
+    browserProgressStage = 'opened';
+    setStatus('Browser tab opened. Finish sign-in there; the real callback target is localhost:1455 on this machine.', 'info');
     scheduleBrowserWait();
+  }
+
+  function validateManualBrowserCallbackURL(raw) {
+    const callbackURL = String(raw || '').trim();
+    if (!callbackURL) {
+      return 'Callback URL is required.';
+    }
+    let parsed;
+    try {
+      parsed = new URL(callbackURL);
+    } catch {
+      return 'Callback URL must be a valid URL.';
+    }
+    if (parsed.protocol !== 'http:' || parsed.hostname !== 'localhost' || parsed.port !== '1455') {
+      return 'Callback URL must target http://localhost:1455.';
+    }
+    if (!parsed.searchParams.get('code')) {
+      return 'Callback URL must include code.';
+    }
+    if (!parsed.searchParams.get('state')) {
+      return 'Callback URL must include state.';
+    }
+    return '';
   }
 
   async function submitManualBrowserCallback() {
@@ -1666,13 +1519,20 @@
       setStatus('Callback URL is required.', 'error');
       return;
     }
+    const callbackValidationError = validateManualBrowserCallbackURL(callbackURL);
+    if (callbackValidationError) {
+      setStatus(callbackValidationError, 'error');
+      return;
+    }
     busy = true;
+    browserProgressStage = 'recovery';
     try {
       const data = await req('/api/auth/browser/complete', {
         method: 'POST',
         body: JSON.stringify({ login_id: loginID, callback_url: callbackURL })
       });
       const accountID = String(data?.account?.id || '').trim();
+      browserProgressStage = 'success';
       closeAddAccountModal();
       setStatus('Browser callback login success. Account added.', 'success');
       if (accountID) {
@@ -1687,6 +1547,8 @@
       busy = false;
     }
   }
+
+  const browserCallbackValidationError = $derived(validateManualBrowserCallbackURL(browserCallbackURL));
 
   async function startDeviceLogin() {
     busy = true;
@@ -1994,7 +1856,6 @@
 
     {#if !isChatRoute && activeMenu === 'dashboard'}
       <DashboardView
-        {apiMode}
         accounts={dashboardPagination.items}
         totalAccounts={totalAccountsFromServer}
         filteredCount={dashboardPagination.totalFiltered}
@@ -2040,11 +1901,9 @@
     {#if !isChatRoute && activeMenu === 'settings'}
       <SettingsView
         busy={settingsBusy}
-        {apiMode}
         {directAPIStrategy}
         {codingTemplateHome}
         codingTemplateBusy={codingTemplateHomeBusy}
-        onSetAPIMode={setAPIMode}
         onSetDirectAPIStrategy={setDirectAPIStrategy}
         onInitializeCodingTemplateHome={() => manageCodingTemplateHome('initialize')}
         onResyncCodingTemplateHome={() => manageCodingTemplateHome('resync')}
@@ -2082,14 +1941,6 @@
         {claudeEndpoint}
         authJSONEndpoint={authJSONEndpoint}
         usageStatusEndpoint={usageStatusEndpoint}
-        {zoChatEndpoint}
-        {zoModelsEndpoint}
-        {zoKeys}
-        {zoKeyName}
-        {zoKeyValue}
-        {zoStrategy}
-        {zoAvailableModels}
-        {zoModelsLoading}
         {claudeCodeIntegration}
         {availableModels}
         {modelMappings}
@@ -2104,20 +1955,12 @@
         onDeleteModelMapping={deleteModelMapping}
         onRegenerateAPIKey={regenerateAPIKey}
         onEnableClaudeCodeIntegration={openClaudeCodeIntegrationModal}
-        onSetZoKeyName={(value) => (zoKeyName = value)}
-        onSetZoKeyValue={(value) => (zoKeyValue = value)}
-        onAddZoKey={addZoKey}
-        onActivateZoKey={activateZoKey}
-        onResetZoKeyUsage={resetZoKeyUsage}
-        onDeleteZoKey={deleteZoKey}
-        onSetZoStrategy={setZoStrategy}
         onCopyText={copyText}
         {isCopied}
         {openAIExample}
         {claudeExample}
         {authJSONExample}
         {usageStatusExample}
-        {zoChatExample}
       />
     {/if}
 
@@ -2179,7 +2022,7 @@
         <div class="modal-head">
           <div>
             <h3>Add Account</h3>
-            <p class="modal-subtitle">Connect ChatGPT account with browser callback or device login.</p>
+            <p class="modal-subtitle">Connect ChatGPT account with local browser login or device login.</p>
           </div>
           <button class="btn btn-secondary btn-small" onclick={closeAddAccountModal} disabled={busy}>Close</button>
         </div>
@@ -2188,8 +2031,8 @@
           <p class="modal-helper">Choose preferred login flow.</p>
           <div class="method-grid">
             <button class="method-card" onclick={startBrowserLogin} disabled={busy}>
-              <span class="method-title">Browser Callback</span>
-              <span class="method-desc">Open ChatGPT login page in a new tab and wait for automatic callback.</span>
+              <span class="method-title">Browser Login</span>
+              <span class="method-desc">Open ChatGPT login in a new tab on this machine. OpenAI returns to localhost:1455 after sign-in.</span>
             </button>
             <button class="method-card" onclick={startDeviceLogin} disabled={busy}>
               <span class="method-title">Device Code</span>
@@ -2200,43 +2043,72 @@
 
         {#if addAccountMode === 'browser'}
           <div class="modal-body">
-            <label for="browserLoginUrl">Browser Login URL</label>
-            <div class="device-code-row">
-              <input id="browserLoginUrl" value={browserLoginURL} readonly disabled />
-              <button
-                class="btn btn-secondary"
-                onclick={() => copyText(browserLoginURL, 'Browser login URL', 'browser_login_url')}
-                disabled={busy || !browserLoginURL}
-              >
-                {#if isCopied('browser_login_url')}Copied{:else}Copy{/if}
-              </button>
-              <button class="btn btn-primary" onclick={openBrowserLoginTab} disabled={busy || !browserLoginURL}>
-                Open New Tab
-              </button>
+            <div class="browser-login-section" aria-label="Browser login">
+              <div class="browser-login-section-head">
+                <strong>Browser login</strong>
+                <span class={`browser-login-status browser-login-status-${browserProgressStage}`}>
+                  {#if browserProgressStage === 'ready'}Ready{/if}
+                  {#if browserProgressStage === 'opened'}Browser opened{/if}
+                  {#if browserProgressStage === 'waiting'}Waiting{/if}
+                  {#if browserProgressStage === 'recovery'}Manual fallback{/if}
+                  {#if browserProgressStage === 'success'}Connected{/if}
+                  {#if browserProgressStage === 'idle'}Not started{/if}
+                </span>
+              </div>
+              <p class="modal-helper">Open the login on this machine. After sign-in, OpenAI should return to <span class="mono">localhost:1455</span>.</p>
+              <label for="browserLoginUrl">Browser Login URL</label>
+              <div class="device-code-row">
+                <input id="browserLoginUrl" value={browserLoginURL} readonly disabled />
+                <button
+                  class="btn btn-secondary"
+                  onclick={() => copyText(browserLoginURL, 'Browser login URL', 'browser_login_url')}
+                  disabled={busy || !browserLoginURL}
+                >
+                  {#if isCopied('browser_login_url')}Copied{:else}Copy{/if}
+                </button>
+                <button class="btn btn-primary" onclick={openBrowserLoginTab} disabled={busy || !browserLoginURL}>
+                  Open Browser
+                </button>
+              </div>
+              {#if browserWaiting}
+                <p class="modal-helper">Waiting for the localhost:1455 return and the new account to appear.</p>
+              {/if}
             </div>
-            <label for="browserCallbackUrl">Callback URL (Manual Paste)</label>
-            <div class="device-code-row">
-              <input
-                id="browserCallbackUrl"
-                value={browserCallbackURL}
-                placeholder="http://127.0.0.1:3061/auth/callback?code=...&state=..."
-                oninput={(event) => (browserCallbackURL = event.currentTarget.value)}
-                disabled={busy}
-              />
-              <button
-                class="btn btn-secondary"
-                onclick={submitManualBrowserCallback}
-                disabled={busy || !browserCallbackURL.trim()}
-              >
-                Submit
-              </button>
-            </div>
+
+            <details class="browser-login-section browser-login-section-secondary" ontoggle={(event) => event.currentTarget.open && browserProgressStage !== 'success' && (browserProgressStage = 'recovery')}>
+              <summary>Use manual callback if the browser already returned</summary>
+              <div class="stack-small" style="margin-top: 12px;">
+                <p class="modal-helper">Only use this if the browser already hit <span class="mono">localhost:1455</span> and the account still did not show up here.</p>
+                <label for="browserCallbackUrl">Callback URL</label>
+                <div class="device-code-row">
+                  <input
+                    id="browserCallbackUrl"
+                    value={browserCallbackURL}
+                    placeholder="http://localhost:1455/auth/callback?code=...&state=..."
+                    oninput={(event) => {
+                      browserCallbackURL = event.currentTarget.value;
+                      if (browserCallbackURL.trim() && browserProgressStage !== 'success') {
+                        browserProgressStage = 'recovery';
+                      }
+                    }}
+                    disabled={busy}
+                  />
+                  <button
+                    class="btn btn-secondary"
+                    onclick={submitManualBrowserCallback}
+                    disabled={busy || !browserCallbackURL.trim()}
+                  >
+                    Submit
+                  </button>
+                </div>
+                {#if browserCallbackURL.trim() && browserCallbackValidationError}
+                  <p class="modal-helper" style="color: var(--danger);">{browserCallbackValidationError}</p>
+                {/if}
+              </div>
+            </details>
             <div class="panel-actions">
               <button class="btn btn-secondary" onclick={() => (addAccountMode = 'menu')} disabled={busy}>Back</button>
             </div>
-            {#if browserWaiting}
-              <p class="modal-helper">Waiting callback from browser login...</p>
-            {/if}
           </div>
         {/if}
 

@@ -4,9 +4,7 @@ import "time"
 
 const (
 	SettingAPIKey                   = "codexsess_api_key"
-	SettingAPIMode                  = "api_mode"
 	SettingDirectAPIStrategy        = "direct_api_strategy"
-	SettingZoAPIStrategy            = "zo_api_strategy"
 	SettingModelMappings            = "model_mappings"
 	SettingAdminPasswordHash        = "admin_password_hash"
 	SettingCodexHome                = "codex_home"
@@ -119,28 +117,4 @@ type MemoryQuery struct {
 	VerifiedOnly bool
 	IncludeStale bool
 	Limit        int
-}
-
-type ZoAPIKey struct {
-	ID                    string
-	Name                  string
-	Token                 string
-	Active                bool
-	CreatedAt             time.Time
-	UpdatedAt             time.Time
-	LastUsedAt            time.Time
-	ConversationID        string
-	ConversationUpdatedAt *time.Time
-}
-
-type ZoAPIKeyUsage struct {
-	KeyID         string
-	TotalRequests int
-	LastRequestAt *time.Time
-	LastResetAt   *time.Time
-}
-
-type ZoAPIKeyWithUsage struct {
-	Key   ZoAPIKey
-	Usage ZoAPIKeyUsage
 }

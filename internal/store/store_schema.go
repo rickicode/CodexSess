@@ -103,24 +103,6 @@ func (s *Store) migrate(ctx context.Context) error {
 			meta_json TEXT NOT NULL DEFAULT '{}',
 			created_at TEXT NOT NULL
 		);`,
-		`CREATE TABLE IF NOT EXISTS zo_api_keys (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			key_secret TEXT NOT NULL,
-			active INTEGER NOT NULL DEFAULT 1,
-			conversation_id TEXT NOT NULL DEFAULT '',
-			conversation_updated_at TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			last_used_at TEXT NOT NULL
-		);`,
-		`CREATE TABLE IF NOT EXISTS zo_api_key_usage (
-			key_id TEXT PRIMARY KEY,
-			usage_count INTEGER NOT NULL,
-			last_request_at TEXT NOT NULL,
-			last_reset_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL
-		);`,
 		`CREATE TABLE IF NOT EXISTS app_settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
@@ -153,10 +135,6 @@ func (s *Store) migrate(ctx context.Context) error {
 			ON coding_ws_request_dedup(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_system_logs_created
 			ON system_logs(created_at);`,
-		`CREATE INDEX IF NOT EXISTS idx_zo_api_keys_updated
-			ON zo_api_keys(updated_at);`,
-		`CREATE INDEX IF NOT EXISTS idx_zo_api_key_usage_updated
-			ON zo_api_key_usage(updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_app_settings_updated
 			ON app_settings(updated_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_memory_items_scope_updated
@@ -208,24 +186,6 @@ func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.execWithRetry(ctx, `UPDATE coding_sessions SET reasoning_level='medium' WHERE TRIM(COALESCE(reasoning_level,''))=''`); err != nil {
 		msg := strings.ToLower(err.Error())
 		if !strings.Contains(msg, "no such column") {
-			return err
-		}
-	}
-	if _, err := s.execWithRetry(ctx, `ALTER TABLE zo_api_key_usage ADD COLUMN last_request_at TEXT NOT NULL DEFAULT ''`); err != nil {
-		msg := strings.ToLower(err.Error())
-		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") && !strings.Contains(msg, "no such table") {
-			return err
-		}
-	}
-	if _, err := s.execWithRetry(ctx, `ALTER TABLE zo_api_keys ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''`); err != nil {
-		msg := strings.ToLower(err.Error())
-		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") && !strings.Contains(msg, "no such table") {
-			return err
-		}
-	}
-	if _, err := s.execWithRetry(ctx, `ALTER TABLE zo_api_keys ADD COLUMN conversation_updated_at TEXT NOT NULL DEFAULT ''`); err != nil {
-		msg := strings.ToLower(err.Error())
-		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") && !strings.Contains(msg, "no such table") {
 			return err
 		}
 	}

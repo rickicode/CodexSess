@@ -20,10 +20,6 @@ export default defineConfig({
       '/auth/': {
         target: 'http://127.0.0.1:3052',
         changeOrigin: false
-      },
-      '/zo/': {
-        target: 'http://127.0.0.1:3052',
-        changeOrigin: false
       }
     }
   },

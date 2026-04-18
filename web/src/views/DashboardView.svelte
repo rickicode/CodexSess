@@ -1,6 +1,5 @@
 <script>
   let {
-    apiMode,
     accounts,
     totalAccounts,
     filteredCount,

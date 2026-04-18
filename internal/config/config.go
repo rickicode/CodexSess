@@ -23,7 +23,6 @@ type Config struct {
 	CodexHome                string            `yaml:"codex_home"`
 	CodexBin                 string            `yaml:"codex_bin"`
 	ProxyAPIKey              string            `yaml:"-"`
-	APIMode                  string            `yaml:"-"`
 	ModelMappings            map[string]string `yaml:"-"`
 	UsageAlertThreshold      int               `yaml:"usage_alert_threshold"`
 	UsageAutoSwitchThreshold int               `yaml:"usage_auto_switch_threshold"`
@@ -32,10 +31,8 @@ type Config struct {
 	UsageRefreshTimeoutSec   int               `yaml:"usage_scheduler_refresh_timeout_seconds"`
 	UsageSwitchTimeoutSec    int               `yaml:"usage_scheduler_switch_timeout_seconds"`
 	DirectAPIStrategy        string            `yaml:"direct_api_strategy"`
-	ZoAPIStrategy            string            `yaml:"zo_api_strategy"`
 	CLISwitchNotifyCmd       string            `yaml:"cli_switch_notify_cmd"`
 	SystemLogMaxRows         int               `yaml:"system_log_max_rows"`
-	DirectAPIInjectPrompt    bool              `yaml:"direct_api_inject_prompt"`
 	AdminUsername            string            `yaml:"admin_username"`
 	AdminPassword            string            `yaml:"admin_password,omitempty"`
 	AdminPasswordHash        string            `yaml:"admin_password_hash"`
@@ -52,7 +49,6 @@ func Default() Config {
 		AuthStoreDir:  filepath.Join(base, "auth-accounts"),
 		CodexHome:     filepath.Join(home, ".codex"),
 		CodexBin:      resolveCodexBin(""),
-		APIMode:       "codex_cli",
 		ModelMappings: map[string]string{
 			"gpt-4o":                     "gpt-5.1-codex-max",
 			"gpt-4o-mini":                "gpt-5.1-codex-max",
@@ -87,10 +83,8 @@ func Default() Config {
 		UsageRefreshTimeoutSec:   120,
 		UsageSwitchTimeoutSec:    45,
 		DirectAPIStrategy:        "round_robin",
-		ZoAPIStrategy:            "round_robin",
 		CLISwitchNotifyCmd:       "",
 		SystemLogMaxRows:         1000,
-		DirectAPIInjectPrompt:    true,
 		AdminUsername:            "admin",
 		AdminPasswordHash:        HashPassword("hijilabs"),
 		LogLevel:                 "info",
@@ -135,9 +129,6 @@ func LoadOrInit() (Config, error) {
 	if v := strings.TrimSpace(asString(raw["codexsess_api_key"])); v != "" {
 		cfg.ProxyAPIKey = v
 	}
-	if v := strings.TrimSpace(asString(raw["api_mode"])); v != "" {
-		cfg.APIMode = v
-	}
 	if m := readStringMap(raw["model_mappings"]); len(m) > 0 {
 		cfg.ModelMappings = m
 	}
@@ -157,9 +148,7 @@ func LoadOrInit() (Config, error) {
 		cfg.CodexHome = def.CodexHome
 	}
 	cfg.CodexBin = resolveCodexBin(cfg.CodexBin)
-	cfg.APIMode = NormalizeAPIMode(cfg.APIMode)
 	cfg.DirectAPIStrategy = NormalizeDirectAPIStrategy(cfg.DirectAPIStrategy)
-	cfg.ZoAPIStrategy = NormalizeZoAPIStrategy(cfg.ZoAPIStrategy)
 	cfg.CLISwitchNotifyCmd = resolveCLISwitchNotifyCmd(cfg.CLISwitchNotifyCmd)
 	if cfg.ModelMappings == nil {
 		cfg.ModelMappings = map[string]string{}
@@ -204,9 +193,6 @@ func LoadOrInit() (Config, error) {
 	}
 	if _, ok := raw["usage_scheduler_switch_timeout_seconds"]; !ok {
 		cfg.UsageSwitchTimeoutSec = def.UsageSwitchTimeoutSec
-	}
-	if _, ok := raw["direct_api_inject_prompt"]; !ok {
-		cfg.DirectAPIInjectPrompt = def.DirectAPIInjectPrompt
 	}
 	if cfg.ProxyAPIKey == "" {
 		k, err := randomKey("sk-")
@@ -282,31 +268,11 @@ func resolveCodexBin(current string) string {
 	return "codex"
 }
 
-func NormalizeAPIMode(v string) string {
-	mode := strings.TrimSpace(strings.ToLower(v))
-	switch mode {
-	case "direct_api":
-		return "direct_api"
-	default:
-		return "codex_cli"
-	}
-}
-
 func NormalizeDirectAPIStrategy(v string) string {
 	mode := strings.TrimSpace(strings.ToLower(v))
 	switch mode {
 	case "load_balance":
 		return "load_balance"
-	default:
-		return "round_robin"
-	}
-}
-
-func NormalizeZoAPIStrategy(v string) string {
-	mode := strings.TrimSpace(strings.ToLower(v))
-	switch mode {
-	case "manual":
-		return "manual"
 	default:
 		return "round_robin"
 	}

@@ -7,14 +7,6 @@
     claudeEndpoint,
     authJSONEndpoint,
     usageStatusEndpoint,
-    zoChatEndpoint,
-    zoModelsEndpoint,
-    zoKeys,
-    zoKeyName,
-    zoKeyValue,
-    zoStrategy,
-    zoAvailableModels,
-    zoModelsLoading,
     claudeCodeIntegration,
     availableModels,
     modelMappings,
@@ -29,27 +21,13 @@
     onDeleteModelMapping,
     onRegenerateAPIKey,
     onEnableClaudeCodeIntegration,
-    onSetZoKeyName,
-    onSetZoKeyValue,
-    onAddZoKey,
-    onActivateZoKey,
-    onResetZoKeyUsage,
-    onDeleteZoKey,
-    onSetZoStrategy,
     onCopyText,
     isCopied,
     openAIExample,
     claudeExample,
     authJSONExample,
     usageStatusExample,
-    zoChatExample,
   } = $props();
-
-  function zoKeyLabel(key) {
-    const name = String(key?.name || "").trim();
-    const id = String(key?.id || "").trim();
-    return name || id || "Zo Key";
-  }
 </script>
 
 <section class="panel">
@@ -76,135 +54,6 @@
             onclick={onRegenerateAPIKey}
             disabled={busy}>Regenerate</button
           >
-        </div>
-      </div>
-    </section>
-
-    <section class="setting-category">
-      <h3 class="setting-category-title">Zo API</h3>
-      <div class="setting-row">
-        <p class="setting-title">Zo API Strategy</p>
-        <div
-          class="api-mode-switch"
-          role="group"
-          aria-label="zo api strategy switch"
-        >
-          <button
-            type="button"
-            class="btn btn-secondary api-mode-btn {zoStrategy === 'round_robin'
-              ? 'is-active'
-              : ''}"
-            onclick={() => onSetZoStrategy("round_robin")}
-            disabled={busy || zoStrategy === "round_robin"}
-            aria-pressed={zoStrategy === "round_robin"}
-          >
-            Round Robin
-          </button>
-          <button
-            type="button"
-            class="btn btn-secondary api-mode-btn {zoStrategy === 'manual'
-              ? 'is-active'
-              : ''}"
-            onclick={() => onSetZoStrategy("manual")}
-            disabled={busy || zoStrategy === "manual"}
-            aria-pressed={zoStrategy === "manual"}
-          >
-            Manual
-          </button>
-        </div>
-        <p class="setting-title">
-          {#if zoStrategy === "manual"}
-            Uses the active Zo key for all requests.
-          {:else}
-            Rotates Zo keys on each request.
-          {/if}
-        </p>
-      </div>
-
-      <div class="setting-row">
-        <div class="zo-settings-stack">
-          <div class="zo-settings-card">
-            <div class="zo-settings-card-head">
-              <div>
-                <p class="setting-title"><strong>Zo Keys</strong></p>
-                <p class="setting-title">Manage Zo keys for strategy mode and explicit per-mode defaults.</p>
-              </div>
-            </div>
-            <div class="mapping-form zo-key-form">
-              <input
-                placeholder="Key name"
-                value={zoKeyName}
-                oninput={(event) => onSetZoKeyName(event.currentTarget.value)}
-              />
-              <input
-                placeholder="zo_sk_..."
-                value={zoKeyValue}
-                oninput={(event) => onSetZoKeyValue(event.currentTarget.value)}
-              />
-              <button class="btn btn-primary" onclick={onAddZoKey} disabled={busy}>
-                Save Key
-              </button>
-            </div>
-            <div class="simple-list zo-keys-list">
-              {#if zoKeys.length === 0}
-                <p class="empty-note">No Zo API keys saved.</p>
-              {:else}
-                {#each zoKeys as key}
-                  <div class="zo-key-row">
-                    <div class="zo-key-main">
-                      <div class="zo-key-title">
-                        <strong>{key.name || key.id}</strong>
-                        {#if key.active}
-                          <span class="account-state state-active">Active</span>
-                        {:else}
-                          <span class="account-state">Idle</span>
-                        {/if}
-                      </div>
-                      <div class="zo-key-meta">
-                        <span class="mono">{key.masked_key || "-"}</span>
-                        <span>Requests: {key.total_requests || 0}</span>
-                        <span>Last request: {key.last_request_at ? new Date(key.last_request_at).toLocaleString() : "-"}</span>
-                      </div>
-                    </div>
-                    <div class="zo-key-actions">
-                      <button class="btn btn-small btn-secondary" onclick={() => onActivateZoKey(key.id)} disabled={busy || key.active}>
-                        Activate
-                      </button>
-                      <button class="btn btn-small btn-secondary" onclick={() => onResetZoKeyUsage(key.id)} disabled={busy}>
-                        Reset
-                      </button>
-                      <button class="btn btn-small btn-danger" onclick={() => onDeleteZoKey(key.id)} disabled={busy}>
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                {/each}
-              {/if}
-            </div>
-          </div>
-
-          <div class="zo-settings-card">
-            <div class="zo-settings-card-head">
-              <div>
-                <p class="setting-title"><strong>Zo Supported Models</strong></p>
-                <p class="setting-title">Live model list from Zo, with defaults shown when no key is active yet.</p>
-              </div>
-            </div>
-            <div class="simple-list">
-              {#if zoModelsLoading}
-                <p class="empty-note">Loading Zo models...</p>
-              {:else if !zoKeys.length}
-                <p class="empty-note">Add at least one Zo API key to fetch live model list. Showing defaults.</p>
-              {/if}
-              {#if !zoAvailableModels.length}
-                <p class="empty-note">No Zo model list available.</p>
-              {:else}
-                {#each zoAvailableModels as model}
-                  <code>{model}</code>
-                {/each}
-              {/if}
-            </div>
-          </div>
         </div>
       </div>
     </section>
@@ -443,49 +292,6 @@
           </button>
         </div>
       </div>
-
-      <div class="setting-row">
-        <label for="zoChatEndpoint">Zo Chat Endpoint</label>
-        <div class="setting-actions-grid">
-          <input id="zoChatEndpoint" value={zoChatEndpoint} readonly disabled />
-          <button
-            class="btn btn-secondary"
-            onclick={() =>
-              onCopyText(
-                zoChatEndpoint,
-                "Zo chat endpoint",
-                "zo_chat_endpoint",
-              )}
-            disabled={busy}
-          >
-            {#if isCopied("zo_chat_endpoint")}Copied{:else}Copy{/if}
-          </button>
-        </div>
-      </div>
-
-      <div class="setting-row">
-        <label for="zoModelsEndpoint">Zo Models Endpoint</label>
-        <div class="setting-actions-grid">
-          <input
-            id="zoModelsEndpoint"
-            value={zoModelsEndpoint}
-            readonly
-            disabled
-          />
-          <button
-            class="btn btn-secondary"
-            onclick={() =>
-              onCopyText(
-                zoModelsEndpoint,
-                "Zo models endpoint",
-                "zo_models_endpoint",
-              )}
-            disabled={busy}
-          >
-            {#if isCopied("zo_models_endpoint")}Copied{:else}Copy{/if}
-          </button>
-        </div>
-      </div>
     </section>
 
     <section class="setting-category">
@@ -550,20 +356,6 @@
               )}
           >
             {#if isCopied("usage_status_example")}Copied{:else}Copy Example{/if}
-          </button>
-        </div>
-      </div>
-
-      <div class="setting-row">
-        <p class="setting-title">Zo Chat Compatible Example</p>
-        <div class="code-box">
-          <pre>{zoChatExample()}</pre>
-          <button
-            class="btn btn-secondary"
-            onclick={() =>
-              onCopyText(zoChatExample(), "Zo chat example", "zo_chat_example")}
-          >
-            {#if isCopied("zo_chat_example")}Copied{:else}Copy Example{/if}
           </button>
         </div>
       </div>

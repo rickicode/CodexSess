@@ -27,7 +27,7 @@ func TestFilterToolCallsByDefs_DropsMissingRequiredArguments(t *testing.T) {
 			},
 		},
 	}
-	filtered, ok := filterToolCallsByDefs(calls, defs)
+	filtered, ok := defaultClaudeTranslator.FilterToolCallsByDefs(calls, defs)
 	if ok {
 		t.Fatalf("expected invalid native tool call to be dropped")
 	}
@@ -37,7 +37,7 @@ func TestFilterToolCallsByDefs_DropsMissingRequiredArguments(t *testing.T) {
 }
 
 func TestSanitizeClaudeMessagesForPrompt_DropsInvalidToolUseAndPairedToolResult(t *testing.T) {
-	s := &Server{}
+	s := &Server{claudePolicy: newClaudeProtocolPolicy()}
 	toolDefs := []ChatToolDef{
 		{
 			Type: "function",
@@ -54,7 +54,7 @@ func TestSanitizeClaudeMessagesForPrompt_DropsInvalidToolUseAndPairedToolResult(
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"final request"}]`)},
 	}
 
-	sanitized := s.sanitizeClaudeMessagesForPrompt(messages, toolDefs, "session-test")
+	sanitized := s.claudePolicy.SanitizeMessagesForPrompt(messages, toolDefs, "session-test")
 	if len(sanitized) != 2 {
 		t.Fatalf("expected 2 messages after sanitize, got %d", len(sanitized))
 	}
@@ -64,7 +64,7 @@ func TestSanitizeClaudeMessagesForPrompt_DropsInvalidToolUseAndPairedToolResult(
 }
 
 func TestSanitizeClaudeMessagesForPrompt_DropsSubsequentToolUseFromCachedInvalidPattern(t *testing.T) {
-	s := &Server{}
+	s := &Server{claudePolicy: newClaudeProtocolPolicy()}
 	toolDefs := []ChatToolDef{
 		{
 			Type: "function",
@@ -81,7 +81,7 @@ func TestSanitizeClaudeMessagesForPrompt_DropsSubsequentToolUseFromCachedInvalid
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"final request"}]`)},
 	}
 
-	sanitized := s.sanitizeClaudeMessagesForPrompt(messages, toolDefs, "session-cache")
+	sanitized := s.claudePolicy.SanitizeMessagesForPrompt(messages, toolDefs, "session-cache")
 	if len(sanitized) != 2 {
 		t.Fatalf("expected 2 user-only messages after sanitize, got %d", len(sanitized))
 	}
@@ -91,14 +91,14 @@ func TestSanitizeClaudeMessagesForPrompt_DropsSubsequentToolUseFromCachedInvalid
 }
 
 func TestSanitizeClaudeMessagesForPrompt_DropsAssistantPolicyRefusalText(t *testing.T) {
-	s := &Server{}
+	s := &Server{claudePolicy: newClaudeProtocolPolicy()}
 	messages := []ClaudeMessage{
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"tolong cek bug ini"}]`)},
 		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"Maaf, saya tidak bisa membantu memperbaiki sistem ini karena berpotensi disalahgunakan."}]`)},
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"fokus ke bug parser output saja"}]`)},
 	}
 
-	sanitized := s.sanitizeClaudeMessagesForPrompt(messages, nil, "session-refusal")
+	sanitized := s.claudePolicy.SanitizeMessagesForPrompt(messages, nil, "session-refusal")
 	got := promptFromClaudeMessages(sanitized)
 	if strings.Contains(strings.ToLower(got), "maaf, saya tidak bisa membantu") {
 		t.Fatalf("expected assistant refusal text to be removed from prompt")
@@ -109,12 +109,12 @@ func TestSanitizeClaudeMessagesForPrompt_DropsAssistantPolicyRefusalText(t *test
 }
 
 func TestSanitizeClaudeMessagesForPrompt_PreservesSkillActivityLines(t *testing.T) {
-	s := &Server{}
+	s := &Server{claudePolicy: newClaudeProtocolPolicy()}
 	messages := []ClaudeMessage{
 		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"● Skill(superpowers:brainstorming)\n⎿ Successfully loaded skill\nLangsung ke akar masalah parser."}]`)},
 	}
 
-	sanitized := s.sanitizeClaudeMessagesForPrompt(messages, nil, "session-skill-lines")
+	sanitized := s.claudePolicy.SanitizeMessagesForPrompt(messages, nil, "session-skill-lines")
 	got := promptFromClaudeMessages(sanitized)
 	if !strings.Contains(got, "Skill(superpowers:brainstorming)") {
 		t.Fatalf("expected skill activity line to stay, got: %s", got)
@@ -128,14 +128,14 @@ func TestSanitizeClaudeMessagesForPrompt_PreservesSkillActivityLines(t *testing.
 }
 
 func TestSanitizeClaudeMessagesForPrompt_DropsSkillToolUseAndResult(t *testing.T) {
-	s := &Server{}
+	s := &Server{claudePolicy: newClaudeProtocolPolicy()}
 	messages := []ClaudeMessage{
 		{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"call_skill_1","name":"Skill","input":{"skill":"superpowers:systematic-debugging"}}]`)},
 		{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"call_skill_1","content":"Launching skill"}]`)},
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"cek potensi bug di sistem ini"}]`)},
 	}
 
-	sanitized := s.sanitizeClaudeMessagesForPrompt(messages, nil, "session-skill-drop")
+	sanitized := s.claudePolicy.SanitizeMessagesForPrompt(messages, nil, "session-skill-drop")
 	got := promptFromClaudeMessages(sanitized)
 	if strings.Contains(got, "assistant_tool_calls: Skill(") {
 		t.Fatalf("expected Skill tool_use to be removed from prompt")
@@ -149,13 +149,13 @@ func TestSanitizeClaudeMessagesForPrompt_DropsSkillToolUseAndResult(t *testing.T
 }
 
 func TestSanitizeClaudeMessagesForPrompt_StripsSystemReminderTextBlocks(t *testing.T) {
-	s := &Server{}
+	s := &Server{claudePolicy: newClaudeProtocolPolicy()}
 	messages := []ClaudeMessage{
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"<system-reminder>\nvery long reminder\n</system-reminder>"}]`)},
 		{Role: "user", Content: json.RawMessage(`[{"type":"text","text":"analisis bug ini"}]`)},
 	}
 
-	sanitized := s.sanitizeClaudeMessagesForPrompt(messages, nil, "session-system-reminder")
+	sanitized := s.claudePolicy.SanitizeMessagesForPrompt(messages, nil, "session-system-reminder")
 	got := promptFromClaudeMessages(sanitized)
 	if strings.Contains(strings.ToLower(got), "system-reminder") {
 		t.Fatalf("expected system-reminder block to be stripped, got: %s", got)
@@ -178,7 +178,7 @@ func TestSanitizeClaudeAssistantText_DropsTraceAndKeepsSubstance(t *testing.T) {
 		"(ctrl+b ctrl+b to run in background)",
 	}, "\n")
 
-	got := sanitizeClaudeAssistantText(in)
+	got := defaultClaudeTranslator.SanitizeAssistantText(in)
 	if strings.Contains(strings.ToLower(got), "entered plan mode") {
 		t.Fatalf("expected plan mode trace to be removed: %s", got)
 	}
@@ -258,7 +258,7 @@ func TestMapClaudeToolsToChatTools_AllowsTaskToolsByDefault(t *testing.T) {
 		{Name: "TaskOutput"},
 		{Name: "Read"},
 	}
-	got := mapClaudeToolsToChatTools(in)
+	got := defaultClaudeTranslator.MapTools(in)
 	if len(got) != 3 {
 		t.Fatalf("expected all tools to remain by default, got=%d", len(got))
 	}
@@ -268,6 +268,7 @@ func TestMapClaudeToolsToChatTools_AllowsTaskToolsByDefault(t *testing.T) {
 }
 
 func TestSanitizeClaudeClientToolCalls_NormalizesReadPagesAndKeepsTaskByDefault(t *testing.T) {
+	policy := newClaudeProtocolPolicy()
 	calls := []ChatToolCall{
 		{
 			ID:   "a",
@@ -286,7 +287,7 @@ func TestSanitizeClaudeClientToolCalls_NormalizesReadPagesAndKeepsTaskByDefault(
 			},
 		},
 	}
-	got := sanitizeClaudeClientToolCalls(calls)
+	got := policy.SanitizeClientToolCalls(calls)
 	if len(got) != 2 {
 		t.Fatalf("expected both calls to remain by default, got=%d", len(got))
 	}
@@ -303,6 +304,7 @@ func TestSanitizeClaudeClientToolCalls_NormalizesReadPagesAndKeepsTaskByDefault(
 
 func TestSanitizeClaudeClientToolCalls_DropsTaskWhenEnvEnabled(t *testing.T) {
 	t.Setenv("CODEXSESS_CLAUDE_BLOCK_TASK_TOOLS", "1")
+	policy := newClaudeProtocolPolicy()
 	calls := []ChatToolCall{
 		{
 			ID:   "a",
@@ -321,7 +323,7 @@ func TestSanitizeClaudeClientToolCalls_DropsTaskWhenEnvEnabled(t *testing.T) {
 			},
 		},
 	}
-	got := sanitizeClaudeClientToolCalls(calls)
+	got := policy.SanitizeClientToolCalls(calls)
 	if len(got) != 1 {
 		t.Fatalf("expected Task* call to be dropped when env enabled, got=%d", len(got))
 	}
@@ -331,21 +333,23 @@ func TestSanitizeClaudeClientToolCalls_DropsTaskWhenEnvEnabled(t *testing.T) {
 }
 
 func TestSanitizeClaudeToolResultText_DropsKnownNoise(t *testing.T) {
+	policy := newClaudeProtocolPolicy()
 	cases := []string{
 		`<tool_use_error>Invalid pages parameter: "".</tool_use_error>`,
 		`File content (18151 tokens) exceeds maximum allowed tokens (10000).`,
 		`CRITICAL: This is a READ-ONLY task. You CANNOT edit, write, or create files.`,
 	}
 	for _, in := range cases {
-		if got, keep := sanitizeClaudeToolResultText(in); keep || got != "" {
+		if got, keep := policy.SanitizeToolResultText(in); keep || got != "" {
 			t.Fatalf("expected noisy tool_result to be dropped, got keep=%v text=%q", keep, got)
 		}
 	}
 }
 
 func TestSanitizeClaudeToolResultText_TruncatesLongResult(t *testing.T) {
+	policy := newClaudeProtocolPolicy()
 	in := strings.Repeat("x", 4000)
-	got, keep := sanitizeClaudeToolResultText(in)
+	got, keep := policy.SanitizeToolResultText(in)
 	if !keep {
 		t.Fatalf("expected long tool_result to be kept with truncation")
 	}

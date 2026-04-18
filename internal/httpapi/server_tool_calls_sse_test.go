@@ -24,7 +24,7 @@ func TestParseToolCallsFromText_DropsMissingRequiredArguments(t *testing.T) {
 		},
 	}
 	text := `{"tool_calls":[{"name":"Skill","arguments":{}}]}`
-	calls, ok := parseToolCallsFromText(text, defs)
+	calls, ok := defaultOpenAITranslator.ParseToolCallsFromText(text, defs)
 	if ok {
 		t.Fatalf("expected invalid tool call to be dropped")
 	}
@@ -38,7 +38,7 @@ func TestParseToolCallsFromText_WrappedJSON(t *testing.T) {
 		{Type: "function", Function: ChatToolFunctionDef{Name: "navigate_page"}},
 	}
 	text := `{"tool_calls":[{"name":"navigate_page","arguments":{"page":1,"action":"url","url":"https://www.speedtest.net"}}]}`
-	calls, ok := parseToolCallsFromText(text, defs)
+	calls, ok := defaultOpenAITranslator.ParseToolCallsFromText(text, defs)
 	if !ok {
 		t.Fatalf("expected tool calls to parse")
 	}
@@ -62,7 +62,7 @@ func TestParseToolCallsFromText_RejectsUnknownTool(t *testing.T) {
 		{Type: "function", Function: ChatToolFunctionDef{Name: "navigate_page"}},
 	}
 	text := `{"name":"delete_all","arguments":{"confirm":true}}`
-	calls, ok := parseToolCallsFromText(text, defs)
+	calls, ok := defaultOpenAITranslator.ParseToolCallsFromText(text, defs)
 	if ok {
 		t.Fatalf("expected parse to fail for unknown tool")
 	}
@@ -76,7 +76,7 @@ func TestParseToolCallsFromText_AcceptsResponsesStyleToolDef(t *testing.T) {
 		{Type: "function", Name: "navigate_page"},
 	}
 	text := `{"tool_calls":[{"name":"navigate_page","arguments":{"url":"https://example.com"}}]}`
-	calls, ok := parseToolCallsFromText(text, defs)
+	calls, ok := defaultOpenAITranslator.ParseToolCallsFromText(text, defs)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one parsed tool call, got ok=%v len=%d", ok, len(calls))
 	}
@@ -90,7 +90,7 @@ func TestParseToolCallsFromText_AcceptsToolCallsObject(t *testing.T) {
 		{Type: "function", Name: "glob"},
 	}
 	text := `{"tool_calls":{"name":"glob","arguments":{"pattern":"./CLAUDE.md","path":"/home/ricki/.claude"}}}`
-	calls, ok := parseToolCallsFromText(text, defs)
+	calls, ok := defaultOpenAITranslator.ParseToolCallsFromText(text, defs)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected one parsed tool call, got ok=%v len=%d", ok, len(calls))
 	}
@@ -111,7 +111,7 @@ func TestParseToolCallsFromText_AcceptsConcatenatedJSONObjects(t *testing.T) {
 		`{"tool_calls":{"name":"glob","arguments":{"pattern":"./CLAUDE.md","path":"/home/ricki/.claude"}}}`,
 		`{"tool_calls":{"name":"read","arguments":{"filePath":"/home/ricki/.claude/CLAUDE.md"}}}`,
 	}, "")
-	calls, ok := parseToolCallsFromText(text, defs)
+	calls, ok := defaultOpenAITranslator.ParseToolCallsFromText(text, defs)
 	if !ok {
 		t.Fatalf("expected parse to succeed for concatenated objects")
 	}
@@ -426,7 +426,7 @@ func TestResolveToolCalls_PrefersNative(t *testing.T) {
 			},
 		},
 	}
-	calls, ok := resolveToolCalls(`plain text`, defs, native)
+	calls, ok := defaultOpenAITranslator.ResolveToolCalls(`plain text`, defs, native)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected native tool call, got ok=%v len=%d", ok, len(calls))
 	}
@@ -437,14 +437,14 @@ func TestResolveToolCalls_PrefersNative(t *testing.T) {
 
 func TestResolveToolCalls_PrefersProviderNative(t *testing.T) {
 	defs := []ChatToolDef{{Type: "function", Name: "read_file"}}
-	native := mapProviderToolCalls([]provider.ToolCall{
+	native := defaultOpenAITranslator.MapProviderToolCalls([]provider.ToolCall{
 		{
 			ID:        "call_1",
 			Name:      "read_file",
 			Arguments: `{"path":"README.md"}`,
 		},
 	})
-	calls, ok := resolveToolCalls(`not json`, defs, native)
+	calls, ok := defaultOpenAITranslator.ResolveToolCalls(`not json`, defs, native)
 	if !ok || len(calls) != 1 {
 		t.Fatalf("expected provider-native tool call, got ok=%v len=%d", ok, len(calls))
 	}

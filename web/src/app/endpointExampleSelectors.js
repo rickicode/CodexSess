@@ -14,14 +14,9 @@ function usageStatusExample({ usageStatusEndpoint, apiKey, buildUsageStatusExamp
   return buildUsageStatusExample({ endpoint: usageStatusEndpoint, apiKey })
 }
 
-function zoChatExample({ zoChatEndpoint, apiKey, buildZoChatExample }) {
-  return buildZoChatExample({ endpoint: zoChatEndpoint, apiKey })
-}
-
 export {
   authJSONExample,
   claudeExample,
   openAIExample,
-  usageStatusExample,
-  zoChatExample
+  usageStatusExample
 }

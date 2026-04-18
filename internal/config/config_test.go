@@ -160,7 +160,4 @@ func TestLoadOrInit_BackfillsMissingBooleanDefaults(t *testing.T) {
 	if !cfg.UsageSchedulerEnabled {
 		t.Fatal("expected UsageSchedulerEnabled to backfill to true default when key missing")
 	}
-	if !cfg.DirectAPIInjectPrompt {
-		t.Fatal("expected DirectAPIInjectPrompt to backfill to true default when key missing")
-	}
 }

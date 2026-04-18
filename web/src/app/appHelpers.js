@@ -7,20 +7,8 @@ const defaultCodexModels = [
   'gpt-5.4'
 ];
 
-const defaultZoModels = [
-  'openai:gpt-5.4-2026-03-05',
-  'openai:gpt-5.4-mini-2026-03-17',
-  'openai:gpt-5.3-codex',
-  'anthropic:claude-opus-4-6',
-  'vercel:moonshotai/kimi-k2.5',
-  'vercel:zai/glm-5',
-  'vercel:minimax/minimax-m2.5',
-  'vercel:minimax/minimax-m2.7'
-];
-
 const jsonHeaders = { 'Content-Type': 'application/json' };
 const uiPrefsKey = 'codexsess.ui.preferences';
-const zoModelsCacheKey = 'codexsess.zo.models';
 
 function statusClass(kind) {
   if (kind === 'error') return 'error';
@@ -314,14 +302,6 @@ function usageStatusExample() {
   return 'GET /v1/usage';
 }
 
-function zoChatExample() {
-  return `POST /zo/v1/chat/completions
-{
-  "model": "openai:gpt-5.4-mini-2026-03-17",
-  "messages": [{"role":"user","content":"Hello"}]
-}`;
-}
-
 function logStatusClass(statusCode) {
   if (statusCode >= 500) return 'error';
   if (statusCode >= 400) return 'warn';
@@ -343,10 +323,8 @@ function parseSchedulerIntervalInput(value, fallbackValue) {
 
 export {
   defaultCodexModels,
-  defaultZoModels,
   jsonHeaders,
   uiPrefsKey,
-  zoModelsCacheKey,
   statusClass,
   statusIcon,
   usageLabel,
@@ -372,7 +350,6 @@ export {
   claudeExample,
   authJSONExample,
   usageStatusExample,
-  zoChatExample,
   logStatusClass,
   parsePercentInput,
   parseSchedulerIntervalInput

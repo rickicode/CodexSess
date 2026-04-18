@@ -135,8 +135,7 @@ func TestHandleWebSettings_ClaudeEndpointUsesClaudeMessagesPath(t *testing.T) {
 		bindAddr: "127.0.0.1:3052",
 		svc: &service.Service{
 			Cfg: config.Config{
-				ModelMappings:         map[string]string{"default": "gpt-5.2-codex"},
-				DirectAPIInjectPrompt: true,
+				ModelMappings: map[string]string{"default": "gpt-5.2-codex"},
 			},
 		},
 	}
@@ -162,23 +161,20 @@ func TestHandleWebSettings_ClaudeEndpointUsesClaudeMessagesPath(t *testing.T) {
 	if !strings.HasSuffix(usageStatusEndpoint, "/v1/usage") {
 		t.Fatalf("expected usage status endpoint to end with /v1/usage, got %q", usageStatusEndpoint)
 	}
-	if inject, ok := body["direct_api_inject_prompt"].(bool); !ok || !inject {
-		t.Fatalf("expected direct_api_inject_prompt=true, got %v", body["direct_api_inject_prompt"])
+	if _, ok := body["mode"]; ok {
+		t.Fatalf("expected legacy mode field to be absent, got %v", body["mode"])
 	}
 }
 
-func TestHandleWebSettings_UpdateDirectAPIInjectPrompt(t *testing.T) {
+func TestHandleWebSettings_DoesNotExposeLegacyModeField(t *testing.T) {
 	s := &Server{
 		apiKey:   "sk-test",
 		bindAddr: "127.0.0.1:3052",
-		svc: &service.Service{
-			Cfg: config.Config{
-				DirectAPIInjectPrompt: true,
-			},
-		},
+		svc:      &service.Service{Cfg: config.Config{}},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/api/settings", strings.NewReader(`{"direct_api_inject_prompt":false}`))
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	req.Host = "127.0.0.1:3052"
 	rec := httptest.NewRecorder()
 	s.handleWebSettings(rec, req)
 	if rec.Code != http.StatusOK {
@@ -189,23 +185,16 @@ func TestHandleWebSettings_UpdateDirectAPIInjectPrompt(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if inject, ok := body["direct_api_inject_prompt"].(bool); !ok || !inject {
-		t.Fatalf("expected direct_api_inject_prompt=true, got %v", body["direct_api_inject_prompt"])
-	}
-	if !s.svc.Cfg.DirectAPIInjectPrompt {
-		t.Fatalf("expected server config direct_api_inject_prompt=true")
+	if _, ok := body["mode"]; ok {
+		t.Fatalf("expected legacy mode field to be absent, got %v", body["mode"])
 	}
 }
 
-func TestHandleWebSettings_DoesNotExposeLegacyZoModeSettings(t *testing.T) {
+func TestHandleWebSettings_DoesNotExposeLegacyRemovedProviderSettings(t *testing.T) {
 	s := &Server{
 		apiKey:   "sk-test",
 		bindAddr: "127.0.0.1:3052",
-		svc: &service.Service{
-			Cfg: config.Config{
-				DirectAPIInjectPrompt: true,
-			},
-		},
+		svc:      &service.Service{Cfg: config.Config{}},
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
@@ -228,12 +217,12 @@ func TestHandleWebSettings_DoesNotExposeLegacyZoModeSettings(t *testing.T) {
 		"legacy_planning_mode",
 	} {
 		if _, ok := body[key]; ok {
-			t.Fatalf("expected legacy Zo legacy setting %q to be absent", key)
+			t.Fatalf("expected legacy removed-provider setting %q to be absent", key)
 		}
 	}
 }
 
-func TestHandleWebSettings_IgnoresLegacyZoModeSettings(t *testing.T) {
+func TestHandleWebSettings_IgnoresLegacyRemovedProviderSettings(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "settings-legacy-mode.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -247,9 +236,7 @@ func TestHandleWebSettings_IgnoresLegacyZoModeSettings(t *testing.T) {
 		bindAddr: "127.0.0.1:3052",
 		svc: &service.Service{
 			Store: st,
-			Cfg: config.Config{
-				DirectAPIInjectPrompt: true,
-			},
+			Cfg:   config.Config{},
 		},
 	}
 

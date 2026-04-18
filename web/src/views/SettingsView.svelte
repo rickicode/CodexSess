@@ -1,8 +1,6 @@
 <script>
   let {
     busy,
-    apiMode,
-    onSetAPIMode,
     showAccountEmail,
     onToggleShowAccountEmail,
     directAPIStrategy,
@@ -51,39 +49,9 @@
 
   <div class="settings-list">
     <section class="setting-category">
-      <h3 class="setting-category-title">API Mode</h3>
+      <h3 class="setting-category-title">API Execution</h3>
       <div class="setting-row">
-        <p class="setting-title">Proxy Execution Mode</p>
-        <div class="api-mode-switch" role="group" aria-label="API mode switch">
-          <button
-            type="button"
-            class="btn btn-secondary api-mode-btn {apiMode === 'codex_cli' ? 'is-active' : ''}"
-            onclick={() => onSetAPIMode('codex_cli')}
-            disabled={busy || apiMode === 'codex_cli'}
-            aria-pressed={apiMode === 'codex_cli'}
-          >
-            Codex CLI
-          </button>
-          <button
-            type="button"
-            class="btn btn-secondary api-mode-btn {apiMode === 'direct_api' ? 'is-active' : ''}"
-            onclick={() => onSetAPIMode('direct_api')}
-            disabled={busy || apiMode === 'direct_api'}
-            aria-pressed={apiMode === 'direct_api'}
-          >
-            Direct API
-          </button>
-        </div>
-        <p class="setting-title">
-          {#if apiMode === 'direct_api'}
-            /v1 endpoints call ChatGPT backend API directly.
-          {:else}
-            /v1 endpoints call local codex CLI execution pipeline.
-          {/if}
-        </p>
-      </div>
-      {#if apiMode === 'direct_api'}
-      <div class="setting-row">
+        <p class="setting-title">Proxy APIs always use Direct API</p>
         <p class="setting-title">Direct API Account Strategy</p>
         <div class="api-mode-switch" role="group" aria-label="direct api strategy switch">
           <button
@@ -106,14 +74,9 @@
           </button>
         </div>
         <p class="setting-title">
-          {#if directAPIStrategy === 'load_balance'}
-            Select account by highest fresh remaining usage.
-          {:else}
-            Rotate account every request to distribute load.
-          {/if}
+          {#if directAPIStrategy === 'load_balance'}Select account by highest fresh remaining usage.{:else}Rotate account every request to distribute load.{/if}
         </p>
       </div>
-      {/if}
     </section>
 
     <section class="setting-category">

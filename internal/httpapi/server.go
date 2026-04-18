@@ -12,11 +12,11 @@ import (
 
 	"github.com/ricki/codexsess/internal/service"
 	"github.com/ricki/codexsess/internal/trafficlog"
-	"github.com/ricki/codexsess/internal/webui"
 )
 
 type Server struct {
 	svc               *service.Service
+	executor          *proxyExecutor
 	apiKey            string
 	bindAddr          string
 	adminUsername     string
@@ -34,8 +34,7 @@ type Server struct {
 	updateCheckErrMessage string
 	mu                    sync.RWMutex
 	directRoundRobin      atomic.Uint64
-	invalidToolCacheMu    sync.Mutex
-	invalidToolCache      map[string]map[string]time.Time
+	claudePolicy          claudePolicy
 	lastActiveCheckAt     atomic.Int64
 	lastAllAttemptAt      atomic.Int64
 	lastAllFailureAt      atomic.Int64
@@ -63,7 +62,7 @@ var (
 )
 
 func New(svc *service.Service, bindAddr string, apiKey string, adminUsername string, adminPasswordHash string, traffic *trafficlog.Logger, appVersion string, codexVersion string) *Server {
-	return &Server{
+	srv := &Server{
 		svc:               svc,
 		bindAddr:          bindAddr,
 		apiKey:            apiKey,
@@ -72,8 +71,10 @@ func New(svc *service.Service, bindAddr string, apiKey string, adminUsername str
 		traffic:           traffic,
 		appVersion:        normalizeVersionString(appVersion),
 		codexVersion:      strings.TrimSpace(codexVersion),
-		invalidToolCache:  make(map[string]map[string]time.Time),
 	}
+	srv.claudePolicy = newClaudeProtocolPolicy()
+	srv.executor = newProxyExecutor(svc, srv.currentDirectAPIStrategy, srv.shouldInjectDirectAPIPrompt, srv.resolveAPIAccount, srv.findBestUsageAccount, srv.markUsageLastError, &srv.directRoundRobin)
+	return srv
 }
 
 func (s *Server) ListenAndServe(ctx context.Context) error {
@@ -82,72 +83,8 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 	s.bootstrapCodingTemplateHome()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/accounts", s.handleWebAccounts)
-	mux.HandleFunc("/api/accounts/types", s.handleWebAccountTypes)
-	mux.HandleFunc("/api/accounts/total", s.handleWebAccountsTotal)
-	mux.HandleFunc("/api/accounts/revoked", s.handleDeleteRevokedAccounts)
-	mux.HandleFunc("/api/account/use", s.handleWebUseAccount)
-	mux.HandleFunc("/api/account/use-api", s.handleWebUseAPIAccount)
-	mux.HandleFunc("/api/account/use-cli", s.handleWebUseCLIAccount)
-	mux.HandleFunc("/api/account/remove", s.handleWebRemoveAccount)
-	mux.HandleFunc("/api/account/import", s.handleWebImportAccount)
-	mux.HandleFunc("/api/accounts/backup", s.handleWebBackupAccounts)
-	mux.HandleFunc("/api/accounts/export-tokens", s.handleWebExportAccountTokens)
-	mux.HandleFunc("/api/accounts/restore", s.handleWebRestoreAccounts)
-	mux.HandleFunc("/api/usage/refresh", s.handleWebRefreshUsage)
-	mux.HandleFunc("/api/usage/automation", s.handleWebUsageAutomationStatus)
-	mux.HandleFunc("/api/system/logs", s.handleWebSystemLogs)
-	mux.HandleFunc("/api/settings", s.handleWebSettings)
-	mux.HandleFunc("/api/settings/claude-code", s.handleWebClaudeCodeSettings)
-	mux.HandleFunc("/api/settings/api-key", s.handleWebUpdateAPIKey)
-	mux.HandleFunc("/api/zo/keys", s.handleWebZoKeys)
-	mux.HandleFunc("/api/zo/keys/activate", s.handleWebZoKeyActivate)
-	mux.HandleFunc("/api/zo/keys/delete", s.handleWebZoKeyDelete)
-	mux.HandleFunc("/api/zo/keys/reset", s.handleWebZoKeyReset)
-	mux.HandleFunc("/api/zo/keys/strategy", s.handleWebZoKeyStrategy)
-	mux.HandleFunc("/api/version/check", s.handleWebVersionCheck)
-	mux.HandleFunc("/api/model-mappings", s.handleWebModelMappings)
-	mux.HandleFunc("/api/logs", s.handleWebLogs)
-	mux.HandleFunc("/api/coding/sessions", s.handleWebCodingSessions)
-	mux.HandleFunc("/api/coding/messages", s.handleWebCodingMessages)
-	mux.HandleFunc("/api/coding/messages/snapshot", s.handleWebCodingMessageSnapshot)
-	mux.HandleFunc("/api/coding/status", s.handleWebCodingStatus)
-	mux.HandleFunc("/api/coding/runtime/debug", s.handleWebCodingRuntimeDebug)
-	mux.HandleFunc("/api/coding/stop", s.handleWebCodingStop)
-	mux.HandleFunc("/api/coding/ws", s.handleWebCodingWS)
-	mux.HandleFunc("/api/coding/chat", s.handleWebCodingChat)
-	mux.HandleFunc("/api/coding/runtime/restart", s.handleWebCodingRuntimeRestart)
-	mux.HandleFunc("/api/coding/template-home", s.handleWebCodingTemplateHome)
-	mux.HandleFunc("/api/coding/path-suggestions", s.handleWebCodingPathSuggestions)
-	mux.HandleFunc("/api/coding/skills", s.handleWebCodingSkills)
-	mux.HandleFunc("/api/auth/browser/start", s.handleWebBrowserStart)
-	mux.HandleFunc("/api/auth/browser/cancel", s.handleWebBrowserCancel)
-	mux.HandleFunc("/api/auth/browser/callback", s.handleWebBrowserCallback)
-	mux.HandleFunc("/api/auth/browser/complete", s.handleWebBrowserComplete)
-	mux.HandleFunc("/api/auth/login", s.handleAPIAuthLogin)
-	mux.HandleFunc("/auth/callback", s.handleWebBrowserCallback)
-	mux.HandleFunc("/auth/login", s.handleWebAuthLogin)
-	mux.HandleFunc("/auth/logout", s.handleWebAuthLogout)
-	mux.HandleFunc("/api/auth/device/start", s.handleWebDeviceStart)
-	mux.HandleFunc("/api/auth/device/poll", s.handleWebDevicePoll)
-	mux.HandleFunc("/api/events/log", s.handleWebClientEventLog)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		respondJSON(w, 200, map[string]any{"ok": true})
-	})
-	mux.HandleFunc("/v1/models", s.withTrafficLog("openai", s.handleModels))
-	mux.HandleFunc("/v1", s.withTrafficLog("openai", s.handleOpenAIRoot))
-	mux.HandleFunc("/v1/chat/completions", s.withTrafficLog("openai", s.handleChatCompletions))
-	mux.HandleFunc("/v1/responses", s.withTrafficLog("openai", s.handleResponses))
-	mux.HandleFunc("/v1/auth.json", s.handleAPIAuthJSON)
-	mux.HandleFunc("/v1/usage", s.withTrafficLog("openai", s.handleAPIUsageStatus))
-	mux.HandleFunc("/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
-	mux.HandleFunc("/claude/v1/messages", s.withTrafficLog("claude", s.handleClaudeMessages))
-	mux.HandleFunc("/zo/v1/models", s.withTrafficLog("zo", s.handleZoModels))
-	mux.HandleFunc("/zo/v1", s.withTrafficLog("zo", s.handleZoRoot))
-	mux.HandleFunc("/zo/v1/chat/completions", s.withTrafficLog("zo", s.handleZoChatCompletions))
-	mux.HandleFunc("/zo/v1/responses", s.withTrafficLog("zo", s.handleZoNotSupported))
-	mux.HandleFunc("/zo/v1/messages", s.withTrafficLog("zo", s.handleZoNotSupported))
-	mux.Handle("/", webui.Handler())
+	s.registerWebRoutes(mux)
+	s.registerProxyRoutes(mux)
 	handler := s.withAccessLog(withCORS(s.withManagementAuth(mux)))
 	srv := &http.Server{Addr: s.bindAddr, Handler: handler}
 	go s.runUsageSchedulerLoop(ctx)
